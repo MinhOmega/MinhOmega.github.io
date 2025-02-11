@@ -3,7 +3,7 @@ import { SiteConfig } from "@/types";
 export const siteConfig: SiteConfig = {
   name: "MinhVo",
   title: "MinhVo | Front-end Engineer",
-  description: "MinhVo is a software engineer who loves to build things with code.",
+  description: "Hey there! I'm MinhVo, a passionate Front-End Engineer who brings ideas to life through elegant code and delightful user experiences. I specialize in crafting modern web applications that make a difference.",
   origin: "https://minhvo.vercel.app",
   keywords: [
     "MinhVo",
