@@ -8,21 +8,21 @@ export async function generateMetadata(): Promise<Metadata> {
   ogUrl.searchParams.set("mode", "dark");
 
   return {
-    title: `CV | ${siteConfig.name}`,
-    description: "Front-end Engineer with expertise in React, Next.js, and modern web technologies",
-    keywords: ["Front-end Engineer", "React", "Next.js", "JavaScript", "TypeScript", "Web Development"],
+    title: `CV | ${siteConfig.creator.name}`,
+    description: "Front-end Engineer with expertise in React, Next.js, React Native, and modern web technologies",
+    keywords: ["Front-end Engineer", "React", "Next.js", "React Native", "JavaScript", "TypeScript", "Web Development", "Mobile Development", "Full-stack Engineer", "Software Engineer", "Developer", "Engineering", "Front-end", "Developer"],
     authors: [{ name: "VO NGOC QUANG MINH" }],
     openGraph: {
-      title: `CV | ${siteConfig.name}`,
-      description: "Front-end Engineer with expertise in React, Next.js, and modern web technologies",
+      title: `CV | ${siteConfig.creator.name}`,
+      description: "Front-end Engineer with expertise in React, Next.js, React Native, and modern web technologies",
       type: "article",
       url: `${siteConfig.siteUrl}/cv`,
       images: [{ url: ogUrl.toString(), width: 1200, height: 630, alt: "CV" }],
     },
     twitter: {
       card: "summary_large_image",
-      title: `CV | ${siteConfig.name}`,
-      description: "Front-end Engineer with expertise in React, Next.js, and modern web technologies",
+      title: `CV | ${siteConfig.creator.name}`,
+      description: "Front-end Engineer with expertise in React, Next.js, React Native, and modern web technologies",
       images: [ogUrl.toString()],
     },
   };

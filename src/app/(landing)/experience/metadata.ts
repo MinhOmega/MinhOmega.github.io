@@ -17,7 +17,7 @@ export async function generateMetadata(): Promise<Metadata> {
     "Experience",
     ...experiencesConfig.map((exp) => exp.company.name),
   ];
-  const title = `Experience | ${siteConfig.creator.name} | ${siteConfig.name}`;
+  const title = `Experience | ${siteConfig.creator.name}`;
   const og = `${siteConfig.siteUrl}/experience-og.png`;
 
   return {

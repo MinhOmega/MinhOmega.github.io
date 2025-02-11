@@ -18,7 +18,7 @@ export async function generateMetadata(): Promise<Metadata> {
       .join("\n")}
     `;
   
-  const title = `Today I Learned | ${siteConfig.creator.name} | ${siteConfig.name}`;
+  const title = `Today I Learned | ${siteConfig.creator.name}`;
   const ogUrl = new URL(`${siteConfig.siteUrl}/og`);
   ogUrl.searchParams.set("heading", "Today I Learned");
   ogUrl.searchParams.set("type", "TIL");

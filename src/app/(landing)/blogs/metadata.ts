@@ -2,7 +2,7 @@ import { siteConfig } from "@/config/site.config";
 import type { Metadata } from "next";
 
 export async function generateMetadata(): Promise<Metadata> {
-  const title = `Blog | ${siteConfig.creator.name} | ${siteConfig.name}`;
+  const title = `Blog | ${siteConfig.creator.name}`;
   const description = `Personal blog by ${siteConfig.creator.name}. Coming soon with interesting articles about web development, technology, and more.`;
   
   const ogUrl = new URL(`${siteConfig.siteUrl}/og`);

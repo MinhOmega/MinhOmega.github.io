@@ -102,5 +102,5 @@ For more details, see the [full license text](https://www.gnu.org/licenses/agpl-
 
 ## Links
 
-- [Portfolio Site](https://minhvo.vercel.app)
+- [Portfolio Site](https://minhvo.is-a.dev)
 - [GitHub Repository](https://github.com/MinhOmega/minhvo)

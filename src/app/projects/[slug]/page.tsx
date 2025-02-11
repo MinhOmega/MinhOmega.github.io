@@ -37,11 +37,11 @@ export async function generateMetadata({ params }: ProjectPageProps): Promise<Me
   ogUrl.searchParams.set("mode", "dark");
 
   return {
-    title: `${project.title} | ${siteConfig.name} | ${siteConfig.creator.name}`,
+    title: `${project.title} | ${siteConfig.creator.name}`,
     description: project.description,
     keywords: [...project.tags, ...siteConfig.keywords, project.title],
     openGraph: {
-      title: `${project.title} | ${siteConfig.name} | ${siteConfig.creator.name}`,
+      title: `${project.title} | ${siteConfig.creator.name}`,
       description: project.description,
       type: "article",
       url: `${siteConfig.siteUrl}/projects/${project.slugAsParams}`,
