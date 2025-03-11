@@ -29,11 +29,9 @@ export default function Hero() {
         {portfolioConfig.tagline} <span className="sr-only">tagline</span>
       </h3>
       <p className="my-6 max-w-2xl text-foreground/80">
-        Hey there 👋 I&apos;m a Front-End Engineer with expertise in building scalable web and mobile applications. 
-        Currently working at SNAPTEC, where I lead development of SaaS themes, administrative dashboards, and e-commerce 
-        solutions. I specialize in React, Next.js, and React Native, with a strong focus on performance optimization 
-        and user experience. Notable achievements include improving Gtmetrix scores to grade A and being awarded 
-        HERO OF THE YEARS 2021.
+      Hey there 👋 I'm a Front-End Engineer with expertise in building scalable web and mobile applications.  
+      I worked at SNAPTEC, where I led the development of SaaS themes, administrative dashboards, and e-commerce solutions, but I am currently looking for a new job.  
+      I specialize in React, Next.js, and React Native, with a strong focus on performance optimization and user experience. Notable achievements include improving GTmetrix scores to grade A and being awarded Hero of the Year 2021.
         <span className="sr-only">bio</span>
       </p>
       <Socials />
