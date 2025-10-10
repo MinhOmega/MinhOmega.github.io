@@ -2,6 +2,8 @@ import { Octokit } from "octokit";
 import { NextResponse } from "next/server";
 
 export const revalidate = 3600; // Revalidate every hour
+export const dynamic = 'force-static';
+export const runtime = 'nodejs';
 
 export async function GET() {
   try {
@@ -16,11 +18,7 @@ export async function GET() {
 
     const filteredRepos = repos.data.filter(repo => !repo.fork);
     
-    return NextResponse.json(filteredRepos, {
-      headers: {
-        'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=7200',
-      },
-    });
+    return NextResponse.json(filteredRepos);
   } catch (error) {
     console.error("Failed to fetch GitHub repos:", error);
     return NextResponse.json(
