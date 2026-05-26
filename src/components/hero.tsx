@@ -29,9 +29,10 @@ export default function Hero() {
         {portfolioConfig.tagline} <span className="sr-only">tagline</span>
       </h3>
       <p className="my-6 max-w-2xl text-foreground/80">
-      Hey there 👋 I'm a Front-End Engineer with expertise in building scalable web and mobile applications.  
-      I worked at SNAPTEC, where I led the development of SaaS themes, administrative dashboards, and e-commerce solutions, but I am currently looking for a new job.  
-      I specialize in React, Next.js, and React Native, with a strong focus on performance optimization and user experience. Notable achievements include improving GTmetrix scores to grade A and being awarded Hero of the Year 2021.
+      Hey there 👋 I'm an AI Engineer with 7 years of experience building scalable web and mobile applications.
+      Currently at <a href="https://www.neurond.com/" className="underline" target="_blank" rel="noopener noreferrer">Neurond AI</a> (May 2025 — present), architecting an Enterprise AI Assistant Platform with multi-tenant RAG on pgvector, multi-provider LLM orchestration, and Azure-native infrastructure.
+      Previously spent 5+ years at SNAPTEC (Sep 2019 — Apr 2025), leading SaaS themes, admin dashboards, and e-commerce platforms — earned the Hero of the Year award in 2021.
+      I specialize in TypeScript, React, Next.js, and AI-Native engineering with Claude Code and Cursor.
         <span className="sr-only">bio</span>
       </p>
       <Socials />

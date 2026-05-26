@@ -2,8 +2,8 @@ import { SiteConfig } from "@/types";
 
 export const siteConfig: SiteConfig = {
   name: "MinhVo",
-  title: "MinhVo | Front-end Engineer",
-  description: "Hey there! I'm MinhVo, a passionate Front-End Engineer who brings ideas to life through elegant code and delightful user experiences. I specialize in crafting modern web applications that make a difference.",
+  title: "MinhVo | AI Engineer",
+  description: "Hey there! I'm MinhVo, an AI Engineer at Neurond AI building enterprise RAG platforms, multi-tenant SaaS, and model-agnostic AI systems. Specialize in TypeScript, Next.js, React, and AI-Native engineering with Claude Code.",
   origin: "https://minhvo.is-a.dev",
   keywords: [
     "MinhVo",
