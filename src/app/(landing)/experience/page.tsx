@@ -3,7 +3,7 @@ import type { Experience as ExperienceType } from "@/types";
 
 export default function ExperiencePage() {
   return (
-    <div className="w-full max-w-xl space-y-10 mt-10">
+    <div className="w-full max-w-5xl space-y-10 mt-10">
       {experiencesConfig.map((exp, i) => (
         <Experience key={i} experience={exp} />
       ))}

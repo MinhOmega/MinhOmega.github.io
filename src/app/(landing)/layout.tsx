@@ -14,7 +14,7 @@ export default function LandingPageLayout({
         </div>
         <div
           id="tab-section"
-          className="relative w-full mt-3 max-w-5xl mx-auto lg:mt-0 lg:w-3/5 p-2 md:p-8 pb-16 lg:pb-20"
+          className="relative w-full mt-3 max-w-6xl mx-auto lg:mt-0 lg:w-3/5 p-2 md:p-8 pb-16 lg:pb-20"
         >
           <Navbar />
           {children}
