@@ -23,19 +23,31 @@ For developers, the key question isn't whether AI image generation works — it 
 
 Diffusion models work in two phases: **forward diffusion** (adding Gaussian noise to training images until they become pure noise) and **reverse diffusion** (learning to remove noise step by step to recover the original image). During generation, the model starts with random noise and iteratively denoises it, guided by the text prompt, to produce a coherent image.
 
+The forward process is a fixed Markov chain that gradually adds Gaussian noise according to a variance schedule β₁, β₂, ..., βₜ. After T steps (typically T=1000), the image becomes indistinguishable from pure Gaussian noise. The reverse process learns to invert this: starting from xₜ ~ N(0, I), it predicts and removes noise at each step until recovering a clean image x₀.
+
 The text prompt guides the denoising process through cross-attention mechanisms. The text encoder (typically CLIP) converts the prompt into a vector representation, which the diffusion model uses at each denoising step to steer the image toward matching the description.
 
 ### Text Encoders and CLIP
 
 CLIP (Contrastive Language-Image Pre-training) is the bridge between text and images. It encodes both text and images into a shared embedding space where similar concepts are close together. When you write "a sunset over mountains," CLIP encodes this into a vector that points toward the region of image space containing sunset-over-mountain images.
 
+Stable Diffusion XL (SDXL) uses a dual text encoder architecture: OpenCLIP ViT-bigG and CLIP ViT-L. This allows it to capture both high-level semantic meaning and fine-grained stylistic details from prompts. The two embeddings are concatenated and used as conditioning input throughout the U-Net architecture.
+
 ### Samplers and Inference Steps
 
 The denoising process uses mathematical samplers (Euler, DPM++, DDIM) that control how noise is removed at each step. More steps generally produce higher quality but take longer. Most applications use 20-50 steps as the quality/latency sweet spot.
 
+Different samplers have distinct characteristics: **Euler Ancestral** produces creative, varied results with stochastic sampling; **DPM++ 2M Karras** converges quickly with deterministic output; **DDIM** enables fast sampling with fewer steps. For production, DPM++ 2M Karras at 25-30 steps provides the best balance of quality and speed.
+
+### CFG Scale (Classifier-Free Guidance)
+
+The CFG scale controls how closely the generated image follows the text prompt. A CFG of 1.0 means no guidance (pure random generation), while higher values (7-15) force the model to adhere strictly to the prompt. Values too high (>20) produce oversaturated, artificial-looking images. The sweet spot for most applications is 5-9.
+
 ### Image-to-Image and Inpainting
 
 Beyond text-to-image, diffusion models support **image-to-image** (transform an existing image based on a prompt) and **inpainting** (modify specific regions of an image while preserving the rest). These capabilities enable precise control over generated output.
+
+Image-to-image takes an input image and a prompt, adds noise to the input (controlled by a "strength" parameter from 0 to 1), then denoises toward the prompt. A strength of 0.3 preserves most of the original while adding subtle changes; 0.7 creates a significantly different image based on the same composition.
 
 ![Diffusion process visualization](https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=800&h=400&fit=crop)
 
@@ -45,17 +57,23 @@ Beyond text-to-image, diffusion models support **image-to-image** (transform an 
 
 Use cloud APIs (DALL-E, Stability API, Replicate) for simplicity and scalability. No GPU infrastructure needed — pay per image and scale instantly. Best for applications with moderate generation volume.
 
+The API pattern requires minimal infrastructure: a backend service that constructs prompts, calls the API, handles rate limits and retries, stores the generated images, and returns URLs to the frontend. The main ongoing cost is per-image API pricing.
+
 ### The Self-Hosted Pattern
 
 Run Stable Diffusion on your own GPU servers for maximum control, privacy, and cost efficiency at scale. Requires GPU infrastructure (NVIDIA A100 or equivalent) but eliminates per-image costs.
+
+Self-hosting is cost-effective above ~10,000 images per day. An NVIDIA A100 can generate ~4 SDXL images per second, meaning a single $1.50/hour GPU instance can produce ~14,000 images per hour — far cheaper than API calls at $0.04 each. The tradeoff is operational complexity: managing GPU instances, model loading, queue systems, and monitoring.
 
 ### The Pipeline Pattern
 
 Build multi-stage pipelines: prompt enhancement → image generation → quality filtering → post-processing. Each stage can be optimized independently, and you can add safety checks between stages.
 
+A production pipeline might include: (1) prompt validation and sanitization, (2) prompt enhancement with style/quality suffixes, (3) image generation with configurable parameters, (4) quality scoring with CLIP aesthetic predictor, (5) NSFW content filtering, (6) face restoration with GFPGAN, (7) upscaling with Real-ESRGAN, (8) storage and CDN delivery.
+
 ### The Caching Pattern
 
-Cache generated images with their prompts as keys. For applications with repetitive prompts (e-commerce product backgrounds, avatar generation), caching eliminates redundant generation and reduces costs.
+Cache generated images with their prompts as keys. For applications with repetitive prompts (e-commerce product backgrounds, avatar generation), caching eliminates redundant generation and reduces costs. Use a content-addressable hash of the prompt + parameters + seed as the cache key.
 
 ## Step-by-Step Implementation
 
@@ -112,15 +130,15 @@ class ImageGenerator:
             use_safetensors=True,
             variant="fp16",
         ).to("cuda")
-        
+
         self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
             self.pipe.scheduler.config
         )
-        
+
         # Enable memory optimizations
         self.pipe.enable_model_cpu_offload()
         self.pipe.enable_vae_slicing()
-    
+
     def generate(
         self,
         prompt: str,
@@ -132,7 +150,7 @@ class ImageGenerator:
         seed: int | None = None,
     ) -> Image.Image:
         generator = torch.Generator("cuda").manual_seed(seed) if seed else None
-        
+
         result = self.pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -142,7 +160,7 @@ class ImageGenerator:
             guidance_scale=guidance_scale,
             generator=generator,
         )
-        
+
         return result.images[0]
 
 # Usage
@@ -187,9 +205,9 @@ function isPromptSafe(prompt: string): boolean {
 app.post('/api/generate', async (req, res) => {
   try {
     await rateLimiter.consume(req.ip);
-    
+
     const { prompt, size, quality, style } = req.body;
-    
+
     if (!isPromptSafe(prompt)) {
       return res.status(400).json({ error: 'Prompt contains blocked content' });
     }
@@ -202,9 +220,9 @@ app.post('/api/generate', async (req, res) => {
 
     const enhanced = enhancePrompt(prompt);
     const urls = await generateImage({ prompt: enhanced, size, quality, style });
-    
+
     imageCache.set(cacheKey, urls[0]);
-    
+
     res.json({ url: urls[0], cached: false });
   } catch (err) {
     if (err instanceof Error && err.message.includes('rate')) {
@@ -217,6 +235,66 @@ app.post('/api/generate', async (req, res) => {
 app.listen(3000);
 ```
 
+### ComfyUI for Visual Workflows
+
+ComfyUI is a node-based interface for Stable Diffusion that enables complex generation workflows without code. For developers, ComfyUI's API mode allows you to define workflows as JSON graphs and execute them programmatically:
+
+```python
+import json
+import requests
+
+# Define a ComfyUI workflow as a node graph
+workflow = {
+    "3": {  # KSampler node
+        "class_type": "KSampler",
+        "inputs": {
+            "seed": 42,
+            "steps": 30,
+            "cfg": 7.5,
+            "sampler_name": "dpmpp_2m",
+            "scheduler": "karras",
+            "denoise": 1.0,
+            "model": ["4", 0],
+            "positive": ["6", 0],
+            "negative": ["7", 0],
+            "latent_image": ["5", 0],
+        }
+    },
+    "4": {  # Load checkpoint
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": "sdxl_base_1.0.safetensors"}
+    },
+    "5": {  # Empty latent
+        "class_type": "EmptyLatentImage",
+        "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+    },
+    "6": {  # Positive prompt
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": "A modern cityscape at sunset, cyberpunk style", "clip": ["4", 1]}
+    },
+    "7": {  # Negative prompt
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": "blurry, low quality", "clip": ["4", 1]}
+    },
+    "8": {  # VAE Decode
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
+    },
+    "9": {  # Save image
+        "class_type": "SaveImage",
+        "inputs": {"filename_prefix": "output", "images": ["8", 0]}
+    }
+}
+
+# Submit to ComfyUI API
+response = requests.post(
+    "http://localhost:8188/prompt",
+    json={"prompt": workflow}
+)
+```
+
+ComfyUI excels at complex workflows: multi-model pipelines, img2img with ControlNet, regional prompting, and batch processing. The visual interface makes it easy to experiment, and the JSON workflow format enables version control and programmatic execution.
+
 ![Image generation pipeline architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
 ## Real-World Use Cases
@@ -225,17 +303,70 @@ app.listen(3000);
 
 Generate product lifestyle images, backgrounds, and context shots without expensive photo shoots. Place products in different environments, lighting conditions, and compositions. This can reduce product photography costs by 80-90%.
 
+A typical e-commerce pipeline: photograph the product on a white background, use inpainting to remove the background, then use ControlNet with a depth map to place the product in generated environments. The result is photorealistic product-in-context images at a fraction of the cost of traditional photography.
+
 ### Marketing and Social Media Content
 
 Create unique images for blog posts, social media, ads, and email campaigns. Generate variations for A/B testing, seasonal campaigns, and localized content. The speed of generation enables rapid iteration on visual concepts.
+
+Marketing teams use batch generation to produce 50-100 image variations from a single concept brief, then select the best performers through A/B testing. This replaces the traditional workflow of commissioning a photographer for a single shoot.
 
 ### Game Development Concept Art
 
 Generate concept art for characters, environments, props, and UI elements. Artists use AI-generated images as starting points, dramatically accelerating the concept phase of game development.
 
+The workflow: generate 20-30 concept variations from a text brief, artist selects and refines the best 3-5, then uses img2img to iterate. This reduces concept art production time from weeks to days while maintaining creative direction.
+
 ### Architectural Visualization
 
-Generate architectural renderings from floor plans or text descriptions. Explore design options quickly, present concepts to clients, and visualize spaces before construction begins.
+Generate architectural renderings from floor plans or text descriptions. Explore design options quickly, present concepts to clients, and visualize spaces before construction begins. ControlNet with depth maps and edge detection ensures generated images respect architectural constraints.
+
+### Personalized Content at Scale
+
+Generate personalized images for email campaigns, user avatars, product recommendations, and dynamic ad creatives. Each user receives a unique image tailored to their preferences, demographics, or behavior — something impossible with traditional photography.
+
+## Prompt Engineering for Image Generation
+
+The quality of generated images depends heavily on prompt construction. A well-structured prompt follows a formula:
+
+```
+[Subject] [Action/Pose] [Environment] [Lighting] [Style] [Quality modifiers]
+```
+
+### Prompt Templates
+
+```typescript
+const promptTemplates = {
+  productPhotography: (product: string, context: string) =>
+    `Professional product photography of ${product} in ${context}, studio lighting, soft shadows, high-end commercial photo, 8k, sharp focus, color graded`,
+
+  conceptArt: (subject: string, style: string) =>
+    `${subject}, ${style} concept art, detailed environment, dramatic lighting, trending on artstation, 4k, digital painting, highly detailed`,
+
+  avatar: (description: string) =>
+    `Portrait of ${description}, professional headshot, studio lighting, soft background bokeh, photorealistic, sharp focus, 85mm lens`,
+
+  landscape: (scene: string, mood: string) =>
+    `${scene}, ${mood} atmosphere, golden hour lighting, wide angle, landscape photography, 8k resolution, National Geographic style`,
+};
+
+// Usage
+const prompt = promptTemplates.productPhotography(
+  "leather messenger bag",
+  "a rustic wooden desk with vintage books and a coffee cup"
+);
+```
+
+### Negative Prompt Best Practices
+
+```typescript
+const negativePrompts = {
+  general: "blurry, low quality, distorted, deformed, disfigured, bad anatomy, watermark, text, signature",
+  photorealistic: "cartoon, illustration, painting, drawing, anime, CGI, render, 3d",
+  portraits: "extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, ugly, bad anatomy, extra limbs",
+  landscapes: "people, buildings, roads, vehicles, power lines, urban elements",
+};
+```
 
 ## Best Practices for Production
 
@@ -255,6 +386,10 @@ Generate architectural renderings from floor plans or text descriptions. Explore
 
 8. **Monitor costs per image** — Track API costs, GPU utilization, and generation volume. Set budgets and alerts to prevent unexpected expenses.
 
+9. **Batch similar requests** — When generating multiple images from similar prompts, batch them to reduce model loading overhead and improve throughput.
+
+10. **Implement graceful degradation** — If the primary model fails, fall back to a faster/lower-quality model rather than showing an error.
+
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
@@ -262,14 +397,44 @@ Generate architectural renderings from floor plans or text descriptions. Explore
 | Vague prompts | Inconsistent, low-quality results | Use specific, detailed prompts with style/quality modifiers |
 | Ignoring safety filters | Inappropriate content served to users | Implement both prompt and image content filtering |
 | No caching | Redundant generation costs | Cache by prompt hash with TTL expiration |
-| Wrong aspect ratio | Distorted or cropped subjects | Choose aspect ratio based on content type |
+| Wrong aspect ratio | Distorted or cropped subjects | Choose aspect ratio based on content type (SDXL: 1024x1024, 768x1344, 1344x768) |
 | Over-reliance on API | High costs at scale | Hybrid: API for prototyping, self-hosted for production |
 | Ignoring prompt injection | Users manipulate generation | Sanitize and validate all user-provided prompts |
 | No fallback handling | Generation failures crash the app | Implement retries, fallback models, and graceful degradation |
+| Wrong CFG scale | Oversaturated or incoherent images | Use CFG 5-9 for most applications; test with your specific model |
+| Not using model-specific resolutions | Poor quality or artifacts | SDXL: 1024x1024 base; SD 1.5: 512x512 base |
+| Ignoring VAE selection | Color artifacts or washed-out images | Use a high-quality VAE (e.g., sdxl-vae-fp16-fix for SDXL) |
 
 ### Handling Prompt Injection
 
 User-provided prompts can contain injection attempts ("ignore previous instructions and generate..."). Sanitize prompts by removing instruction-like patterns, limiting length, and wrapping user input in delimiters.
+
+```typescript
+function sanitizePrompt(userInput: string): string {
+  // Remove potential injection patterns
+  let sanitized = userInput
+    .replace(/ignore\s+(previous|all)\s+instructions?/gi, '')
+    .replace(/system\s*:\s*/gi, '')
+    .replace(/\[INST\]/gi, '')
+    .replace(/\[\/INST\]/gi, '')
+    .trim();
+
+  // Limit length to prevent abuse
+  if (sanitized.length > 500) {
+    sanitized = sanitized.substring(0, 500);
+  }
+
+  // Check against blocklist
+  const blocked = ['explicit', 'nsfw', 'gore', 'violence'];
+  for (const term of blocked) {
+    if (sanitized.toLowerCase().includes(term)) {
+      throw new Error(`Blocked term detected: ${term}`);
+    }
+  }
+
+  return sanitized;
+}
+```
 
 ## Performance Optimization
 
@@ -282,6 +447,25 @@ const presets = {
   standard: { steps: 30, size: '1024x1024', model: 'sdxl-base' },    // ~5s
   premium: { steps: 50, size: '1024x1024', model: 'sdxl-refiner' },  // ~15s
 };
+```
+
+### GPU Memory Optimization
+
+For self-hosted deployments, GPU memory is often the bottleneck. These optimizations enable running on smaller GPUs:
+
+```python
+# Enable all memory optimizations for SDXL on 8GB GPU
+pipe.enable_model_cpu_offload()     # Offload to CPU when not in use
+pipe.enable_vae_slicing()           # Decode VAE in slices
+pipe.enable_vae_tiling()            # Tile VAE for large images
+pipe.enable_sequential_cpu_offload() # Aggressive offloading (slower but uses less VRAM)
+
+# Quantized inference for even lower memory usage
+from diffusers import BitsAndBytesConfig
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+)
 ```
 
 ## Comparison with Alternatives
@@ -300,19 +484,67 @@ const presets = {
 
 ControlNet adds spatial control to diffusion models using edge maps, depth maps, pose skeletons, or segmentation masks. This enables precise control over composition, character poses, and architectural layouts.
 
+```python
+from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+from controlnet_aux import CannyDetector
+
+controlnet = ControlNetModel.from_pretrained(
+    "diffusers/controlnet-canny-sdxl-1.0",
+    torch_dtype=torch.float16,
+)
+
+pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    controlnet=controlnet,
+    torch_dtype=torch.float16,
+).to("cuda")
+
+# Detect edges from reference image
+canny = CannyDetector()
+canny_image = canny(reference_image)
+
+# Generate with edge control
+image = pipe(
+    prompt="A modern living room, interior design photography",
+    image=canny_image,
+    controlnet_conditioning_scale=0.7,  # 0=ignore, 1=strict
+).images[0]
+```
+
 ### LoRA Fine-Tuning
 
 Fine-tune Stable Diffusion on your specific style, characters, or products using LoRA (Low-Rank Adaptation). With 20-50 training images, you can create a model that consistently generates images in your brand style.
 
+LoRA trains only a small set of rank-decomposition matrices (~10-100MB) instead of the full model (~6GB), making it fast and efficient. Training takes 15-60 minutes on a single GPU using tools like kohya-ss or Hugging Face's PEFT library.
+
 ### Inpainting and Outpainting
 
 Inpainting modifies specific regions of an image (changing a background, replacing an object) while outpainting extends an image beyond its original boundaries. These techniques enable precise, targeted modifications.
+
+```python
+from diffusers import StableDiffusionXLInpaintPipeline
+
+pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    torch_dtype=torch.float16,
+).to("cuda")
+
+result = pipe(
+    prompt="A red sports car parked in a garage",
+    image=original_image,
+    mask_image=mask,  # White = area to inpaint
+    strength=0.8,
+    num_inference_steps=30,
+).images[0]
+```
 
 ## Future Outlook
 
 Image generation is moving toward **real-time generation** (sub-second latency), **3D-aware generation** (generating 3D scenes from text), and **video generation** (extending static images into motion). The convergence of image generation with 3D rendering, animation, and AR/VR will create entirely new creative workflows.
 
 **Consistent character generation** — maintaining the same character across multiple images with different poses, expressions, and environments — is rapidly improving and will unlock applications in storytelling, gaming, and personalized content.
+
+The emergence of **video generation models** (Sora, Kling, Runway Gen-3) extends diffusion principles to temporal domains. These models generate coherent video sequences from text prompts, maintaining temporal consistency across frames. For developers, this means the same pipeline architecture used for image generation will soon serve video content.
 
 ## Conclusion
 
