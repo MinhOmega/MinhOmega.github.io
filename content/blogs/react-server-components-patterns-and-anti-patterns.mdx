@@ -1,7 +1,7 @@
 ---
 title: "React Server Components: Patterns and Anti-Patterns"
 date: "2025-03-15"
-description: "Master RSC: data fetching, client boundaries, serialization, and performance patterns."
+description: "Master RSC: data fetching strategies, client component boundaries, serialization rules, and performance patterns for production React apps."
 tags: ["React", "RSC", "Server Components", "Frontend"]
 published: true
 author: "MinhVo"
@@ -9,330 +9,479 @@ author: "MinhVo"
 
 ## Introduction
 
-React Server Components (RSC) introduce a new dimension to React development: the server/client boundary. Every component is a Server Component by default—running only on the server, with zero client JavaScript. Components marked with `'use client'` become Client Components that ship to the browser and can use hooks, browser APIs, and event handlers. This boundary is not just a technical detail; it determines where your code runs, what data it can access, and how much JavaScript reaches the user's browser.
+React Server Components (RSC) fundamentally change how React applications are structured. Instead of shipping all component logic to the browser, RSC lets you run components on the server — accessing databases, file systems, and secrets directly — while sending only the rendered output to the client. This reduces bundle size, eliminates data waterfalls, and simplifies architecture.
 
-With this new model comes a new set of patterns and anti-patterns. The patterns that work in traditional React (client-side data fetching, prop drilling through context, large client bundles) become anti-patterns in RSC. Meanwhile, patterns that were previously impossible or awkward (direct database access in components, streaming partial HTML, zero-JS static content) become the foundation of good architecture. Understanding these patterns is essential for building performant RSC applications.
+But RSC also introduces new rules. The boundary between server and client components creates constraints that, if violated, lead to runtime errors, security vulnerabilities, or performance regressions. This guide covers the patterns that work, the anti-patterns that don't, and the mental model you need to build production-grade RSC applications.
 
-This guide catalogs the most important RSC patterns and anti-patterns, organized by category: data fetching, component composition, state management, caching, and performance. Each pattern includes code examples showing the correct approach and the anti-pattern it replaces. By the end, you will have a clear mental model for designing RSC applications that are fast, maintainable, and leverage the full power of the server/client model.
+![Server architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-![React component architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+## The RSC Mental Model
 
-## Understanding RSC Patterns: Core Concepts
+### Two Types of Components
 
-### The Golden Rule
+RSC splits React components into two categories with different capabilities and constraints:
 
-Server Components are the default. Client Components are the exception. Every `'use client'` directive should be justified by a genuine need for interactivity, browser APIs, or React state. If a component can run on the server, it should.
+**Server Components** (default in Next.js App Router):
+- Run on the server during request handling
+- Can `async`/`await` — access databases, APIs, file systems
+- Cannot use hooks (`useState`, `useEffect`, `useRef`)
+- Cannot use browser APIs
+- Cannot use event handlers (`onClick`, `onChange`)
+- Zero JavaScript sent to client
 
-### The Serialization Boundary
+**Client Components** (opt-in with `'use client'`):
+- Run on both server (SSR) and client (hydration)
+- Can use all React hooks
+- Can use browser APIs and event handlers
+- JavaScript is sent to client for hydration
+- Cannot access server-only resources directly
 
-Data passed from Server to Client Components must be serializable (like JSON). Functions, class instances, symbols, and non-serializable values cannot cross. This constraint shapes how you compose components.
-
-![Server and client rendering](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
-
-## Patterns and Anti-Patterns
-
-### Pattern 1: Server Component as Data Fetcher
-
-**Pattern**: Fetch data directly in Server Components using `async/await`.
-
-```tsx
-// ✅ CORRECT: Server Component fetches its own data
+```typescript
+// Server Component — no JavaScript shipped
 async function ProductList() {
-  const products = await db.products.findMany({ take: 20 });
+  const products = await db.products.findMany(); // Direct DB access
+  return (
+    <ul>
+      {products.map(p => <li key={p.id}>{p.name}</li>)}
+    </ul>
+  );
+}
+
+// Client Component — JavaScript shipped to client
+'use client';
+import { useState } from 'react';
+
+function ProductFilter() {
+  const [category, setCategory] = useState('all');
+  return (
+    <select value={category} onChange={e => setCategory(e.target.value)}>
+      <option value="all">All</option>
+      <option value="electronics">Electronics</option>
+    </select>
+  );
+}
+```
+
+### The Boundary Rule
+
+The `'use client'` directive marks the boundary. Everything imported by a client component becomes client-side too. This means:
+
+```typescript
+// If this is a client component...
+'use client';
+import { HeavyChart } from './HeavyChart'; // ← Also client-side now
+import { formatCurrency } from './utils';   // ← Also client-side now
+
+// Server components can import client components
+// But client components CANNOT import server components
+```
+
+This unidirectional import rule is the most important constraint in RSC.
+
+## Pattern 1: Composition Over Conversion
+
+Instead of converting a server component to a client component, compose them:
+
+```typescript
+// BAD: Converting to client just to wrap children
+'use client';
+function DashboardLayout({ children }) {
   return (
     <div>
-      {products.map(p => <ProductCard key={p.id} product={p} />)}
+      <Sidebar />
+      <main>{children}</main>
     </div>
   );
 }
-```
 
-**Anti-Pattern**: Fetching data in Client Components with `useEffect`.
-
-```tsx
-// ❌ ANTI-PATTERN: Client-side data fetching
-'use client';
-function ProductList() {
-  const [products, setProducts] = useState([]);
-  useEffect(() => {
-    fetch('/api/products').then(r => r.json()).then(setProducts);
-  }, []);
-  // Waterfall: JS loads → component mounts → fetch starts → data arrives → render
-}
-```
-
-### Pattern 2: Composition Over Props
-
-**Pattern**: Use children and composition to pass non-serializable values.
-
-```tsx
-// ✅ CORRECT: Client Component wraps Server Component via children
-// app/page.tsx (Server Component)
-async function Page() {
-  const data = await fetchData();
-  return (
-    <InteractiveWrapper>
-      <StaticContent data={data} />
-    </InteractiveWrapper>
-  );
-}
-
-// app/interactive-wrapper.tsx (Client Component)
-'use client';
-function InteractiveWrapper({ children }) {
-  const [isOpen, setIsOpen] = useState(false);
-  return (
-    <div onClick={() => setIsOpen(!isOpen)}>
-      {children}
-      {isOpen && <Details />}
-    </div>
-  );
-}
-```
-
-**Anti-Pattern**: Passing functions across the boundary.
-
-```tsx
-// ❌ ANTI-PATTERN: Passing non-serializable props
-async function Page() {
-  const handler = () => console.log('clicked'); // Function!
-  return <ClientButton onClick={handler} />; // Serialization error
-}
-```
-
-### Pattern 3: Push Client Boundaries Down
-
-**Pattern**: Keep `'use client'` at the leaf level.
-
-```tsx
-// ✅ CORRECT: Only the interactive leaf is a Client Component
-// app/product/page.tsx (Server Component)
-async function ProductPage({ params }) {
-  const product = await db.products.findUnique({ where: { id: params.id } });
+// GOOD: Keep layout as server component, extract interactive parts
+// app/dashboard/layout.tsx (server component)
+function DashboardLayout({ children }) {
   return (
     <div>
-      <h1>{product.name}</h1>
-      <p>{product.description}</p>
-      <PriceDisplay price={product.price} />
-      <AddToCartButton productId={product.id} />
+      <Sidebar />          {/* client component */}
+      <main>{children}</main>
     </div>
   );
 }
 
-// app/add-to-cart-button.tsx (Client Component - leaf)
+// app/dashboard/sidebar.tsx (client component)
 'use client';
-function AddToCartButton({ productId }) {
-  const [loading, setLoading] = useState(false);
-  return <button onClick={() => addToCart(productId)}>Add to Cart</button>;
-}
-```
-
-**Anti-PATTERN**: Marking entire pages as client components.
-
-```tsx
-// ❌ ANTI-PATTERN: Entire page is a Client Component
-'use client';
-function ProductPage() {
-  // All data fetching, state, and rendering ships to client
-  // Much more JavaScript, slower hydration
-}
-```
-
-### Pattern 4: Server-Side Data Transformation
-
-**Pattern**: Transform and filter data on the server before sending to client.
-
-```tsx
-// ✅ CORRECT: Server filters and transforms
-async function Dashboard() {
-  const rawData = await fetchExpensiveData();
-  const summary = {
-    total: rawData.length,
-    average: rawData.reduce((a, b) => a + b.value, 0) / rawData.length,
-    topItems: rawData.sort((a, b) => b.value - a.value).slice(0, 10),
-  };
-  return <DashboardCharts summary={summary} />; // Only summary crosses boundary
-}
-```
-
-**Anti-Pattern**: Sending raw data to client for transformation.
-
-```tsx
-// ❌ ANTI-PATTERN: Client transforms large datasets
-'use client';
-function Dashboard({ rawData }) { // 10,000 items serialized and sent to client
-  const summary = useMemo(() => expensiveTransform(rawData), [rawData]);
-  return <Chart data={summary} />;
-}
-```
-
-### Pattern 5: Streaming with Suspense
-
-**Pattern**: Use Suspense boundaries to stream content progressively.
-
-```tsx
-// ✅ CORRECT: Fast content renders immediately, slow content streams in
-async function Page() {
+function Sidebar() {
+  const [collapsed, setCollapsed] = useState(false);
   return (
-    <div>
-      <Header /> {/* Immediate */}
-      <Suspense fallback={<ArticleSkeleton />}>
-        <Article /> {/* Streams when ready */}
-      </Suspense>
-      <Suspense fallback={<CommentsSkeleton />}>
-        <Comments /> {/* Streams independently */}
-      </Suspense>
-    </div>
+    <aside className={collapsed ? 'collapsed' : ''}>
+      <button onClick={() => setCollapsed(!collapsed)}>Toggle</button>
+      {/* nav items */}
+    </aside>
   );
 }
 ```
 
-**Anti-Pattern**: No Suspense boundaries—entire page waits for slowest data.
+## Pattern 2: Server Component Data Fetching
 
-```tsx
-// ❌ ANTI-PATTERN: Everything blocked by slowest fetch
-async function Page() {
-  const [article, comments] = await Promise.all([
-    fetchArticle(), // Fast
-    fetchComments(), // Slow
+### Parallel Fetching
+
+```typescript
+// Both queries run in parallel — no waterfall
+async function DashboardPage() {
+  const [user, posts, analytics] = await Promise.all([
+    getUser(),
+    getPosts(),
+    getAnalytics(),
   ]);
-  // Nothing renders until both complete
-  return <div><Article data={article} /><Comments data={comments} /></div>;
+
+  return (
+    <div>
+      <UserProfile user={user} />
+      <PostList posts={posts} />
+      <AnalyticsChart data={analytics} />
+    </div>
+  );
 }
 ```
 
-### Pattern 6: Server Actions for Mutations
+### Streaming with Suspense
 
-```tsx
-// ✅ CORRECT: Server Action with validation and revalidation
+```typescript
+// Components stream independently
+async function DashboardPage() {
+  return (
+    <div>
+      <Header />  {/* Renders immediately */}
+
+      <Suspense fallback={<ChartSkeleton />}>
+        <AnalyticsChart />  {/* Streams when data ready */}
+      </Suspense>
+
+      <Suspense fallback={<TableSkeleton />}>
+        <DataTable />  {/* Streams independently */}
+      </Suspense>
+    </div>
+  );
+}
+```
+
+### Cached Fetching
+
+```typescript
+import { unstable_cache } from 'next/cache';
+
+const getProducts = unstable_cache(
+  async () => db.products.findMany(),
+  ['products'],
+  { revalidate: 3600, tags: ['products'] }
+);
+
+async function ProductPage() {
+  const products = await getProducts(); // Cached for 1 hour
+  // ...
+}
+```
+
+![Data flow patterns](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Pattern 3: Passing Server Data to Client Components
+
+Client components can't fetch server resources directly, but server components can pass data to them as props:
+
+```typescript
+// Server component fetches data
+async function ProductPage({ params }: { params: { id: string } }) {
+  const product = await db.products.findUnique({
+    where: { id: params.id },
+  });
+
+  const reviews = await db.reviews.findMany({
+    where: { productId: params.id },
+  });
+
+  // Pass server data to client component as props
+  return (
+    <div>
+      <ProductDetails product={product} />
+      <ReviewSection initialReviews={reviews} productId={params.id} />
+    </div>
+  );
+}
+
+// Client component uses data for interactivity
+'use client';
+function ReviewSection({ initialReviews, productId }) {
+  const [reviews, setReviews] = useState(initialReviews);
+  const [sortBy, setSortBy] = useState('newest');
+
+  const sorted = useMemo(() => {
+    return [...reviews].sort((a, b) =>
+      sortBy === 'newest'
+        ? new Date(b.createdAt) - new Date(a.createdAt)
+        : b.rating - a.rating
+    );
+  }, [reviews, sortBy]);
+
+  return (
+    <div>
+      <select value={sortBy} onChange={e => setSortBy(e.target.value)}>
+        <option value="newest">Newest</option>
+        <option value="rating">Highest Rated</option>
+      </select>
+      {sorted.map(review => <ReviewCard key={review.id} review={review} />)}
+    </div>
+  );
+}
+```
+
+## Pattern 4: Server Actions for Mutations
+
+```typescript
+// actions.ts
 'use server';
-async function addTodo(formData: FormData) {
-  const title = formData.get('title');
-  if (!title || title.length < 3) return { error: 'Too short' };
-  await db.todos.create({ data: { title } });
-  revalidatePath('/todos');
+
+export async function addToCart(productId: string, quantity: number) {
+  const session = await getSession();
+  if (!session) throw new Error('Not authenticated');
+
+  await db.cartItems.upsert({
+    where: {
+      userId_productId: { userId: session.userId, productId },
+    },
+    update: { quantity: { increment: quantity } },
+    create: { userId: session.userId, productId, quantity },
+  });
+
+  revalidatePath('/cart');
   return { success: true };
 }
 ```
 
-### Pattern 7: Caching with revalidateTag
+```typescript
+// Client component calls server action
+'use client';
+import { addToCart } from './actions';
 
-```tsx
-// ✅ CORRECT: Tag-based cache invalidation
-async function getProduct(id: string) {
-  const product = await fetch(`/api/products/${id}`, {
-    next: { tags: [`product-${id}`] },
-  });
-  return product.json();
-}
+function AddToCartButton({ productId }: { productId: string }) {
+  const [isPending, startTransition] = useTransition();
 
-// Invalidate specific product
-'use server';
-async function updateProduct(id: string, data: ProductData) {
-  await db.products.update({ where: { id }, data });
-  revalidateTag(`product-${id}`);
+  return (
+    <button
+      disabled={isPending}
+      onClick={() => startTransition(() => addToCart(productId, 1))}
+    >
+      {isPending ? 'Adding...' : 'Add to Cart'}
+    </button>
+  );
 }
 ```
 
-![Caching and performance patterns](https://images.unsplash.com/photo-1504868584819-f8e8b4b6d7e3?w=800&h=400&fit=crop)
+## Anti-Pattern 1: `'use client'` at the Top Level
 
-## Real-World Use Cases
+Placing `'use client'` in your root layout or top-level pages defeats RSC's benefits:
 
-### Use Case 1: Blog with Interactive Comments
+```typescript
+// BAD: Everything is client-side
+// app/layout.tsx
+'use client';
+export default function RootLayout({ children }) {
+  return <html><body>{children}</body></html>;
+}
 
-Server Components render the blog post (zero JS). A Client Component handles the comment form with state management and optimistic updates.
+// GOOD: Keep root as server component
+// app/layout.tsx
+export default function RootLayout({ children }) {
+  return (
+    <html>
+      <body>
+        <Navigation /> {/* client component, only this */}
+        {children}     {/* server components by default */}
+      </body>
+    </html>
+  );
+}
+```
 
-### Use Case 2: E-Commerce Catalog
+## Anti-Pattern 2: Passing Non-Serializable Props
 
-Server Components render product listings and details. Client Components handle cart management, quantity selectors, and image galleries.
+Server components can only pass serializable data to client components:
 
-### Use Case 3: Dashboard with Real-Time Widgets
+```typescript
+// BROKEN: Functions, Dates, and class instances are not serializable
+async function Page() {
+  const handleClick = () => console.log('clicked');
+  return <Button onClick={handleClick} />; // Error!
+}
 
-Server Components render the dashboard layout and static widgets. Client Components handle WebSocket-connected real-time widgets and interactive charts.
+// BROKEN: Date objects
+async function Page() {
+  const date = new Date();
+  return <DatePicker value={date} />; // May cause issues
+}
 
-## Best Practices for Production
+// FIX: Pass primitive values
+async function Page() {
+  return <DatePicker value={new Date().toISOString()} />; // String is serializable
+}
+```
 
-1. **Default to Server Components**: Every component starts as a Server Component. Only add `'use client'` when you need interactivity.
-2. **Use composition to pass non-serializable values**: Wrap Client Components around Server Components via children, not props.
-3. **Fetch data in Server Components**: Eliminate `useEffect` data fetching patterns entirely.
-4. **Transform data on the server**: Don't send raw data to the client. Filter, sort, and aggregate on the server.
-5. **Use Suspense for streaming**: Wrap slow components in Suspense boundaries to avoid blocking the entire page.
-6. **Cache with tags**: Use `revalidateTag` for targeted cache invalidation instead of `revalidatePath` for broader invalidation.
-7. **Analyze client bundles**: Regularly check how much JavaScript you're shipping. Tools like `@next/bundle-analyzer` reveal client component bloat.
-8. **Test the boundary**: Verify that Server Components don't accidentally import client-only code and vice versa.
+## Anti-Pattern 3: Importing Server Modules in Client Components
 
-## Common Pitfalls and Solutions
+```typescript
+// BROKEN: Database module in client component
+'use client';
+import { db } from '@/lib/database'; // This exposes DB to the client!
+
+// FIX: Use server actions for data access
+'use server';
+export async function getUsers() {
+  return db.users.findMany();
+}
+```
+
+## Anti-Pattern 4: No Suspense Boundaries for Slow Queries
+
+```typescript
+// BAD: Entire page waits for slowest query
+async function DashboardPage() {
+  const fastData = await getFastData();     // 50ms
+  const slowData = await getSlowData();     // 2000ms
+  return <Dashboard fast={fastData} slow={slowData} />;
+}
+
+// GOOD: Stream content progressively
+async function DashboardPage() {
+  return (
+    <div>
+      <FastSection />    {/* Renders in 50ms */}
+      <Suspense fallback={<SlowSkeleton />}>
+        <SlowSection />  {/* Streams after 2000ms */}
+      </Suspense>
+    </div>
+  );
+}
+```
+
+![Performance monitoring](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Pattern 5: Shared Layout Data
+
+```typescript
+// app/layout.tsx — Server component
+async function RootLayout({ children }) {
+  const session = await getSession();
+
+  return (
+    <html>
+      <body>
+        <Header user={session?.user} />
+        {children}
+      </body>
+    </html>
+  );
+}
+
+// Client component receives data from server layout
+'use client';
+function Header({ user }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  return (
+    <header>
+      <button onClick={() => setMenuOpen(!menuOpen)}>Menu</button>
+      {user ? <span>Welcome, {user.name}</span> : <a href="/login">Login</a>}
+    </header>
+  );
+}
+```
+
+## Pattern 6: Error Handling
+
+```typescript
+// Server component with error handling
+async function ProductPage({ params }) {
+  try {
+    const product = await getProduct(params.id);
+    return <ProductDetails product={product} />;
+  } catch (error) {
+    if (error.code === 'NOT_FOUND') {
+      notFound();
+    }
+    throw error; // Let error boundary handle it
+  }
+}
+
+// app/products/[id]/error.tsx
+'use client';
+export default function ProductError({ error, reset }) {
+  return (
+    <div>
+      <h2>Failed to load product</h2>
+      <p>{error.message}</p>
+      <button onClick={reset}>Try again</button>
+    </div>
+  );
+}
+```
+
+## Serialization Rules
+
+What can be passed from server to client components:
+
+| Type | Serializable? | Notes |
+|------|--------------|-------|
+| String | ✅ | |
+| Number | ✅ | |
+| Boolean | ✅ | |
+| null/undefined | ✅ | |
+| Plain objects | ✅ | No class instances |
+| Arrays | ✅ | |
+| Date | ❌ | Use `.toISOString()` |
+| Map/Set | ❌ | Convert to array |
+| Functions | ❌ | Use server actions |
+| React elements | ✅ | Children are serializable |
+| Promises | ✅ | For streaming |
+
+## Best Practices
+
+1. **Default to server components** — Only add `'use client'` when needed
+2. **Push client boundaries down** — Keep them as leaf nodes
+3. **Compose, don't convert** — Wrap server components in client shells
+4. **Fetch in server components** — Eliminate client-side waterfalls
+5. **Use Suspense for streaming** — Progressive rendering improves UX
+6. **Pass serializable data only** — Strings, numbers, plain objects
+7. **Use server actions for mutations** — Built-in security and progressive enhancement
+8. **Cache with tags** — Fine-grained invalidation control
+
+## Common Pitfalls
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| `'use client'` too high | Large JS bundle | Push boundary to leaf components |
-| Passing functions as props | Serialization error | Use composition (children pattern) |
-| Client-side data fetching | Waterfalls, slower page | Fetch in Server Components |
-| No Suspense boundaries | Slow first paint | Add Suspense around slow components |
-| Sending large datasets to client | Slow serialization, large payload | Transform on server, send summary |
-| Using hooks in Server Components | Runtime error | Move to Client Component |
-| Not caching server data | Redundant database queries | Use `unstable_cache` or fetch caching |
+| `'use client'` at root | No RSC benefits | Restrict to interactive components |
+| Non-serializable props | Runtime errors | Use primitives and plain objects |
+| Server imports in client | Security leak | Use server actions |
+| No Suspense boundaries | Slow TTFB | Wrap slow queries |
+| Client-side waterfalls | Slow page loads | Fetch in server components |
+| Missing error handling | White screens | Add error.tsx files |
 
-## Performance Optimization
+### Performance Monitoring for RSC
 
-```tsx
-// Use React.cache() for request-level deduplication
-import { cache } from 'react';
+Monitor Server Component performance by tracking server rendering time, serialized payload size, and client hydration time. Use OpenTelemetry or similar tracing libraries to instrument your Server Components and measure the time spent in data fetching, rendering, and serialization. Set up alerts for rendering time regressions that may indicate slow database queries or external API calls. Compare Server Component rendering times against client-side rendering times to verify that the server-side approach provides the expected performance benefits. Use these metrics to identify optimization opportunities and track the impact of changes over time.
 
-const getUser = cache(async (id: string) => {
-  return db.users.findUnique({ where: { id } });
-});
+### Migration from Client Components
 
-// Multiple components calling getUser(id) → one DB query per request
+When migrating existing Client Components to Server Components, follow a systematic approach. First, identify components that do not use client-side interactivity like useState, useEffect, or event handlers. These are candidates for Server Components. Second, extract the interactive parts into separate Client Components that receive data as props from the parent Server Component. Third, verify that the migrated component correctly fetches data on the server and passes it to the client components. Fourth, test the migration by comparing the rendered output and behavior before and after. This incremental approach minimizes risk and allows you to validate each migration step independently.
 
-// Parallel data fetching in Server Components
-async function Dashboard() {
-  const [user, orders, analytics] = await Promise.all([
-    getUser('123'),
-    getOrders('123'),
-    getAnalytics(),
-  ]);
-  // All three fetch in parallel, not sequentially
-}
-```
+Understanding the boundary between server and client components is essential for building performant React applications that leverage the best of both worlds.
 
-## Comparison with Alternatives
-
-| Approach | JS Shipped | Data Fetching | Caching | Streaming |
-|----------|-----------|---------------|---------|-----------|
-| RSC (correct patterns) | Minimal | Server-side | Built-in | Yes |
-| RSC (anti-patterns) | Large | Client-side | Manual | No |
-| Traditional SSR | Full bundle | Server + Client | Manual | Limited |
-| SPA | Full bundle | Client-side | Manual | No |
-| Astro Islands | Zero | Server-side | Manual | No |
-
-## Testing Strategies
-
-```tsx
-// Test Server Components as async functions
-import { renderToString } from 'react-dom/server';
-
-test('ProductList renders products from database', async () => {
-  const html = await renderToString(<ProductList />);
-  expect(html).toContain('Product Name');
-});
-
-// Test Client Components with React Testing Library
-import { render, screen } from '@testing-library/react';
-
-test('AddToCartButton calls action on click', async () => {
-  render(<AddToCartButton productId="1" />);
-  await userEvent.click(screen.getByText('Add to Cart'));
-  expect(mockAddToCart).toHaveBeenCalledWith('1');
-});
-```
-
-## Future Outlook
-
-RSC patterns are still evolving. The React team is working on improving the server-client boundary tooling, adding better error messages for serialization issues, and optimizing the wire format. As the ecosystem matures, we can expect more libraries to provide Server Component-compatible APIs and better developer tools for understanding the boundary.
+Understanding the boundary between server and client components is essential for building performant React applications that leverage the best of both worlds while avoiding common pitfalls that lead to unnecessary client-side JavaScript.
 
 ## Conclusion
 
-React Server Components introduce a new way of thinking about React architecture. The patterns are: fetch data in Server Components, use composition to pass non-serializable values, push client boundaries to leaves, transform data on the server, stream with Suspense, and cache with tags. The anti-patterns are: marking everything as `'use client'`, fetching data in Client Components, passing functions across the boundary, and sending large raw datasets to the client.
+React Server Components require a mental model shift from traditional React development. The key insight is that server and client components serve complementary purposes: server components handle data and rendering, client components handle interactivity. By respecting the boundary rules and following the patterns in this guide, you can build applications that are faster, smaller, and more secure.
 
-By following these patterns, you build applications that ship minimal JavaScript, load fast, and provide excellent user experiences. The server/client boundary is not a limitation—it is a design tool that forces clean separation between data access (server) and interactivity (client).
+Key takeaways:
+
+1. **Server components are the default** — They handle data access and rendering
+2. **Client components handle interactivity** — Use `'use client'` only when needed
+3. **Composition over conversion** — Wrap, don't convert
+4. **Fetch in server components** — No waterfalls, direct DB access
+5. **Stream with Suspense** — Progressive rendering for better UX
+6. **Serialize carefully** — Only plain data crosses the boundary
+7. **Server actions for mutations** — Secure, progressive enhancement built-in
