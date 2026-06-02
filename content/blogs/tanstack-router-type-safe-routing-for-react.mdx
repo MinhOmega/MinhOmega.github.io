@@ -9,54 +9,728 @@ author: "MinhVo"
 
 ## Introduction
 
-TanStack Router: Type-Safe Routing for React is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Routing is the backbone of any web application. It determines which component renders for a given URL, how data flows between pages, and how users navigate through the application. In the React ecosystem, React Router has long been the default choice. However, React Router's approach to type safety is minimal—you get no guarantees that your route parameters match your component expectations, that your search parameters are valid, or that your link targets exist. These gaps lead to runtime errors that TypeScript should catch at compile time.
 
-## Key Concepts
+TanStack Router takes a fundamentally different approach. Built from the ground up with TypeScript, it provides end-to-end type safety for every aspect of routing: route parameters, search parameters, context, loaders, and even the paths in your `<Link>` components. If you change a route parameter name, every link pointing to that route gets a compile error. If you add a required search parameter, every call site is immediately flagged. This level of safety transforms routing from a source of runtime bugs into a compile-time guarantee.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+Beyond type safety, TanStack Router introduces powerful features like built-in search parameter validation, route loaders with caching and deduplication, route contexts for dependency injection, and file-based routing. The router is framework-agnostic at its core but provides first-class React integration.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+This guide covers everything from basic route configuration to advanced patterns like search parameter schemas, parallel route loading, and file-based routing. We will explore the type system that makes TanStack Router unique, walk through production-ready implementations, and compare it with React Router and other routing solutions.
 
-## Practical Implementation
+![TanStack Router architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-Let's look at a practical example:
+## Understanding TanStack Router: Core Concepts
+
+### Type-Safe Route Configuration
+
+The foundation of TanStack Router is its type-safe route configuration. Routes are defined using a builder pattern that infers types from parent to child. The router tracks every parameter, every search parameter, and every loader return type across the entire route tree, making it impossible to reference a parameter that does not exist or pass the wrong type to a link.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
+// routes/__root.tsx
+import { createRootRoute, Link, Outlet } from '@tanstack/react-router';
+
+export const Route = createRootRoute({
+  component: RootComponent,
+  notFoundComponent: () => (
+    <div className="text-center py-12">
+      <h1 className="text-4xl font-bold">404</h1>
+      <p className="mt-4 text-gray-600">Page not found</p>
+      <Link to="/" className="mt-4 inline-block text-blue-600">Go home</Link>
+    </div>
+  ),
+});
+
+function RootComponent() {
+  return (
+    <div>
+      <nav className="flex gap-4 p-4 bg-white shadow">
+        <Link to="/" activeProps={{ className: 'font-bold text-blue-600' }}>
+          Home
+        </Link>
+        <Link to="/about">About</Link>
+        <Link to="/users/$userId" params={{ userId: '123' }}>
+          User 123
+        </Link>
+        <Link to="/products" search={{ page: 1, sort: 'name' }}>
+          Products
+        </Link>
+      </nav>
+      <Outlet />
+    </div>
+  );
+}
+
+// routes/index.tsx
+import { createFileRoute } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/')({
+  component: Home,
+});
+
+function Home() {
+  return <h1>Home Page</h1>;
+}
+
+// routes/users.$userId.tsx
+import { createFileRoute } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/users/$userId')({
+  component: UserProfile,
+  loader: ({ params }) => fetchUser(params.userId),
+});
+
+function UserProfile() {
+  const { userId } = Route.useParams(); // TypeScript knows userId is string
+  const user = Route.useLoaderData(); // TypeScript knows the return type
   
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+  return <h1>User: {user.name}</h1>;
 }
 ```
 
-This pattern demonstrates the core approach to implementing TanStack Router solutions in production environments.
+### Search Parameter Validation
 
-## Best Practices
+One of TanStack Router's most powerful features is typed and validated search parameters. Instead of manually parsing `URLSearchParams` and hoping the values are correct, you define a schema that validates and types your search parameters automatically:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+import { createFileRoute } from '@tanstack/react-router';
+import { z } from 'zod';
 
-## Common Pitfalls
+const searchSchema = z.object({
+  page: z.number().default(1),
+  limit: z.number().default(10),
+  sort: z.enum(['name', 'date', 'price']).default('name'),
+  order: z.enum(['asc', 'desc']).default('asc'),
+  search: z.string().optional(),
+});
+
+export const Route = createFileRoute('/products')({
+  component: ProductList,
+  validateSearch: searchSchema,
+});
+
+function ProductList() {
+  const { page, limit, sort, order, search } = Route.useSearch();
+  // TypeScript knows: page is number, sort is 'name' | 'date' | 'price', etc.
+  
+  return (
+    <div>
+      <p>Page {page}, showing {limit} items, sorted by {sort} {order}</p>
+      {search && <p>Search query: {search}</p>}
+    </div>
+  );
+}
+```
+
+When a user navigates to `/products?sort=invalid&page=abc`, the schema rejects the invalid values and applies defaults. Your component never sees malformed data. This is a significant improvement over the manual parsing approach where every component must defensively check types.
+
+### Route Loaders
+
+Loaders fetch data before a route renders, preventing loading spinners and ensuring data is available when the component mounts. They support caching, deduplication, and error handling:
+
+```typescript
+import { createFileRoute } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/posts/$postId')({
+  component: PostDetail,
+  loader: async ({ params, context }) => {
+    const [post, comments] = await Promise.all([
+      context.api.getPost(params.postId),
+      context.api.getComments(params.postId),
+    ]);
+    return { post, comments };
+  },
+  staleTime: 60 * 1000, // Cache loader data for 1 minute
+});
+
+function PostDetail() {
+  const { post, comments } = Route.useLoaderData();
+  // TypeScript knows the exact shape of post and comments
+  
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <p>{post.body}</p>
+      <h2>Comments ({comments.length})</h2>
+      {comments.map((comment) => (
+        <div key={comment.id}>{comment.body}</div>
+      ))}
+    </article>
+  );
+}
+```
+
+![Type-safe routing diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Router Configuration
+
+Create the router instance with context and default settings. The context provides dependency injection, allowing routes to access services without importing them directly:
+
+```typescript
+// router.tsx
+import { createRouter } from '@tanstack/react-router';
+import { routeTree } from './routeTree.gen';
+
+export interface RouterContext {
+  api: ApiClient;
+  auth: AuthService;
+}
+
+export const router = createRouter({
+  routeTree,
+  context: {
+    api: undefined!, // Will be provided at runtime
+    auth: undefined!,
+  },
+  defaultPreload: 'intent', // Preload on hover/focus
+  defaultPreloadStaleTime: 10 * 1000,
+});
+
+// Register the router for type safety
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: typeof router;
+  }
+}
+
+// App.tsx
+import { RouterProvider } from '@tanstack/react-router';
+import { router } from './router';
+
+function App() {
+  const api = useApi();
+  const auth = useAuth();
+
+  return (
+    <RouterProvider 
+      router={router} 
+      context={{ api, auth }} 
+    />
+  );
+}
+```
+
+### Nested Routes with Layout
+
+Define nested routes that share layouts. The layout component renders an `<Outlet />` where child routes mount:
+
+```typescript
+// routes/dashboard.tsx
+import { createFileRoute, Outlet, Link } from '@tanstack/react-router';
+
+export const Route = createFileRoute('/dashboard')({
+  component: DashboardLayout,
+});
+
+function DashboardLayout() {
+  return (
+    <div className="flex min-h-screen">
+      <aside className="w-64 bg-gray-100 p-4 border-r">
+        <nav className="space-y-2">
+          <Link to="/dashboard" activeProps={{ className: 'font-bold bg-white' }}
+                className="block px-4 py-2 rounded">
+            Overview
+          </Link>
+          <Link to="/dashboard/analytics" activeProps={{ className: 'font-bold bg-white' }}
+                className="block px-4 py-2 rounded">
+            Analytics
+          </Link>
+          <Link to="/dashboard/settings" activeProps={{ className: 'font-bold bg-white' }}
+                className="block px-4 py-2 rounded">
+            Settings
+          </Link>
+        </nav>
+      </aside>
+      <main className="flex-1 p-8">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+// routes/dashboard.index.tsx
+export const Route = createFileRoute('/dashboard/')({
+  component: DashboardOverview,
+  loader: async ({ context }) => context.api.getDashboardSummary(),
+});
+
+function DashboardOverview() {
+  const summary = Route.useLoaderData();
+  return (
+    <div>
+      <h1 className="text-2xl font-bold">Dashboard</h1>
+      <div className="grid grid-cols-3 gap-4 mt-6">
+        <div className="bg-white p-6 rounded-lg shadow">
+          <p className="text-sm text-gray-500">Total Users</p>
+          <p className="text-3xl font-bold">{summary.totalUsers}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// routes/dashboard.analytics.tsx
+export const Route = createFileRoute('/dashboard/analytics')({
+  component: Analytics,
+  loader: async ({ context }) => context.api.getAnalytics(),
+});
+
+// routes/dashboard.settings.tsx
+export const Route = createFileRoute('/dashboard/settings')({
+  component: Settings,
+});
+```
+
+### Type-Safe Navigation
+
+Links are type-safe—incorrect paths or missing parameters cause compile errors. This is one of TanStack Router's most distinctive features:
+
+```typescript
+import { Link, useNavigate } from '@tanstack/react-router';
+
+function Navigation() {
+  return (
+    <nav>
+      {/* Simple path */}
+      <Link to="/">Home</Link>
+      <Link to="/about">About</Link>
+      
+      {/* Dynamic path with required params */}
+      <Link to="/users/$userId" params={{ userId: '123' }}>
+        User 123
+      </Link>
+      
+      {/* With search parameters - type-checked */}
+      <Link 
+        to="/products" 
+        search={{ page: 2, sort: 'price', order: 'desc' }}
+      >
+        Products (Page 2)
+      </Link>
+      
+      {/* Active link styling */}
+      <Link 
+        to="/dashboard" 
+        activeProps={{ className: 'text-blue-600 font-bold' }}
+        inactiveProps={{ className: 'text-gray-600' }}
+      >
+        Dashboard
+      </Link>
+      
+      {/* Preloading on hover */}
+      <Link to="/heavy-page" preload="intent">
+        Heavy Page (preloads on hover)
+      </Link>
+    </nav>
+  );
+}
+
+// Programmatic navigation with type safety
+function useNavigateToUser() {
+  const navigate = useNavigate();
+  
+  return (userId: string) => {
+    navigate({ 
+      to: '/users/$userId', 
+      params: { userId },
+      search: { tab: 'posts' }, // Type-checked against the route definition
+    });
+  };
+}
+```
+
+## Step-by-Step Implementation
+
+### Setting Up TanStack Router
+
+Install the required packages:
+
+```bash
+npm install @tanstack/react-router @tanstack/router-devtools
+npm install -D @tanstack/router-plugin @tanstack/router-vite-plugin
+```
+
+Configure Vite with the TanStack Router plugin for file-based routing:
+
+```typescript
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import TanStackRouterVite from '@tanstack/router-vite-plugin';
+
+export default defineConfig({
+  plugins: [
+    TanStackRouterVite(),
+    react(),
+  ],
+});
+```
+
+Create the root route:
+
+```typescript
+// src/routes/__root.tsx
+import { createRootRoute, Link, Outlet } from '@tanstack/react-router';
+import { TanStackRouterDevtools } from '@tanstack/router-devtools';
+
+export const Route = createRootRoute({
+  component: () => (
+    <div className="min-h-screen bg-gray-50">
+      <header className="bg-white shadow">
+        <div className="max-w-7xl mx-auto px-4 py-4 flex gap-6">
+          <Link to="/" className="text-xl font-bold">MyApp</Link>
+          <Link to="/about">About</Link>
+          <Link to="/users">Users</Link>
+          <Link to="/products" search={{ page: 1, sort: 'name', order: 'asc', limit: 20 }}>
+            Products
+          </Link>
+        </div>
+      </header>
+      <main className="max-w-7xl mx-auto px-4 py-8">
+        <Outlet />
+      </main>
+      <TanStackRouterDevtools />
+    </div>
+  ),
+});
+```
+
+### Building a Type-Safe Search Interface
+
+Create a product search with validated search parameters:
+
+```typescript
+// src/routes/products.tsx
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { z } from 'zod';
+
+const productsSearchSchema = z.object({
+  q: z.string().optional(),
+  category: z.string().optional(),
+  minPrice: z.number().optional(),
+  maxPrice: z.number().optional(),
+  sort: z.enum(['name', 'price', 'rating', 'newest']).default('newest'),
+  order: z.enum(['asc', 'desc']).default('desc'),
+  page: z.number().int().positive().default(1),
+  limit: z.number().int().min(1).max(100).default(20),
+});
+
+export type ProductsSearch = z.infer<typeof productsSearchSchema>;
+
+export const Route = createFileRoute('/products')({
+  component: ProductsPage,
+  validateSearch: productsSearchSchema,
+  loaderDeps: ({ search }) => search, // Refetch when search params change
+  loader: async ({ deps }) => {
+    return productApi.search({
+      query: deps.q,
+      category: deps.category,
+      minPrice: deps.minPrice,
+      maxPrice: deps.maxPrice,
+      sort: deps.sort,
+      order: deps.order,
+      page: deps.page,
+      limit: deps.limit,
+    });
+  },
+});
+
+function ProductsPage() {
+  const search = Route.useSearch();
+  const navigate = useNavigate({ from: Route.fullPath });
+  const data = Route.useLoaderData();
+
+  const updateSearch = (updates: Partial<ProductsSearch>) => {
+    navigate({ search: { ...search, ...updates, page: 1 } });
+  };
+
+  return (
+    <div>
+      <div className="flex gap-4 mb-6">
+        <input
+          type="text"
+          placeholder="Search products..."
+          value={search.q ?? ''}
+          onChange={(e) => updateSearch({ q: e.target.value || undefined })}
+          className="border rounded-lg px-4 py-2 flex-1"
+        />
+        <select
+          value={search.sort}
+          onChange={(e) => updateSearch({ sort: e.target.value as any })}
+          className="border rounded-lg px-4 py-2"
+        >
+          <option value="newest">Newest</option>
+          <option value="price">Price</option>
+          <option value="rating">Rating</option>
+          <option value="name">Name</option>
+        </select>
+        <select
+          value={search.order}
+          onChange={(e) => updateSearch({ order: e.target.value as any })}
+          className="border rounded-lg px-4 py-2"
+        >
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
+      </div>
+
+      <div className="grid grid-cols-3 gap-6">
+        {data.products.map((product) => (
+          <ProductCard key={product.id} product={product} />
+        ))}
+      </div>
+
+      <div className="flex justify-center gap-2 mt-8">
+        {Array.from({ length: data.totalPages }, (_, i) => (
+          <Link
+            key={i}
+            to="/products"
+            search={{ ...search, page: i + 1 }}
+            className={`px-4 py-2 rounded ${
+              search.page === i + 1 ? 'bg-blue-600 text-white' : 'bg-gray-200'
+            }`}
+          >
+            {i + 1}
+          </Link>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+![TanStack Router implementation](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: Complex Dashboard with Nested Routes
+
+Enterprise dashboards with deeply nested routes benefit from TanStack Router's layout system. A dashboard with `/dashboard/analytics/reports` uses three levels of nested layouts, each with its own sidebar and content area. Route loaders fetch data in parallel, and the type system ensures that context passed from parent routes matches child route expectations.
+
+### Use Case 2: E-Commerce with Search Filters
+
+E-commerce sites with complex filtering (category, price range, brand, rating, availability) benefit from validated search parameters. TanStack Router's search schema validation ensures that filters are always valid—if a user manually edits the URL to set `minPrice=abc`, the schema rejects it and applies the default. The type system also ensures that filter components receive correctly typed values.
+
+### Use Case 3: Multi-Step Forms with URL State
+
+Multi-step forms (wizard flows) that persist state in the URL use TanStack Router's search parameters to track form data across steps. Each step encodes its data in search parameters, and the schema validation ensures that incomplete or invalid data does not break the flow. Users can bookmark or share links to specific steps.
+
+### Use Case 4: Documentation Sites with File-Based Routing
+
+Documentation sites with hundreds of pages benefit from file-based routing. TanStack Router's Vite plugin generates route configurations from the file system, eliminating the need to manually maintain route definitions. Type safety ensures that internal links remain valid even as the documentation structure evolves.
+
+## Best Practices for Production
+
+1. **Use file-based routing for large projects**: The TanStack Router Vite plugin generates routes from your file system, reducing boilerplate and preventing configuration drift.
+
+2. **Validate all search parameters with Zod**: Define schemas for every route that uses search parameters. This catches invalid URLs before your components render and provides automatic TypeScript types.
+
+3. **Use route loaders for data fetching**: Loaders run before the component renders, preventing loading spinners. They also support caching and deduplication, so multiple routes requesting the same data only fetch once.
+
+4. **Leverage route context for dependency injection**: Pass API clients, authentication services, and other dependencies through the router context. This makes routes testable and avoids prop drilling.
+
+5. **Use `preload: 'intent'` for faster navigation**: The `intent` preload mode starts loading data when the user hovers over a link, making navigation feel instant.
+
+6. **Implement proper error boundaries**: Use `errorComponent` on routes to catch and display errors gracefully. TanStack Router provides error boundaries at the route level, so errors in one route do not crash the entire application.
+
+7. **Keep route files small**: Each route file should define the route configuration, loader, and component. If the component is large, extract it to a separate file and import it.
+
+8. **Use the DevTools during development**: TanStack Router DevTools show the route tree, active matches, loader states, and search parameter values. They are essential for debugging complex routing scenarios.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Not validating search params | Runtime errors from invalid URLs | Use `validateSearch` with Zod schemas |
+| Forgetting `loaderDeps` | Loader not refetching when search changes | Set `loaderDeps: ({ search }) => search` |
+| Using `any` types in context | Breaks type safety for child routes | Define context interface explicitly |
+| Not handling loader errors | Blank screen on data fetch failure | Add `errorComponent` to routes |
+| Hardcoding route strings | Typos cause silent failures | Use `Link` with typed `to` prop |
+| Missing `from` in navigate | Incorrect relative navigation | Always specify `from` when navigating from a specific route |
+| Not preloading heavy pages | Slow perceived navigation | Use `preload: 'intent'` for heavy routes |
+
+## Performance Optimization
+
+TanStack Router provides several built-in performance optimizations:
+
+```typescript
+// Configure preload behavior
+const router = createRouter({
+  routeTree,
+  defaultPreload: 'intent', // Preload on hover
+  defaultPreloadStaleTime: 10 * 1000, // 10 seconds
+});
+
+// Use staleTime on loaders to cache data
+export const Route = createFileRoute('/products')({
+  loader: async ({ context }) => context.api.getProducts(),
+  staleTime: 60 * 1000, // Cache for 1 minute
+});
+
+// Use gcTime to control garbage collection of cached data
+export const Route = createFileRoute('/products')({
+  loader: async ({ context }) => context.api.getProducts(),
+  staleTime: 60 * 1000,
+  gcTime: 5 * 60 * 1000, // Keep in cache for 5 minutes after last use
+});
+```
+
+## Comparison with Alternatives
+
+| Feature | TanStack Router | React Router v6 | Next.js App Router | Remix |
+|---------|----------------|-----------------|-------------------|-------|
+| Type Safety | End-to-end | Partial | Partial | Partial |
+| Search Param Validation | Built-in (Zod) | Manual | Manual | Manual |
+| Loaders | Built-in | No (use React) | Server Components | Built-in |
+| File-Based Routing | Plugin | No | Built-in | Convention |
+| Route Context | Built-in | No | No | No |
+| Preloading | Built-in | No | Built-in | No |
+| DevTools | Yes | No | No | No |
+| Bundle Size | ~15KB | ~10KB | Framework | Framework |
+| SSR Support | Yes | Yes | Built-in | Built-in |
+| Learning Curve | Medium | Low | Medium | Medium |
+
+## Advanced Patterns and Techniques
+
+### Route Authentication Guard
+
+```typescript
+// routes/dashboard.tsx
+export const Route = createFileRoute('/dashboard')({
+  component: DashboardLayout,
+  beforeLoad: async ({ context }) => {
+    if (!context.auth.isAuthenticated) {
+      throw redirect({ 
+        to: '/login', 
+        search: { redirect: '/dashboard' } 
+      });
+    }
+  },
+  loader: async ({ context }) => {
+    return context.api.getDashboardData();
+  },
+});
+```
+
+### Parallel Route Loading
+
+Routes at the same level load in parallel by default. For routes that depend on each other, use `await` in the parent loader:
+
+```typescript
+// Parent route loads data that child routes need
+export const Route = createFileRoute('/users/$userId')({
+  loader: async ({ params, context }) => {
+    const user = await context.api.getUser(params.userId);
+    return { user };
+  },
+});
+
+// Child route can access parent loader data
+export const Route = createFileRoute('/users/$userId/posts')({
+  loader: async ({ context, params }) => {
+    const posts = await context.api.getUserPosts(params.userId);
+    return { posts };
+  },
+});
+```
+
+### Custom Error Components
+
+```typescript
+export const Route = createFileRoute('/posts/$postId')({
+  component: PostDetail,
+  loader: async ({ params }) => {
+    const post = await fetchPost(params.postId);
+    if (!post) throw new NotFoundError('Post not found');
+    return post;
+  },
+  errorComponent: ({ error }) => {
+    if (error instanceof NotFoundError) {
+      return (
+        <div className="text-center py-12">
+          <h1 className="text-4xl font-bold">404</h1>
+          <p className="mt-4">{error.message}</p>
+        </div>
+      );
+    }
+    return (
+      <div className="text-center py-12">
+        <h1 className="text-2xl font-bold text-red-600">Error</h1>
+        <p className="mt-4">{error.message}</p>
+      </div>
+    );
+  },
+});
+```
+
+## Testing Strategies
+
+Test TanStack Router components with the testing library:
+
+```typescript
+import { render, screen, waitFor } from '@testing-library/react';
+import { createRouter, createMemoryHistory } from '@tanstack/react-router';
+import { routeTree } from './routeTree.gen';
+
+function renderRoute(initialPath: string) {
+  const router = createRouter({
+    routeTree,
+    history: createMemoryHistory({ initialEntries: [initialPath] }),
+  });
+
+  render(<RouterProvider router={router} />);
+  return router;
+}
+
+describe('Products Page', () => {
+  it('renders products with search parameters', async () => {
+    renderRoute('/products?sort=price&order=asc');
+
+    await waitFor(() => {
+      expect(screen.getByText('Products')).toBeInTheDocument();
+    });
+
+    const sortSelect = screen.getByDisplayValue('Price');
+    expect(sortSelect).toBeInTheDocument();
+  });
+
+  it('applies default search parameters for invalid values', async () => {
+    renderRoute('/products?sort=invalid&page=abc');
+
+    await waitFor(() => {
+      expect(screen.getByText('Products')).toBeInTheDocument();
+    });
+
+    // Should fall back to defaults
+    const sortSelect = screen.getByDisplayValue('Newest');
+    expect(sortSelect).toBeInTheDocument();
+  });
+});
+```
+
+## Future Outlook
+
+TanStack Router is rapidly maturing as a production-ready routing solution. The team is focused on improving file-based routing ergonomics, adding streaming SSR support, and deepening integration with TanStack Query for seamless data fetching.
+
+The type-safety innovations in TanStack Router are influencing the broader React ecosystem. React Router v7 is adopting similar concepts with typed routes and search parameter validation, validating TanStack Router's approach.
+
+The rise of server components and streaming SSR creates new opportunities for TanStack Router. The router can coordinate server-side data fetching with client-side navigation, providing the best of both worlds—fast initial loads and instant client-side transitions.
 
 ## Conclusion
 
-TanStack Router: Type-Safe Routing for React is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+TanStack Router represents a significant advancement in React routing:
+
+1. **End-to-end type safety eliminates routing bugs**: From route parameters to search parameters to link targets, every aspect of routing is validated at compile time. No more runtime errors from typos or missing parameters.
+
+2. **Search parameter validation prevents broken URLs**: Zod schemas validate search parameters on every navigation, ensuring that invalid URLs never reach your components.
+
+3. **Route loaders with caching improve performance**: Data is fetched before the component renders, and cached loader data prevents redundant network requests.
+
+4. **File-based routing reduces boilerplate**: The Vite plugin generates route configurations from your file system, keeping route definitions close to their components.
+
+5. **The API is designed for TypeScript**: Unlike routers that add TypeScript support as an afterthought, TanStack Router was built from the ground up with TypeScript. The types are not just documentation—they are enforced guarantees.
+
+6. **It scales from simple to complex**: A basic route with a component works the same as a complex nested route with loaders, search validation, and authentication guards. The API does not change—only the configuration grows.
+
+If type safety and developer experience are priorities for your project, TanStack Router is the strongest routing solution available for React today. The compile-time guarantees it provides catch bugs before they reach production, and the developer tools make complex routing scenarios manageable.

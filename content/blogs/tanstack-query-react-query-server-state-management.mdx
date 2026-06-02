@@ -9,54 +9,620 @@ author: "MinhVo"
 
 ## Introduction
 
-TanStack Query (React Query): Server State Management is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Managing server state in React applications is one of the most underestimated challenges in frontend development. Server state—data fetched from APIs that lives on a remote server—is fundamentally different from client state (modals, form inputs, theme preferences). It is asynchronous, shared across components, can become stale at any moment, and requires synchronization with the server to remain accurate. Most developers start with `useState` and `useEffect` for data fetching, only to discover they have reinvented caching, deduplication, background refetching, and error handling from scratch.
 
-## Key Concepts
+TanStack Query (formerly React Query) solves this problem by providing a purpose-built abstraction for server state. It handles caching, background updates, stale-while-revalidate patterns, pagination, infinite scrolling, optimistic mutations, and offline support out of the box. Instead of managing the lifecycle of async data yourself, you declare what data you need and TanStack Query figures out when to fetch it, how long to cache it, and when to refresh it.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers everything from basic queries to advanced patterns like optimistic updates, query invalidation, and infinite scrolling. We will explore the mental model behind TanStack Query, walk through production-ready implementations, and discuss the patterns that make it one of the most popular libraries in the React ecosystem. Whether you are building a simple data dashboard or a complex real-time application, this guide will help you leverage TanStack Query effectively.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![TanStack Query architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding TanStack Query: Core Concepts
 
-Let's look at a practical example:
+### The Server State Mental Model
+
+TanStack Query introduces a mental model that distinguishes between client state and server state. Client state is owned by the client—it is synchronous, local, and fully controlled by your application. Server state is owned by the server—it is asynchronous, remote, and can be modified by other users or processes at any time.
+
+This distinction matters because server state has properties that client state does not:
+
+- **It can become stale**: The data on the server might have changed since you last fetched it.
+- **It requires network requests**: Accessing it is slow and can fail.
+- **It is shared**: Multiple components might need the same data.
+- **It needs synchronization**: Changes on the client (mutations) need to be reflected on the server.
+
+TanStack Query treats server state as a cache with a lifecycle. Data is fetched, cached, and eventually becomes stale. When data is stale, TanStack Query refetches it in the background to keep the cache fresh. This stale-while-revalidate pattern provides instant UI updates while ensuring data accuracy.
+
+### Query Keys and Caching
+
+Every query in TanStack Query is identified by a unique key. The key is typically an array that describes the data being fetched:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Simple key
+useQuery({ queryKey: ['todos'], queryFn: fetchTodos });
+
+// Parameterized key
+useQuery({ queryKey: ['todo', todoId], queryFn: () => fetchTodo(todoId) });
+
+// Complex key with filters
+useQuery({ 
+  queryKey: ['todos', { status: 'completed', page: 2 }], 
+  queryFn: () => fetchTodos({ status: 'completed', page: 2 }) 
+});
+```
+
+The query key serves multiple purposes:
+- **Cache identification**: Two queries with the same key share the same cache entry.
+- **Automatic refetching**: When a query key changes, the old query is removed and a new one starts.
+- **Invalidation**: You can invalidate all queries matching a key prefix.
+
+### Query States
+
+Every query has a well-defined state machine with these states:
+
+- **`pending`**: The query is loading for the first time (no cached data).
+- **`success`**: The query has data (may be stale while refetching in background).
+- **`error`**: The query failed (previous data may still be available).
+
+The `isPending`, `isSuccess`, and `isError` booleans reflect the current state. The `status` field provides the same information as a string. Importantly, `isFetching` is true whenever a network request is in flight, regardless of whether cached data is available.
+
+![Query lifecycle diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Provider Setup
+
+Wrap your application with the QueryClientProvider:
+
+```typescript
+// App.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000, // 5 minutes
+      gcTime: 10 * 60 * 1000, // 10 minutes (formerly cacheTime)
+      retry: 2,
+      refetchOnWindowFocus: true,
+    },
+  },
+});
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <Router />
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  );
 }
 ```
 
-This pattern demonstrates the core approach to implementing React Query solutions in production environments.
+### Custom Hook Pattern
 
-## Best Practices
+Encapsulate queries in custom hooks for reusability and type safety:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// hooks/useTodos.ts
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { todoApi } from '../api/todoApi';
 
-## Common Pitfalls
+export function useTodos(filters?: TodoFilters) {
+  return useQuery({
+    queryKey: ['todos', filters],
+    queryFn: () => todoApi.list(filters),
+    staleTime: 30 * 1000, // 30 seconds
+  });
+}
+
+export function useTodo(id: string) {
+  return useQuery({
+    queryKey: ['todo', id],
+    queryFn: () => todoApi.get(id),
+    enabled: !!id, // Only run if id is provided
+  });
+}
+
+export function useCreateTodo() {
+  const queryClient = useQueryClient();
+  
+  return useMutation({
+    mutationFn: todoApi.create,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+}
+
+export function useUpdateTodo() {
+  const queryClient = useQueryClient();
+  
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Partial<Todo> }) =>
+      todoApi.update(id, data),
+    onSuccess: (updatedTodo) => {
+      queryClient.setQueryData(['todo', updatedTodo.id], updatedTodo);
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+}
+```
+
+### Type-Safe Query Keys
+
+Create a centralized key factory for type safety and consistency:
+
+```typescript
+// api/queryKeys.ts
+export const todoKeys = {
+  all: ['todos'] as const,
+  lists: () => [...todoKeys.all, 'list'] as const,
+  list: (filters: TodoFilters) => [...todoKeys.lists(), filters] as const,
+  details: () => [...todoKeys.all, 'detail'] as const,
+  detail: (id: string) => [...todoKeys.details(), id] as const,
+};
+
+// Usage
+useQuery({ queryKey: todoKeys.list({ status: 'active' }), queryFn: ... });
+useQuery({ queryKey: todoKeys.detail('123'), queryFn: ... });
+```
+
+## Step-by-Step Implementation
+
+### Basic Data Fetching
+
+Fetch and display a list of users:
+
+```typescript
+// api/userApi.ts
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string;
+}
+
+export const userApi = {
+  list: async (): Promise<User[]> => {
+    const response = await fetch('/api/users');
+    if (!response.ok) throw new Error('Failed to fetch users');
+    return response.json();
+  },
+  
+  get: async (id: string): Promise<User> => {
+    const response = await fetch(`/api/users/${id}`);
+    if (!response.ok) throw new Error('Failed to fetch user');
+    return response.json();
+  },
+};
+
+// hooks/useUsers.ts
+import { useQuery } from '@tanstack/react-query';
+import { userApi } from '../api/userApi';
+
+export function useUsers() {
+  return useQuery({
+    queryKey: ['users'],
+    queryFn: userApi.list,
+    staleTime: 60 * 1000, // 1 minute
+  });
+}
+
+// components/UserList.tsx
+import { useUsers } from '../hooks/useUsers';
+
+export function UserList() {
+  const { data: users, isPending, isError, error } = useUsers();
+
+  if (isPending) {
+    return (
+      <div className="space-y-4">
+        {[...Array(5)].map((_, i) => (
+          <div key={i} className="animate-pulse flex items-center space-x-4">
+            <div className="w-12 h-12 bg-gray-200 rounded-full" />
+            <div className="flex-1 space-y-2">
+              <div className="h-4 bg-gray-200 rounded w-1/4" />
+              <div className="h-3 bg-gray-200 rounded w-1/2" />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+        <p className="text-red-800">Error: {error.message}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {users.map((user) => (
+        <div key={user.id} className="flex items-center space-x-4 p-4 
+                                      bg-white rounded-lg shadow">
+          <img src={user.avatar} alt={user.name} 
+               className="w-12 h-12 rounded-full" />
+          <div>
+            <h3 className="font-semibold">{user.name}</h3>
+            <p className="text-sm text-gray-500">{user.email}</p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+### Pagination with Keep Previous Data
+
+Implement pagination that shows previous data while loading new pages:
+
+```typescript
+// components/PaginatedUsers.tsx
+import { useState } from 'react';
+import { useQuery, keepPreviousData } from '@tanstack/react-query';
+import { userApi } from '../api/userApi';
+
+export function PaginatedUsers() {
+  const [page, setPage] = useState(1);
+  
+  const { data, isPending, isPlaceholderData } = useQuery({
+    queryKey: ['users', { page }],
+    queryFn: () => userApi.listPaginated({ page, limit: 10 }),
+    placeholderData: keepPreviousData, // Show previous page while loading
+    staleTime: 30 * 1000,
+  });
+
+  return (
+    <div>
+      <div className={`space-y-4 transition-opacity ${isPlaceholderData ? 'opacity-50' : 'opacity-100'}`}>
+        {data?.users.map((user) => (
+          <UserCard key={user.id} user={user} />
+        ))}
+      </div>
+      
+      <div className="flex justify-center gap-2 mt-6">
+        <button
+          onClick={() => setPage((p) => Math.max(1, p - 1))}
+          disabled={page === 1}
+          className="px-4 py-2 bg-gray-200 rounded-lg disabled:opacity-50"
+        >
+          Previous
+        </button>
+        <span className="px-4 py-2">Page {page} of {data?.totalPages}</span>
+        <button
+          onClick={() => setPage((p) => p + 1)}
+          disabled={isPlaceholderData || page === data?.totalPages}
+          className="px-4 py-2 bg-gray-200 rounded-lg disabled:opacity-50"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+### Optimistic Updates
+
+Implement optimistic updates for instant UI feedback:
+
+```typescript
+// hooks/useUpdateTodo.ts
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { todoApi } from '../api/todoApi';
+
+export function useUpdateTodo() {
+  const queryClient = useQueryClient();
+  
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Partial<Todo> }) =>
+      todoApi.update(id, data),
+    
+    onMutate: async ({ id, data }) => {
+      // Cancel outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['todo', id] });
+      
+      // Snapshot the previous value
+      const previousTodo = queryClient.getQueryData<Todo>(['todo', id]);
+      
+      // Optimistically update the cache
+      queryClient.setQueryData<Todo>(['todo', id], (old) => ({
+        ...old!,
+        ...data,
+      }));
+      
+      return { previousTodo };
+    },
+    
+    onError: (err, { id }, context) => {
+      // Rollback on error
+      if (context?.previousTodo) {
+        queryClient.setQueryData(['todo', id], context.previousTodo);
+      }
+    },
+    
+    onSettled: (data, error, { id }) => {
+      // Always refetch to ensure server consistency
+      queryClient.invalidateQueries({ queryKey: ['todo', id] });
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+}
+
+// Usage in component
+function TodoItem({ todo }: { todo: Todo }) {
+  const updateTodo = useUpdateTodo();
+  
+  const toggleComplete = () => {
+    updateTodo.mutate({
+      id: todo.id,
+      data: { completed: !todo.completed },
+    });
+  };
+  
+  return (
+    <div className="flex items-center gap-3">
+      <input
+        type="checkbox"
+        checked={todo.completed}
+        onChange={toggleComplete}
+        disabled={updateTodo.isPending}
+      />
+      <span className={todo.completed ? 'line-through text-gray-400' : ''}>
+        {todo.title}
+      </span>
+    </div>
+  );
+}
+```
+
+![TanStack Query implementation](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: E-Commerce Product Catalog
+
+An e-commerce product catalog with filtering, sorting, and pagination is a natural fit for TanStack Query. Each filter combination produces a unique query key, caching products for each filter state. When users navigate back to a previous filter, the cached data displays instantly while a background refetch ensures freshness.
+
+### Use Case 2: Real-Time Dashboard
+
+Dashboards that display metrics from multiple API endpoints benefit from TanStack Query's automatic background refetching. Configure `refetchInterval` to poll the server at regular intervals, and the UI updates seamlessly. Combined with `keepPreviousData`, the dashboard never shows a loading spinner—it always displays the most recent data while fetching updates.
+
+### Use Case 3: Multi-Step Form with Server Validation
+
+Forms that require server-side validation (username availability, email verification) can use TanStack Query to debounce validation requests and cache results. If a user types a username, switches to another field, and comes back, the cached validation result displays instantly.
+
+### Use Case 4: Social Media Feed with Infinite Scroll
+
+Social media feeds with infinite scrolling use TanStack Query's `useInfiniteQuery` to load pages of content as the user scrolls. The `fetchNextPage` function loads the next page, and all pages are concatenated into a single list. Previous pages remain cached, so scrolling back is instant.
+
+## Best Practices for Production
+
+1. **Use custom hooks for every query**: Encapsulate query logic in hooks like `useUsers()`, `useTodo(id)`, etc. This makes queries reusable, testable, and easy to refactor.
+
+2. **Set appropriate `staleTime`**: Default staleTime is 0 (immediately stale). For data that changes infrequently, set staleTime to 30-60 seconds to reduce unnecessary refetches.
+
+3. **Use `queryKey` factories**: Centralize query key definitions to ensure consistency and enable easy invalidation. The key factory pattern prevents typos and makes invalidation queries type-safe.
+
+4. **Implement optimistic updates for mutations**: Users expect instant feedback. Use `onMutate` to update the cache before the server responds, and `onError` to roll back if the mutation fails.
+
+5. **Use `placeholderData` for pagination**: The `keepPreviousData` option prevents loading spinners when navigating between pages, creating a smoother user experience.
+
+6. **Handle errors gracefully**: Differentiate between network errors (retry-able) and server errors (display error message). Use the `retry` option to control automatic retry behavior.
+
+7. **Leverage `select` for data transformation**: Transform query data in the `select` function instead of in the component. This keeps components clean and allows TanStack Query to memoize the transformation.
+
+8. **Use the DevTools during development**: The React Query DevTools show all active queries, their states, cache contents, and refetch schedules. They are invaluable for debugging caching issues.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using `useEffect` + `useState` for data fetching | Manual caching, race conditions, boilerplate | Use `useQuery` instead |
+| Not setting staleTime | Unnecessary refetches on every mount | Set staleTime based on data freshness requirements |
+| Using object literals as query keys | New reference on every render, cache misses | Use stable arrays with primitive values |
+| Forgetting to invalidate after mutations | Stale data displayed after changes | Call `invalidateQueries` in `onSuccess` |
+| Not handling the `isPending` state | Blank UI while loading | Show skeleton loaders or spinners |
+| Overusing `enabled: false` | Queries never run | Use `enabled` only when the query depends on external data |
+| Destructuring `data` without checking `isPending` | Runtime errors on undefined data | Always check `isPending` before accessing `data` |
+
+## Performance Optimization
+
+TanStack Query provides several performance optimization mechanisms:
+
+```typescript
+// Use select to transform and memoize data
+const { data: todoCount } = useQuery({
+  queryKey: ['todos'],
+  queryFn: fetchTodos,
+  select: (todos) => todos.filter(t => !t.completed).length,
+  // Only re-renders when the count changes, not when any todo changes
+});
+
+// Use structural sharing (enabled by default)
+const { data } = useQuery({
+  queryKey: ['todos'],
+  queryFn: fetchTodos,
+  structuralSharing: true, // Default: true
+  // Re-renders only happen when data structure actually changes
+});
+
+// Prefetch data for anticipated navigation
+const queryClient = useQueryClient();
+
+function UserList() {
+  const { data: users } = useQuery({
+    queryKey: ['users'],
+    queryFn: userApi.list,
+  });
+
+  return (
+    <div>
+      {users?.map((user) => (
+        <Link
+          key={user.id}
+          to={`/users/${user.id}`}
+          onMouseEnter={() => {
+            // Prefetch user detail on hover
+            queryClient.prefetchQuery({
+              queryKey: ['user', user.id],
+              queryFn: () => userApi.get(user.id),
+            });
+          }}
+        >
+          {user.name}
+        </Link>
+      ))}
+    </div>
+  );
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | TanStack Query | SWR | RTK Query | Apollo Client |
+|---------|---------------|-----|-----------|---------------|
+| Framework Support | React, Vue, Svelte, Angular, Solid | React | React (Redux) | React |
+| Caching | Advanced (stale-while-revalidate) | Basic | Advanced | Advanced |
+| DevTools | Yes | No | Yes (Redux) | Yes |
+| Optimistic Updates | Built-in API | Manual | Built-in API | Built-in API |
+| Infinite Queries | Built-in | Manual | Manual | Built-in |
+| Offline Support | Yes (with plugins) | No | Yes | Yes |
+| Bundle Size | ~13KB | ~4KB | ~15KB | ~33KB |
+| Learning Curve | Low | Very low | Medium | High |
+| TypeScript | Excellent | Good | Excellent | Good |
+| Prefetching | Built-in | Manual | Manual | Built-in |
+
+## Advanced Patterns and Techniques
+
+### Infinite Scrolling
+
+```typescript
+import { useInfiniteQuery } from '@tanstack/react-query';
+
+function useInfinitePosts() {
+  return useInfiniteQuery({
+    queryKey: ['posts'],
+    queryFn: ({ pageParam }) => fetchPosts({ cursor: pageParam }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+  });
+}
+
+function PostFeed() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfinitePosts();
+
+  const { ref, inView } = useInView();
+
+  useEffect(() => {
+    if (inView && hasNextPage) {
+      fetchNextPage();
+    }
+  }, [inView, hasNextPage, fetchNextPage]);
+
+  return (
+    <div>
+      {data?.pages.flatMap((page) =>
+        page.posts.map((post) => <PostCard key={post.id} post={post} />)
+      )}
+      <div ref={ref}>
+        {isFetchingNextPage && <Spinner />}
+      </div>
+    </div>
+  );
+}
+```
+
+### Dependent Queries
+
+```typescript
+function useUserWithPosts(userId: string) {
+  const userQuery = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => userApi.get(userId),
+  });
+
+  const postsQuery = useQuery({
+    queryKey: ['posts', { userId }],
+    queryFn: () => postApi.listByUser(userId),
+    enabled: !!userQuery.data, // Only run after user data is available
+  });
+
+  return {
+    user: userQuery.data,
+    posts: postsQuery.data,
+    isLoading: userQuery.isPending || postsQuery.isPending,
+  };
+}
+```
+
+## Testing Strategies
+
+Test TanStack Query hooks with the testing library:
+
+```typescript
+import { renderHook, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { useUsers } from './useUsers';
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return ({ children }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+describe('useUsers', () => {
+  it('fetches users successfully', async () => {
+    const { result } = renderHook(() => useUsers(), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.isPending).toBe(true);
+
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+
+    expect(result.current.data).toHaveLength(5);
+  });
+});
+```
+
+## Future Outlook
+
+TanStack Query continues to evolve with improved TypeScript support, better DevTools, and new features like mutation tracking and query cancellation. The v5 release brought significant API improvements including simplified generics, better defaults, and the `useSuspenseQuery` hook for React Suspense integration.
+
+The library is expanding beyond React with official adapters for Vue, Svelte, Angular, and Solid. Each adapter provides the same powerful caching and synchronization primitives, adapted to the framework's idioms.
+
+The broader trend toward server components and streaming SSR creates new opportunities for TanStack Query. The library can manage client-side cache hydration and background updates while server components handle initial data fetching, combining the best of both approaches.
 
 ## Conclusion
 
-TanStack Query (React Query): Server State Management is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+TanStack Query fundamentally changes how you think about data fetching in React applications:
+
+1. **It eliminates the most common React anti-pattern**: Stop writing `useEffect` + `useState` + `fetch` boilerplate. TanStack Query handles caching, deduplication, background updates, and error handling automatically.
+
+2. **It provides instant UI through intelligent caching**: The stale-while-revalidate pattern means your UI always has data to display—either fresh from the cache or just fetched from the server.
+
+3. **It simplifies mutations with optimistic updates**: The `onMutate` / `onError` / `onSettled` lifecycle makes optimistic updates straightforward, providing instant feedback while maintaining data integrity.
+
+4. **It scales from simple to complex**: A basic `useQuery` call handles simple data fetching. The same API scales to infinite scrolling, dependent queries, and real-time dashboards without changing your mental model.
+
+5. **The developer experience is excellent**: TypeScript support, DevTools, and a clear API make TanStack Query one of the most pleasant libraries to work with in the React ecosystem.
+
+6. **It works everywhere**: Framework-agnostic core with adapters for every major framework means you can take your knowledge with you regardless of your tech stack.
+
+If you are still managing server state with `useState` and `useEffect`, switching to TanStack Query is one of the highest-impact improvements you can make to your codebase. The patterns it introduces—caching, background refetching, optimistic updates—become indispensable once you experience them.
