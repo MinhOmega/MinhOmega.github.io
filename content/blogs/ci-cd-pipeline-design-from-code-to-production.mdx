@@ -9,54 +9,837 @@ author: "MinhVo"
 
 ## Introduction
 
-CI/CD Pipeline Design: From Code to Production is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+A well-designed CI/CD pipeline is the backbone of modern software delivery. It transforms a developer's code commit into a production deployment through a series of automated steps — building, testing, security scanning, and deploying — that would take hours to perform manually and would be error-prone even then. Teams with mature CI/CD practices deploy to production dozens of times per day with confidence, while teams without automation deploy weekly or monthly and hold their breath each time.
 
-## Key Concepts
+But building a CI/CD pipeline that is both fast and reliable is not straightforward. A pipeline that takes 45 minutes to complete discourages frequent deployments. A pipeline without proper test stages lets bugs reach production. A pipeline without rollback strategies turns every deployment into a high-stakes gamble. The design decisions you make — which stages to include, how to parallelize work, how to handle failures — determine whether your pipeline accelerates or hinders your team's velocity.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![DevOps Pipeline](https://images.unsplash.com/photo-1667372393119-3d4c48d07fc9?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+This article covers the principles, patterns, and practical implementation of CI/CD pipelines, from basic build-and-test workflows to advanced deployment strategies like blue-green and canary deployments.
 
-## Practical Implementation
+## Understanding CI/CD: Core Concepts
 
-Let's look at a practical example:
+### Continuous Integration vs Continuous Delivery vs Continuous Deployment
+
+These three terms are often confused, but they represent distinct practices:
+
+**Continuous Integration (CI)**: Developers frequently merge code changes into a shared repository. Each merge triggers an automated build and test sequence. The goal is to detect integration issues early, before they become difficult to resolve.
+
+**Continuous Delivery (CD)**: Extends CI by ensuring that code is always in a deployable state. After passing all tests, the code is automatically prepared for deployment to production, but the actual deployment requires manual approval.
+
+**Continuous Deployment**: Extends continuous delivery by automatically deploying every change that passes all stages of the pipeline to production. There is no manual gate between testing and deployment.
+
+Most teams practice continuous integration and continuous delivery, with continuous deployment reserved for high-confidence, well-tested systems.
+
+### Pipeline Stages
+
+A typical CI/CD pipeline consists of these stages, executed sequentially or in parallel:
+
+1. **Source**: Triggered by a code push, pull request, or scheduled event.
+2. **Build**: Compile code, bundle assets, create containers.
+3. **Test**: Run unit tests, integration tests, end-to-end tests.
+4. **Security**: Static analysis, dependency scanning, container scanning.
+5. **Staging**: Deploy to a staging environment for final validation.
+6. **Production**: Deploy to production with monitoring and rollback capability.
+
+Each stage acts as a quality gate. If a stage fails, the pipeline stops and notifies the team. This prevents defective code from progressing to later stages where it would be more expensive to fix.
+
+### Pipeline as Code
+
+Modern CI/CD platforms define pipelines as code — YAML files, Dockerfiles, or scripts stored in the repository alongside application code. This provides several advantages:
+
+- **Version control**: Pipeline changes are tracked in git, reviewed in pull requests, and auditable.
+- **Reproducibility**: The same pipeline runs identically on every branch and every commit.
+- **Self-documenting**: The pipeline definition describes exactly what happens during deployment.
+- **Testable**: Pipeline changes can be tested on feature branches before merging.
+
+![Build Automation](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### GitHub Actions Pipeline Architecture
+
+```yaml
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '20'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Stage 1: Build and Test (parallel)
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test -- --shard=${{ matrix.shard }}/4
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  # Stage 2: Build Docker image (after tests pass)
+  build:
+    needs: [lint, test, typecheck]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Stage 3: Security scanning
+  security:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Stage 4: Deploy to staging
+  deploy-staging:
+    needs: [security]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          kubectl set image deployment/app \
+            app=${{ needs.build.outputs.image-tag }} \
+            --namespace=staging
+          kubectl rollout status deployment/app --namespace=staging
+
+  # Stage 5: Integration tests on staging
+  integration-test:
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run test:integration
+        env:
+          BASE_URL: https://staging.example.com
+
+  # Stage 6: Deploy to production
+  deploy-production:
+    needs: [integration-test]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          kubectl set image deployment/app \
+            app=${{ needs.build.outputs.image-tag }} \
+            --namespace=production
+          kubectl rollout status deployment/app --namespace=production
+```
+
+### Parallel Stage Execution
+
+The key to a fast pipeline is parallelization. Independent stages (lint, test, typecheck) should run simultaneously. Test suites can be split into shards that run in parallel. Build steps that don't depend on each other should execute concurrently.
+
+```yaml
+# Parallel test sharding with dynamic matrix
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        run: |
+          # Dynamically determine shard count based on test file count
+          TEST_COUNT=$(find tests -name "*.test.ts" | wc -l)
+          SHARDS=$(( (TEST_COUNT + 24) / 25 ))  # ~25 tests per shard
+          SHARDS=$((SHARDS > 8 ? 8 : SHARDS))    # Cap at 8
+          echo "matrix={\"shard\":[\"$(seq -s '\",\"' 1 $SHARDS)\"]}" >> $GITHUB_OUTPUT
+
+  test:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+```
+
+### Build Caching Strategy
+
+Build caching is one of the most effective pipeline optimizations. Cache dependencies, build artifacts, and Docker layers to avoid redundant work:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache npm dependencies
+      - uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      # Cache TypeScript build output
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: build-${{ runner.os }}-${{ hashFiles('src/**/*.ts') }}
+          restore-keys: |
+            build-${{ runner.os }}-
+
+      # Cache Docker layers
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+## Step-by-Step Implementation
+
+### Complete Node.js CI/CD Pipeline
+
+```yaml
+name: Production Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      changed-files: ${{ steps.changes.outputs.files }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            src:
+              - 'src/**'
+            tests:
+              - 'tests/**'
+            docker:
+              - 'Dockerfile'
+            infra:
+              - 'infrastructure/**'
+
+  lint-and-typecheck:
+    needs: setup
+    if: needs.setup.outputs.changed-files != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint -- --max-warnings=0
+      - run: npx tsc --noEmit
+
+  unit-test:
+    needs: setup
+    if: needs.setup.outputs.changed-files != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test -- --coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  build:
+    needs: [lint-and-typecheck, unit-test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to staging
+        run: |
+          kubectl set image deployment/app \
+            app=${{ needs.build.outputs.image }} \
+            -n staging
+          kubectl rollout status deployment/app -n staging --timeout=300s
+      - name: Smoke test
+        run: |
+          sleep 10
+          curl -f https://staging.example.com/health || exit 1
+
+  e2e-test:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npx playwright test
+        env:
+          BASE_URL: https://staging.example.com
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+
+  deploy-production:
+    needs: e2e-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to production
+        run: |
+          kubectl set image deployment/app \
+            app=${{ needs.build.outputs.image }} \
+            -n production
+          kubectl rollout status deployment/app -n production --timeout=300s
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -f https://api.example.com/health || exit 1
+      - name: Notify team
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "✅ Production deployment successful: ${{ needs.build.outputs.image }}"}'
+```
+
+### Deployment Strategies
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+interface DeploymentStrategy {
+  name: string;
+  deploy(newVersion: string): Promise<DeploymentResult>;
+  rollback(): Promise<void>;
+  verify(): Promise<boolean>;
+}
+
+class BlueGreenDeployment implements DeploymentStrategy {
+  name = "blue-green";
+
+  async deploy(newVersion: string): Promise<DeploymentResult> {
+    // 1. Deploy to inactive environment (green)
+    await this.deployToEnvironment("green", newVersion);
+
+    // 2. Run health checks on green
+    const healthy = await this.verifyEnvironment("green");
+    if (!healthy) {
+      await this.rollback();
+      return { success: false, reason: "Health check failed" };
+    }
+
+    // 3. Switch traffic from blue to green
+    await this.switchTraffic("green");
+
+    // 4. Verify production health
+    const prodHealthy = await this.verifyProduction();
+    if (!prodHealthy) {
+      await this.rollback();
+      return { success: false, reason: "Production health check failed" };
+    }
+
+    return { success: true };
+  }
+
+  async rollback(): Promise<void> {
+    // Switch traffic back to the previous environment
+    const currentActive = await this.getActiveEnvironment();
+    const rollbackTarget = currentActive === "blue" ? "green" : "blue";
+    await this.switchTraffic(rollbackTarget);
+  }
+
+  async verify(): Promise<boolean> {
+    return this.verifyProduction();
+  }
+
+  private async deployToEnvironment(env: string, version: string): Promise<void> {
+    // kubectl set image deployment/app-${env} app=${version}
+  }
+
+  private async verifyEnvironment(env: string): Promise<boolean> {
+    // Health check against environment URL
+    return true;
+  }
+
+  private async switchTraffic(target: string): Promise<void> {
+    // Update ingress/service to point to target environment
+  }
+
+  private async verifyProduction(): Promise<boolean> {
+    // Check error rates, latency, and availability
+    return true;
+  }
+
+  private async getActiveEnvironment(): Promise<string> {
+    return "blue";
+  }
+}
+
+class CanaryDeployment implements DeploymentStrategy {
+  name = "canary";
+
+  async deploy(newVersion: string): Promise<DeploymentResult> {
+    const stages = [5, 25, 50, 100]; // Percentage of traffic
+
+    for (const percentage of stages) {
+      console.log(`Routing ${percentage}% traffic to canary...`);
+      await this.updateTrafficSplit(percentage);
+
+      // Monitor for 5 minutes at each stage
+      await Bun.sleep(5 * 60 * 1000);
+
+      const metrics = await this.collectMetrics();
+      if (metrics.errorRate > 0.01 || metrics.latencyP99 > 500) {
+        console.log(`Canary failed at ${percentage}%: errors=${metrics.errorRate}, p99=${metrics.latencyP99}ms`);
+        await this.rollback();
+        return { success: false, reason: `Canary failed at ${percentage}%` };
+      }
+    }
+
+    return { success: true };
+  }
+
+  async rollback(): Promise<void> {
+    await this.updateTrafficSplit(0); // Route all traffic to stable
+  }
+
+  async verify(): Promise<boolean> {
+    const metrics = await this.collectMetrics();
+    return metrics.errorRate < 0.01 && metrics.latencyP99 < 500;
+  }
+
+  private async updateTrafficSplit(canaryPercent: number): Promise<void> {
+    // Update Istio VirtualService or nginx ingress weights
+  }
+
+  private async collectMetrics(): Promise<{ errorRate: number; latencyP99: number }> {
+    // Query Prometheus for canary metrics
+    return { errorRate: 0.001, latencyP99: 150 };
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing CI/CD solutions in production environments.
+### Pipeline Notification System
 
-## Best Practices
+```typescript
+class PipelineNotifier {
+  private slackWebhook: string;
+  private githubToken: string;
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+  constructor(config: { slackWebhook: string; githubToken: string }) {
+    this.slackWebhook = config.slackWebhook;
+    this.githubToken = config.githubToken;
+  }
 
-## Common Pitfalls
+  async notifySuccess(context: PipelineContext): Promise<void> {
+    await this.sendSlack({
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: [
+              `✅ *Deployment Successful*`,
+              `*Repository:* ${context.repository}`,
+              `*Branch:* ${context.branch}`,
+              `*Commit:* ${context.commitSha.substring(0, 7)}`,
+              `*Author:* ${context.author}`,
+              `*Duration:* ${context.duration}`,
+              `*Environment:* ${context.environment}`,
+            ].join("\n"),
+          },
+        },
+      ],
+    });
+  }
+
+  async notifyFailure(context: PipelineContext, error: string): Promise<void> {
+    await this.sendSlack({
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: [
+              `❌ *Deployment Failed*`,
+              `*Repository:* ${context.repository}`,
+              `*Branch:* ${context.branch}`,
+              `*Error:* ${error}`,
+              `*Logs:* <${context.logsUrl}|View Logs>`,
+            ].join("\n"),
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "Retry" },
+              url: context.retryUrl,
+              style: "danger",
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "Rollback" },
+              url: context.rollbackUrl,
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  private async sendSlack(payload: any): Promise<void> {
+    await fetch(this.slackWebhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+}
+```
+
+![Deployment Dashboard](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Monorepo CI/CD
+
+Monorepos present unique CI/CD challenges because a change to one package can affect many others. Use path filtering to run only affected tests, and use build caching to avoid rebuilding unchanged packages. Tools like Turborepo and Nx provide dependency graph analysis that determines which packages need to be rebuilt and tested.
+
+### Microservice CI/CD
+
+Each microservice should have its own CI/CD pipeline that builds, tests, and deploys independently. Use contract testing (Pact) to verify that service changes don't break consumers. Deploy services in dependency order during coordinated releases.
+
+### Mobile App CI/CD
+
+Mobile CI/CD requires building for multiple platforms (iOS, Android), managing code signing certificates, and submitting to app stores. Use Fastlane for automation, and implement staged rollouts through the app stores' built-in mechanisms.
+
+### Infrastructure as Code CI/CD
+
+Infrastructure changes (Terraform, CloudFormation) require their own CI/CD pipeline with plan-review-apply stages. Run `terraform plan` in CI, require human review of the plan, and apply only after approval. Use policy-as-code tools like OPA to enforce security and compliance rules.
+
+## Best Practices for Production
+
+1. **Fail fast**: Place the fastest stages first. Linting takes seconds, unit tests take minutes, E2E tests take longer. Fail quickly on cheap checks before running expensive ones.
+
+2. **Parallelize independent stages**: Linting, type checking, and unit testing can run simultaneously. Use matrix strategies for test sharding. Don't serialize work that can be done in parallel.
+
+3. **Cache aggressively**: Cache npm dependencies, Docker layers, build artifacts, and test results. A well-configured cache can reduce pipeline duration by 50-80%.
+
+4. **Use environments with approval gates**: Require manual approval for production deployments. This provides a human checkpoint for critical changes and satisfies compliance requirements.
+
+5. **Implement rollback automation**: Every deployment must have a one-click rollback mechanism. Test rollback procedures regularly to ensure they work when needed.
+
+6. **Monitor pipeline metrics**: Track pipeline duration, failure rate, and deployment frequency. Use these metrics to identify bottlenecks and improve the pipeline over time.
+
+7. **Keep pipelines simple**: Avoid over-engineering pipelines with complex conditional logic. A simple, understandable pipeline is easier to debug and maintain than a clever one.
+
+8. **Secure the pipeline**: Protect secrets, use least-privilege access, and scan dependencies for vulnerabilities. A compromised pipeline can deploy malicious code to production.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Flaky tests | False failures erode trust | Quarantine flaky tests; fix or delete them |
+| Slow pipelines | Developers skip CI | Parallelize, cache, and optimize slow stages |
+| No rollback mechanism | Extended outages | Implement automated rollback on health check failure |
+| Hardcoded secrets | Security breach | Use CI platform's secret management |
+| Ignoring pipeline failures | Bugs reach production | Block merges on CI failure; enforce status checks |
+| Over-complex pipelines | Hard to debug and maintain | Keep pipelines simple; extract complex logic to scripts |
+
+### Debugging Pipeline Failures
+
+```bash
+# Local pipeline simulation with act (GitHub Actions)
+# Install: brew install act
+act -j test                    # Run test job locally
+act -j test --secret-file .env # Run with secrets
+act -l                         # List available jobs
+act -n                         # Dry run (show what would run)
+```
+
+## Performance Optimization
+
+### Pipeline Duration Optimization
+
+```typescript
+class PipelineOptimizer {
+  async analyze(pipelineRun: PipelineRun): Promise<OptimizationReport> {
+    const stages = pipelineRun.stages;
+    const totalDuration = stages.reduce((sum, s) => sum + s.duration, 0);
+
+    const bottlenecks = stages
+      .filter((s) => s.duration > totalDuration * 0.3)
+      .map((s) => ({
+        stage: s.name,
+        duration: s.duration,
+        percentOfTotal: ((s.duration / totalDuration) * 100).toFixed(1),
+        suggestions: this.getSuggestions(s),
+      }));
+
+    const parallelizable = this.findParallelizableStages(stages);
+
+    return {
+      totalDuration,
+      bottlenecks,
+      parallelizable,
+      estimatedImprovement: this.estimateImprovement(stages, parallelizable),
+    };
+  }
+
+  private getSuggestions(stage: Stage): string[] {
+    const suggestions: string[] = [];
+    if (stage.name === "test" && stage.duration > 300) {
+      suggestions.push("Shard tests across multiple runners");
+      suggestions.push("Enable test result caching");
+    }
+    if (stage.name === "build" && stage.duration > 180) {
+      suggestions.push("Enable Docker layer caching");
+      suggestions.push("Use multi-stage builds to reduce context");
+    }
+    return suggestions;
+  }
+
+  private findParallelizableStages(stages: Stage[]): string[][] {
+    // Identify stages that don't depend on each other
+    return [["lint", "typecheck", "unit-test"]];
+  }
+
+  private estimateImprovement(stages: Stage[], parallelizable: string[][]): number {
+    // Estimate time savings from parallelization
+    return 40; // 40% estimated improvement
+  }
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | GitHub Actions | GitLab CI | Jenkins | CircleCI | ArgoCD |
+|---------|---------------|-----------|---------|----------|--------|
+| Configuration | YAML | YAML | Groovy | YAML | YAML/CRDs |
+| Cloud-hosted | Yes | Yes | Self-hosted | Yes | Self-hosted |
+| Free tier | 2000 min/month | 400 min/month | Unlimited | 6000 min/month | Open source |
+| Marketplace | Extensive | Good | Extensive | Good | Growing |
+| Container native | Yes | Yes | Partial | Yes | Yes |
+| Kubernetes support | Good | Good | Good | Good | Native |
+
+### Choosing a CI/CD Platform
+
+GitHub Actions is the default choice for projects hosted on GitHub. GitLab CI is excellent for organizations that want a single platform for code hosting and CI/CD. Jenkins provides maximum flexibility but requires more maintenance. CircleCI offers strong performance optimization features. ArgoCD is ideal for GitOps-based Kubernetes deployments.
+
+## Advanced Patterns
+
+### Feature Branch Environments
+
+```yaml
+jobs:
+  deploy-preview:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: preview-${{ github.event.pull_request.number }}
+      url: https://preview-${{ github.event.pull_request.number }}.example.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy preview environment
+        run: |
+          kubectl create namespace preview-${{ github.event.pull_request.number }} || true
+          kubectl apply -f k8s/preview/ \
+            -n preview-${{ github.event.pull_request.number }}
+          kubectl set image deployment/app \
+            app=${{ needs.build.outputs.image }} \
+            -n preview-${{ github.event.pull_request.number }}
+      - name: Comment PR with preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Preview deployed: https://preview-${{ github.event.pull_request.number }}.example.com`
+            });
+```
+
+### Automated Rollback on Failure
+
+```yaml
+  deploy-with-rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        id: deploy
+        run: |
+          PREVIOUS_VERSION=$(kubectl get deployment app -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "previous=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+          kubectl set image deployment/app app=$NEW_IMAGE
+          kubectl rollout status deployment/app --timeout=300s || echo "deploy_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Rollback on failure
+        if: steps.deploy.outputs.deploy_failed == 'true'
+        run: |
+          kubectl set image deployment/app app=${{ steps.deploy.outputs.previous }}
+          kubectl rollout status deployment/app --timeout=300s
+          echo "Deployment rolled back to ${{ steps.deploy.outputs.previous }}"
+          exit 1
+```
+
+## Testing Strategies
+
+### Pipeline Testing
+
+```typescript
+import { test, expect } from "bun:test";
+
+test("pipeline YAML is valid", async () => {
+  const yaml = await Bun.file(".github/workflows/ci.yml").text();
+  const workflow = YAML.parse(yaml);
+
+  expect(workflow.jobs).toHaveProperty("test");
+  expect(workflow.jobs).toHaveProperty("build");
+  expect(workflow.jobs.build.needs).toContain("test");
+});
+
+test("all required checks pass before deploy", async () => {
+  const yaml = await Bun.file(".github/workflows/ci.yml").text();
+  const workflow = YAML.parse(yaml);
+
+  const deployJob = workflow.jobs["deploy-production"];
+  expect(deployJob.needs).toContain("e2e-test");
+  expect(deployJob.environment).toBe("production");
+});
+```
+
+## Future Outlook
+
+CI/CD pipelines are evolving toward GitOps, where the desired state of infrastructure and applications is declared in git and continuously reconciled by controllers like ArgoCD and Flux. This eliminates manual deployment steps entirely — merging a pull request to the main branch automatically deploys to production after all checks pass.
+
+AI-powered CI/CD is also emerging, with tools that automatically optimize pipeline configurations, predict test failures, and suggest deployment strategies based on historical data. The integration of supply chain security tools (SLSA, Sigstore) is becoming standard, ensuring that every artifact in the pipeline is verifiable and tamper-proof.
 
 ## Conclusion
 
-CI/CD Pipeline Design: From Code to Production is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+A well-designed CI/CD pipeline is the foundation of modern software delivery. It automates the path from code commit to production deployment, ensuring that every change is built, tested, and deployed consistently and reliably.
+
+Key takeaways:
+
+1. **Pipeline as code**: Define your pipeline in version-controlled configuration files. This enables review, testing, and reproducibility.
+2. **Fail fast**: Place cheap checks first and expensive checks last. Parallelize independent stages to reduce total duration.
+3. **Automate rollback**: Every deployment must have a one-click or automated rollback mechanism. Test rollback procedures regularly.
+4. **Cache aggressively**: Dependencies, build artifacts, Docker layers, and test results should all be cached. This is the single most effective optimization.
+5. **Monitor pipeline health**: Track duration, failure rate, and deployment frequency. Treat your pipeline as a product that serves your development team.
+
+Start by automating your most painful manual process — whether that's running tests, building Docker images, or deploying to staging. Each automation step compounds, and within weeks you'll have a pipeline that gives your team the confidence to deploy at any time.
