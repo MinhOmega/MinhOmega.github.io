@@ -9,54 +9,339 @@ author: "MinhVo"
 
 ## Introduction
 
-Web Security: Content Security Policy (CSP) in Depth is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Content Security Policy (CSP) is the most powerful browser-based defense against cross-site scripting (XSS), clickjacking, and data injection attacks. By declaring which sources of content are trusted, CSP creates a whitelist that prevents the browser from executing malicious inline scripts, loading unauthorized resources, or submitting data to unexpected endpoints. Despite being over a decade old, CSP remains underutilized—only 5% of websites deploy a meaningful policy.
 
-## Key Concepts
+![Content Security Policy concept](https://images.unsplash.com/photo-1555949963-aa79dcee981c?w=800&h=400&fit=crop)
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+Modern CSP (Level 3) goes far beyond simple script-src directives. Nonce-based policies, strict-dynamic propagation, and reporting endpoints provide granular control over resource loading while maintaining compatibility with modern JavaScript frameworks. Understanding CSP's directive hierarchy, bypass vectors, and deployment strategies is essential for any security-conscious development team.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+This guide covers every CSP directive, implementation patterns for React and Next.js, common bypass techniques attackers use, and production deployment strategies that minimize breakage while maximizing protection.
 
-## Practical Implementation
+## Understanding CSP: Core Concepts
 
-Let's look at a practical example:
+CSP operates through HTTP response headers that instruct the browser on which resource origins to trust. When a browser receives a `Content-Security-Policy` header, it enforces the declared restrictions by blocking any resource loading or script execution that violates the policy. Violations can be reported to a server endpoint for monitoring and incident response.
+
+The policy consists of directives, each controlling a specific resource type. The `default-src` directive serves as a fallback for any directive not explicitly declared. For example, `default-src 'self'` restricts all resource loading to the same origin unless a specific directive overrides it.
+
+### Directive Categories
+
+**Fetch directives** control where resources can be loaded from: `script-src`, `style-src`, `img-src`, `font-src`, `connect-src`, `media-src`, `object-src`, `frame-src`, `worker-src`, and `child-src`. **Document directives** control the document itself: `base-uri`, `sandbox`, and `form-action`. **Navigation directives** control where the user can navigate: `frame-ancestors`, `navigate-to`, and `form-action`.
+
+### Nonce-Based vs. Hash-Based Policies
+
+Nonce-based policies use a randomly generated token per request, injected as an attribute on trusted inline scripts (`<script nonce="abc123">`). The server generates a unique nonce for each page load and includes it in both the CSP header and the HTML. Hash-based policies compute the SHA-256 digest of specific inline script content and include it in the header. Both approaches allow trusted inline scripts while blocking injected ones.
+
+![Security architecture layers](https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Component 1: Nonce Generation
+
+Cryptographically secure random nonces must be generated per-request using `crypto.randomBytes(16).toString('base64')`. The nonce flows from the server through the CSP header and into HTML template injection points. Using `Math.random()` or predictable values completely undermines CSP security.
+
+### Component 2: Policy Builder
+
+A policy builder constructs the CSP header string from a configuration object, handling directive ordering, value validation, and special keyword merging. This abstraction prevents syntax errors and ensures consistent policies across routes.
+
+### Component 3: Violation Reporting
+
+The `report-uri` (deprecated) and `report-to` directives send violation reports to a designated endpoint. These reports contain the violated directive, blocked URI, document referrer, and source file information. Processing violation reports reveals both genuine attacks and policy misconfigurations.
+
+### Component 4: Deployment Pipeline
+
+A phased deployment pipeline starts with `Content-Security-Policy-Report-Only` mode, analyzes violation reports, refines the policy, and gradually enforces restrictions. This prevents accidental breakage in production.
+
+## Step-by-Step Implementation
+
+### Basic CSP Configuration in Express.js
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
+import crypto from 'crypto';
+import express from 'express';
+
+const app = express();
+
+// Generate nonce per request
+app.use((req, res, next) => {
+  res.locals.nonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+
+// CSP middleware
+app.use((req, res, next) => {
+  const nonce = res.locals.nonce;
   
-  // Process data
-  const result = transform(input);
+  const policy = [
+    `default-src 'self'`,
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+    `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
+    `img-src 'self' data: https://images.unsplash.com`,
+    `font-src 'self' https://fonts.gstatic.com`,
+    `connect-src 'self' https://api.yourdomain.com`,
+    `frame-ancestors 'none'`,
+    `base-uri 'self'`,
+    `form-action 'self'`,
+    `report-to csp-endpoint`,
+  ].join('; ');
+
+  res.setHeader('Content-Security-Policy', policy);
+  next();
+});
+```
+
+### Next.js CSP Implementation
+
+```typescript
+// next.config.js
+const securityHeaders = [
+  {
+    key: 'Content-Security-Policy',
+    value: `
+      default-src 'self';
+      script-src 'self' 'nonce-INLINE_NONCE' 'strict-dynamic';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' blob: data: https://*.unsplash.com;
+      font-src 'self';
+      connect-src 'self' https://vitals.vercel-insights.com;
+      frame-ancestors 'none';
+      base-uri 'self';
+      form-action 'self';
+      upgrade-insecure-requests;
+    `.replace(/\n/g, ''),
+  },
+];
+
+module.exports = {
+  async headers() {
+    return [{ source: '/(.*)', headers: securityHeaders }];
+  },
+};
+```
+
+### Nonce Injection for React SSR
+
+```typescript
+// pages/_document.tsx
+import { Html, Head, Main, NextScript } from 'next/document';
+import type { IncomingMessage } from 'http';
+
+interface CustomDocumentProps {
+  nonce: string;
+}
+
+export default function Document({ nonce }: CustomDocumentProps) {
+  return (
+    <Html lang="en">
+      <Head nonce={nonce}>
+        <meta httpEquiv="Content-Security-Policy" 
+          content={`script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`} />
+      </Head>
+      <body>
+        <Main nonce={nonce} />
+        <NextScript nonce={nonce} />
+      </body>
+    </Html>
+  );
+}
+
+// middleware.ts — generate nonce per request
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+  const response = NextResponse.next();
   
-  // Return formatted output
-  return format(result);
+  request.headers.set('x-nonce', nonce);
+  response.headers.set(
+    'Content-Security-Policy',
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'; base-uri 'self'; form-action 'self'`
+  );
+  
+  return response;
 }
 ```
 
-This pattern demonstrates the core approach to implementing Security solutions in production environments.
+![CSP deployment flow](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Best Practices
+## Real-World Use Cases and Case Studies
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+### Use Case 1: SaaS Application with Inline Scripts
 
-## Common Pitfalls
+A SaaS dashboard rendering charts via inline scripts required nonce-based CSP. The team migrated from `'unsafe-inline'` to nonce-based policy by injecting nonces during server-side rendering. After 2 weeks in Report-Only mode, they identified 15 inline scripts that needed noncing and eliminated 3 third-party scripts that couldn't be secured.
+
+### Use Case 2: E-Commerce with Third-Party Widgets
+
+An e-commerce site integrating payment widgets, analytics, and chat support deployed a layered CSP. The initial policy used Report-Only mode for 30 days, revealing 47 third-party domains. The final policy whitelisted only 12 critical domains and removed 8 scripts that violated security requirements.
+
+### Use Case 3: Government Portal with Strict Security
+
+A government portal requiring NIST 800-53 compliance deployed CSP Level 3 with hash-based policies for static content and nonce-based policies for dynamic pages. The deployment included automated CSP validation in CI/CD pipelines, preventing policy regression.
+
+## Best Practices for Production
+
+1. **Start with Report-Only mode**: Deploy `Content-Security-Policy-Report-Only` first and monitor violation reports for 2-4 weeks. Never jump directly to enforcement—misconfigured CSP breaks functionality silently.
+
+2. **Use `'strict-dynamic'` with nonces**: `'strict-dynamic'` trusts scripts loaded by already-trusted scripts, eliminating the need to whitelist every CDN and third-party script URL. This prevents injection attacks on whitelisted domains.
+
+3. **Never use `'unsafe-inline'` for scripts**: `'unsafe-inline'` completely negates CSP's XSS protection. Use nonces or hashes instead. For styles, `'unsafe-inline'` is less dangerous but should still be replaced with nonces when possible.
+
+4. **Implement CSP reporting infrastructure**: Use the Reporting API with `report-to` directive. Tools like Sentry, Report URI, or a custom endpoint aggregate violation reports. Set up alerts for sudden spikes in violations indicating active attacks.
+
+5. **Automate CSP validation in CI/CD**: Add tests that verify CSP headers are present, contain required directives, and don't include `'unsafe-eval'` or `'unsafe-inline'` for scripts. Tools like `csp-validator` catch syntax errors before deployment.
+
+6. **Separate policies per route group**: Admin routes, API endpoints, and public pages have different security requirements. Use middleware to apply route-specific policies rather than one overly permissive global policy.
+
+7. **Document every CSP exception**: Each whitelisted domain or `'unsafe-inline'` usage should have a documented business justification. Regular audits remove exceptions that are no longer needed.
+
+8. **Combine with other security headers**: CSP works best alongside `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and HSTS.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Deploying enforcement without Report-Only testing | Broken functionality, angry users | Always test in Report-Only mode first |
+| Using `'unsafe-inline'` with `'strict-dynamic'` | `'strict-dynamic'` ignores `'unsafe-inline'`, causing unexpected blocks | Remove `'unsafe-inline'` when using nonces + `'strict-dynamic'` |
+| Whitelisting `*.googleapis.com` wildcard | Overly broad trust, increases attack surface | Whitelist specific subdomains needed |
+| Non-reusable nonces across requests | Broken caching, inconsistent SSR/CSR | Generate per-request nonces, never cache CSP pages with CDN |
+| Ignoring CSP violation reports | Missing attack signals and policy misconfigurations | Set up reporting, review weekly, alert on anomalies |
+| Using `'self'` for inline styles in SPA | Style bindings blocked, broken UI | Use `'unsafe-inline'` for styles or nonce-based style policy |
+
+## Performance Optimization
+
+CSP has minimal runtime overhead—the browser evaluates the policy once per resource load. However, the nonce generation and header injection add latency to server-side rendering. For high-traffic applications, pre-compute nonces in a middleware layer and reuse them across template rendering.
+
+```typescript
+// Efficient nonce generation with connection pooling
+import { randomBytes } from 'crypto';
+
+const NONCE_CACHE_SIZE = 1000;
+const nonceCache: string[] = [];
+
+// Pre-generate nonces in batches
+function warmNonceCache(): void {
+  const nonces = Array.from({ length: NONCE_CACHE_SIZE }, () =>
+    randomBytes(16).toString('base64')
+  );
+  nonceCache.push(...nonces);
+}
+
+// Pop nonces from cache, regenerate when depleted
+function getNonce(): string {
+  if (nonceCache.length < 100) {
+    warmNonceCache();
+  }
+  return nonceCache.pop()!;
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | CSP | SRI (Subresource Integrity) | CORS | Sandbox Iframe |
+|---------|-----|---------------------------|------|---------------|
+| XSS Prevention | Strong (with nonces) | None | None | Moderate |
+| Resource Loading Control | Comprehensive | Per-resource only | Origin-level | Full |
+| Inline Script Control | Nonce/hash-based | N/A | N/A | Blocked entirely |
+| Third-Party Script Trust | Whitelist + dynamic | Hash verification | Origin check | Full isolation |
+| Browser Support | 97%+ | 97%+ | 97%+ | 97%+ |
+| Implementation Complexity | High | Low | Medium | Low |
+
+CSP and SRI are complementary—CSP controls which origins can serve scripts, while SRI verifies the content hasn't been tampered with. Using both together provides defense-in-depth against compromised CDNs and supply chain attacks.
+
+## Advanced Patterns and Techniques
+
+### CSP Level 3 `strict-dynamic` Migration
+
+```typescript
+// Phase 1: Add nonces to all inline scripts
+// Phase 2: Deploy with Report-Only + strict-dynamic
+// Phase 3: Remove unnecessary source whitelist entries
+// Phase 4: Switch to enforcement
+
+const cspPhases = {
+  reportOnly: {
+    'script-src': `'nonce-${nonce}' 'strict-dynamic' 'report-sample'`,
+    'report-to': 'csp-endpoint',
+  },
+  enforced: {
+    'script-src': `'nonce-${nonce}' 'strict-dynamic'`,
+    'report-to': 'csp-endpoint',
+  },
+};
+```
+
+### CSP with Trusted Types for DOM XSS Prevention
+
+```typescript
+// Trusted Types policy prevents DOM XSS in sinks like innerHTML
+// Add to CSP: require-trusted-types-for 'script'
+
+import { trustedTypes } from 'trusted-types';
+
+const policy = trustedTypes.createPolicy('sanitize', {
+  createHTML: (input: string) => {
+    return DOMPurify.sanitize(input);
+  },
+  createScriptURL: (input: string) => {
+    const url = new URL(input, document.baseURI);
+    if (url.origin !== location.origin) throw new Error('Blocked script URL');
+    return url.toString();
+  },
+});
+
+// Usage
+element.innerHTML = policy.createHTML(userInput);
+script.src = policy.createScriptURL(trustedUrl);
+```
+
+## Testing Strategies
+
+Automated CSP testing should verify header presence, directive correctness, and policy strength:
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('CSP header is present and enforced', async ({ page }) => {
+  const response = await page.goto('/');
+  const csp = response?.headers()['content-security-policy'];
+  
+  expect(csp).toBeTruthy();
+  expect(csp).toContain("script-src 'self'");
+  expect(csp).not.toContain("'unsafe-eval'");
+  expect(csp).toContain("'strict-dynamic'");
+  expect(csp).toContain('report-to');
+});
+
+test('inline scripts without nonce are blocked', async ({ page }) => {
+  const violations: string[] = [];
+  
+  page.on('console', (msg) => {
+    if (msg.text().includes('Content-Security-Policy')) {
+      violations.push(msg.text());
+    }
+  });
+  
+  await page.evaluate(() => {
+    const script = document.createElement('script');
+    script.textContent = 'window.__injected = true;';
+    document.body.appendChild(script);
+  });
+  
+  await page.waitForTimeout(500);
+  expect(violations.length).toBeGreaterThan(0);
+});
+```
+
+## Future Outlook
+
+CSP Level 3 is now a W3C Candidate Recommendation with broad browser support. The `strict-dynamic` keyword, hash-based policies, and the Reporting API represent the current best practice. Emerging features include document-domain deprecation (preventing `document.domain` manipulation), navigational policies (`navigate-to`), and deeper integration with Trusted Types for DOM XSS prevention.
+
+The CSP ecosystem is maturing with better tooling: automated policy generators like [CSP Evaluator](https://csp-evaluator.withgoogle.com/), framework-specific plugins (Next.js, Nuxt), and CI/CD integration. As browsers deprecate `'unsafe-inline'` support for new features, nonce-based policies will become the universal standard.
+
+A well-configured CSP is one of the most effective defenses against cross-site scripting attacks, but it requires careful planning to avoid breaking legitimate functionality.
 
 ## Conclusion
 
-Web Security: Content Security Policy (CSP) in Depth is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Content Security Policy is the browser's most powerful defense against XSS and injection attacks, but its effectiveness depends entirely on proper deployment. Start with Report-Only mode, migrate to nonce-based `'strict-dynamic'` policies, build robust violation reporting infrastructure, and automate policy validation. The investment in CSP deployment pays dividends in reduced attack surface and compliance with security frameworks like OWASP, NIST, and SOC 2.
+
+Key implementation checklist: generate cryptographically secure nonces per request, use `'strict-dynamic'` to avoid whitelist maintenance, deploy in Report-Only first, monitor violation reports, and combine with Trusted Types for maximum DOM XSS protection.
