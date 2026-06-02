@@ -3,11 +3,11 @@ import { MDXContentRenderer } from "@/components/mdx/mdx-content-renderer";
 
 export default function TILPage() {
   const sortedTils = tils.sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
   );
 
   return (
-    <div className="mt-10 max-w-2xl">
+    <div className="mt-10 max-w-5xl">
       {sortedTils.map((til, i) => (
         <div key={til.slugAsParams} className="relative pb-12">
           <span className="w-2 h-2 rounded-full bg-primary absolute top-3 -translate-y-1/2 left-2 -translate-x-1/2"></span>
@@ -28,4 +28,4 @@ export default function TILPage() {
       ))}
     </div>
   );
-} 
+}

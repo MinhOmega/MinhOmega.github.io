@@ -21,7 +21,7 @@ export default function BlogsPage() {
     .sort((a, b) => b - a);
 
   return (
-    <div className="mt-10 max-w-2xl">
+    <div className="mt-10 max-w-5xl">
       <h1 className="text-3xl font-bold tracking-tight mb-2">Blog</h1>
       <p className="text-muted-foreground mb-8">
         {publishedBlogs.length} articles on web development, AI, DevOps, and
