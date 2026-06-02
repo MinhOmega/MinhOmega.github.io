@@ -9,54 +9,583 @@ author: "MinhVo"
 
 ## Introduction
 
-GraphQL Mutations and Subscriptions: Beyond Queries is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+While GraphQL queries handle reading data, mutations and subscriptions handle the other two critical pillars of data management: writing data and receiving real-time updates. Mutations allow clients to modify server-side data with typed inputs and responses, while subscriptions push data changes to clients in real-time using WebSocket connections.
 
-## Key Concepts
+Mastering these operations is essential for building responsive, real-time applications. In this guide, we'll implement robust mutations with optimistic updates, build real-time subscriptions with WebSocket transport, and explore patterns for handling errors and edge cases in production applications.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Real-time data architecture](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Mutations and Subscriptions: Core Concepts
 
-## Practical Implementation
+### GraphQL Mutations Explained
 
-Let's look at a practical example:
+Mutations are GraphQL's mechanism for modifying server-side data. Unlike queries, mutations are executed serially by the GraphQL specification, ensuring that writes happen in order. A mutation defines input types for the data being sent and returns the modified object:
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+```graphql
+type Mutation {
+  createUser(input: CreateUserInput!): CreateUserPayload!
+  updateUser(id: ID!, input: UpdateUserInput!): User!
+  deleteUser(id: ID!): DeleteUserPayload!
+}
+
+input CreateUserInput {
+  name: String!
+  email: String!
+  role: Role = USER
+}
+
+type CreateUserPayload {
+  user: User!
+  errors: [Error!]
 }
 ```
 
-This pattern demonstrates the core approach to implementing GraphQL solutions in production environments.
+The mutation payload pattern is a best practice that allows returning both the result and any validation errors in a single response. This is more flexible than relying on GraphQL errors alone, which are meant for system-level failures.
 
-## Best Practices
+### GraphQL Subscriptions Explained
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+Subscriptions are long-lived operations that push data to clients when specific events occur. Unlike queries and mutations that use HTTP, subscriptions typically use WebSocket connections for bidirectional communication:
 
-## Common Pitfalls
+```graphql
+type Subscription {
+  messageSent(channelId: ID!): Message!
+  userStatusChanged(userId: ID!): UserStatus!
+  orderUpdated(orderId: ID!): Order!
+}
+```
+
+When a client creates a subscription, the server maintains the WebSocket connection and pushes the subscription payload whenever the subscribed event fires. This enables real-time features like chat, live notifications, and collaborative editing.
+
+### Error Handling Patterns
+
+GraphQL provides two mechanisms for reporting errors: top-level `errors` array for system failures (authentication, server errors) and typed error fields in mutation payloads for business logic failures (validation, conflicts):
+
+```typescript
+// System error (in errors array)
+{
+  "errors": [{
+    "message": "Not authenticated",
+    "extensions": { "code": "UNAUTHENTICATED" }
+  }]
+}
+
+// Business error (in payload)
+{
+  "data": {
+    "createUser": {
+      "user": null,
+      "errors": [
+        { "field": "email", "message": "Already in use" }
+      ]
+    }
+  }
+}
+```
+
+## Architecture and Design Patterns
+
+### The Payload Pattern
+
+The payload pattern structures mutation responses to include both success data and error information. This gives clients precise control over error handling:
+
+```graphql
+interface MutationResponse {
+  success: Boolean!
+  errors: [Error!]
+}
+
+type CreateUserPayload implements MutationResponse {
+  success: Boolean!
+  errors: [Error!]
+  user: User
+}
+
+type Error {
+  field: String
+  message: String!
+  code: ErrorCode!
+}
+```
+
+### The Event Bus Pattern
+
+Subscriptions require an event bus to decouple mutation logic from subscription delivery. When a mutation modifies data, it publishes an event to the bus. Subscriptions listen for these events and push updates to connected clients:
+
+```typescript
+import { PubSub } from "graphql-subscriptions";
+
+const pubsub = new PubSub();
+
+const resolvers = {
+  Mutation: {
+    sendMessage: async (_, { input }, { user, db }) => {
+      const message = await db.message.create({
+        data: { ...input, authorId: user.id },
+      });
+
+      // Publish event for subscriptions
+      pubsub.publish("MESSAGE_SENT", {
+        messageSent: message,
+        channelId: input.channelId,
+      });
+
+      return { success: true, message };
+    },
+  },
+  Subscription: {
+    messageSent: {
+      subscribe: withFilter(
+        () => pubsub.asyncIterableIterator("MESSAGE_SENT"),
+        (payload, variables) => payload.channelId === variables.channelId
+      ),
+    },
+  },
+};
+```
+
+### Optimistic Update Pattern
+
+Optimistic updates immediately reflect changes in the UI before the server confirms them. This makes the application feel instant while the actual request completes in the background:
+
+```typescript
+const [updateUser] = useMutation(UPDATE_USER, {
+  optimisticResponse: {
+    __typename: "Mutation",
+    updateUser: {
+      __typename: "User",
+      id: userId,
+      name: newName,
+      // Include all fields from the selection set
+    },
+  },
+  update(cache, { data: { updateUser } }) {
+    // Update normalized cache
+    cache.modify({
+      id: cache.identify(updateUser),
+      fields: {
+        name: () => newName,
+      },
+    });
+  },
+  onError(error) {
+    // Rollback on error - Apollo automatically reverts optimistic update
+    showToast(`Update failed: ${error.message}`);
+  },
+});
+```
+
+![Optimistic update flow](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Defining Mutation Schema
+
+Start by designing your mutation schema with proper input types and payload types:
+
+```graphql
+type Mutation {
+  # CRUD operations
+  createPost(input: CreatePostInput!): CreatePostPayload!
+  updatePost(id: ID!, input: UpdatePostInput!): UpdatePostPayload!
+  deletePost(id: ID!): DeletePostPayload!
+
+  # Batch operations
+  bulkDeletePosts(ids: [ID!]!): BulkDeletePayload!
+
+  # Actions with side effects
+  publishPost(id: ID!): PublishPostPayload!
+  archivePost(id: ID!): ArchivePostPayload!
+}
+
+input CreatePostInput {
+  title: String!
+  content: String!
+  categoryId: ID!
+  tags: [String!]
+  scheduledAt: DateTime
+}
+
+input UpdatePostInput {
+  title: String
+  content: String
+  categoryId: ID
+  tags: [String!]
+}
+
+type CreatePostPayload {
+  success: Boolean!
+  errors: [Error!]
+  post: Post
+}
+
+type DeletePostPayload {
+  success: Boolean!
+  errors: [Error!]
+  deletedId: ID
+}
+```
+
+### Implementing Mutation Resolvers
+
+Build resolvers that validate input, perform the operation, and publish events for subscriptions:
+
+```typescript
+const mutationResolvers = {
+  Mutation: {
+    createPost: async (_, { input }, { user, db, pubsub }) => {
+      // Validate input
+      const validation = validateCreatePostInput(input);
+      if (!validation.valid) {
+        return { success: false, errors: validation.errors, post: null };
+      }
+
+      // Check authorization
+      if (!user || !user.permissions.includes("CREATE_POST")) {
+        return {
+          success: false,
+          errors: [{ message: "Not authorized", code: "FORBIDDEN" }],
+          post: null,
+        };
+      }
+
+      // Create the post
+      const post = await db.post.create({
+        data: {
+          ...input,
+          authorId: user.id,
+          status: input.scheduledAt ? "SCHEDULED" : "DRAFT",
+        },
+        include: { author: true, category: true },
+      });
+
+      // Publish event for real-time subscriptions
+      pubsub.publish("POST_CREATED", { postCreated: post });
+
+      return { success: true, errors: [], post };
+    },
+
+    updatePost: async (_, { id, input }, { user, db, pubsub }) => {
+      const post = await db.post.findUnique({ where: { id } });
+      if (!post) {
+        return {
+          success: false,
+          errors: [{ message: "Post not found", code: "NOT_FOUND" }],
+          post: null,
+        };
+      }
+
+      if (post.authorId !== user.id && !user.permissions.includes("ADMIN")) {
+        return {
+          success: false,
+          errors: [{ message: "Not authorized", code: "FORBIDDEN" }],
+          post: null,
+        };
+      }
+
+      const updated = await db.post.update({
+        where: { id },
+        data: input,
+        include: { author: true, category: true },
+      });
+
+      pubsub.publish("POST_UPDATED", { postUpdated: updated });
+
+      return { success: true, errors: [], post: updated };
+    },
+  },
+};
+```
+
+### Setting Up WebSocket Subscriptions
+
+Configure Apollo Server with WebSocket transport for subscriptions:
+
+```typescript
+import { ApolloServer } from "@apollo/server";
+import { expressMiddleware } from "@apollo/server/express4";
+import { WebSocketServer } from "ws";
+import { useServer } from "graphql-ws/lib/use/ws";
+import { makeExecutableSchema } from "@graphql-tools/schema";
+import express from "express";
+import { createServer } from "http";
+
+const schema = makeExecutableSchema({ typeDefs, resolvers });
+
+// WebSocket server for subscriptions
+const wsServer = new WebSocketServer({
+  path: "/graphql",
+});
+
+const serverCleanup = useServer(
+  {
+    schema,
+    context: async (ctx) => {
+      const token = ctx.connectionParams?.authToken;
+      const user = token ? await verifyToken(token) : null;
+      return { user, pubsub };
+    },
+  },
+  wsServer
+);
+
+// HTTP server for queries and mutations
+const apolloServer = new ApolloServer({
+  schema,
+  plugins: [
+    {
+      async serverWillStart() {
+        return {
+          async drainServer() {
+            await serverCleanup.dispose();
+          },
+        };
+      },
+    },
+  ],
+});
+
+const app = express();
+const httpServer = createServer(app);
+
+await apolloServer.start();
+app.use("/graphql", express.json(), expressMiddleware(apolloServer));
+
+httpServer.listen(4000);
+```
+
+### Implementing Client-Side Subscriptions
+
+Use Apollo Client's `useSubscription` hook to receive real-time updates:
+
+```typescript
+import { useSubscription, useMutation, gql } from "@apollo/client";
+
+const MESSAGE_SENT = gql`
+  subscription OnMessageSent($channelId: ID!) {
+    messageSent(channelId: $channelId) {
+      id
+      content
+      author {
+        id
+        name
+        avatar
+      }
+      createdAt
+    }
+  }
+`;
+
+const SEND_MESSAGE = gql`
+  mutation SendMessage($input: SendMessageInput!) {
+    sendMessage(input: $input) {
+      success
+      errors { message }
+      message {
+        id
+        content
+        author { id name }
+        createdAt
+      }
+    }
+  }
+`;
+
+function ChatChannel({ channelId }: { channelId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  const { data, loading } = useSubscription(MESSAGE_SENT, {
+    variables: { channelId },
+    onData: ({ data }) => {
+      setMessages((prev) => [...prev, data.messageSent]);
+    },
+  });
+
+  const [sendMessage] = useMutation(SEND_MESSAGE, {
+    optimisticResponse: {
+      sendMessage: {
+        __typename: "SendMessagePayload",
+        success: true,
+        errors: [],
+        message: {
+          __typename: "Message",
+          id: "temp-id",
+          content: "Sending...",
+          author: { __typename: "User", id: "current-user", name: "You" },
+          createdAt: new Date().toISOString(),
+        },
+      },
+    },
+  });
+
+  return (
+    <div>
+      <MessageList messages={messages} />
+      <MessageInput onSend={(content) => sendMessage({ variables: { input: { channelId, content } } })} />
+    </div>
+  );
+}
+```
+
+![WebSocket subscription flow](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Collaborative Document Editing
+
+A document editing application uses subscriptions to broadcast cursor positions, text changes, and presence updates. Mutations handle document saves and version creation. The combination enables real-time collaboration where multiple users see each other's changes instantly.
+
+### Live Auction Platform
+
+An auction platform uses subscriptions for bid updates and countdown timers. When a user places a bid via mutation, the subscription pushes the new bid to all watchers. Optimistic updates make the bidder's UI update instantly while the mutation confirms the bid.
+
+### IoT Dashboard
+
+An IoT dashboard subscribes to sensor data streams. Each sensor publishes readings via mutations, and the subscription delivers them to the dashboard in real-time. Filtering at the subscription level ensures each dashboard widget only receives relevant data.
+
+## Best Practices for Production
+
+1. **Use the payload pattern for mutations**: Always return typed payloads with success status and error arrays rather than relying solely on GraphQL errors.
+
+2. **Implement optimistic updates for mutations**: Update the UI immediately and roll back on error. This makes your app feel instant.
+
+3. **Use `withFilter` for subscription filtering**: Filter events at the subscription level to avoid sending irrelevant data to clients.
+
+4. **Implement connection keepalive**: Send periodic keepalive messages on WebSocket connections to detect and handle disconnections gracefully.
+
+5. **Use DataLoader in subscription resolvers**: Subscription resolvers may trigger entity resolution, so ensure they use batching to avoid N+1 queries.
+
+6. **Rate-limit mutations**: Implement rate limiting on mutations to prevent abuse, especially for mutations that trigger expensive operations.
+
+7. **Validate subscription authentication**: Verify authentication tokens in the WebSocket connection context, not in each subscription resolver.
+
+8. **Implement reconnection logic on the client**: Handle WebSocket disconnections with automatic reconnection and missed event replay.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Missing optimistic response fields | UI flickers on update | Include all fields from selection set in optimistic response |
+| Unfiltered subscriptions | Clients receive irrelevant events | Use `withFilter` to filter by subscription variables |
+| Memory leaks from subscriptions | Server memory grows over time | Implement connection cleanup and subscription disposal |
+| Race conditions in mutations | Data inconsistency | Use database transactions and optimistic locking |
+| WebSocket authentication gaps | Unauthorized data access | Verify auth tokens in connection context |
+
+## Performance Optimization
+
+Optimize mutation and subscription performance by batching database writes, using database transactions for atomic operations, and implementing efficient event filtering:
+
+```typescript
+// Batch mutations with transactions
+const resolvers = {
+  Mutation: {
+    bulkUpdatePosts: async (_, { updates }, { db }) => {
+      return db.$transaction(
+        updates.map(({ id, input }) =>
+          db.post.update({ where: { id }, data: input })
+        )
+      );
+    },
+  },
+};
+```
+
+## Comparison with Alternatives
+
+| Feature | GraphQL Subscriptions | WebSocket (raw) | Server-Sent Events | Polling |
+|---------|----------------------|-----------------|-------------------|---------|
+| Type safety | Full | None | None | Full (with queries) |
+| Bidirectional | Yes | Yes | No | No |
+| Schema integration | Yes | No | No | Yes |
+| Complexity | Moderate | High | Low | Low |
+| Scalability | Good | Good | Good | Poor |
+| Browser support | Universal | Universal | Universal | Universal |
+
+## Advanced Patterns
+
+### Subscription Deduplication
+
+When multiple clients subscribe to the same event with identical parameters, deduplicate them to reduce server load:
+
+```typescript
+class SubscriptionManager {
+  private subscriptions = new Map<string, Set<string>>();
+
+  addSubscription(channelId: string, clientId: string) {
+    if (!this.subscriptions.has(channelId)) {
+      this.subscriptions.set(channelId, new Set());
+    }
+    this.subscriptions.get(channelId)!.add(clientId);
+  }
+
+  getSubscriberCount(channelId: string): number {
+    return this.subscriptions.get(channelId)?.size || 0;
+  }
+}
+```
+
+### Optimistic Locking
+
+Prevent concurrent mutation conflicts using version-based optimistic locking:
+
+```typescript
+const updatePost = async (_, { id, input, expectedVersion }, { db }) => {
+  const result = await db.post.updateMany({
+    where: { id, version: expectedVersion },
+    data: { ...input, version: { increment: 1 } },
+  });
+
+  if (result.count === 0) {
+    return {
+      success: false,
+      errors: [{ message: "Post was modified by another user", code: "CONFLICT" }],
+      post: null,
+    };
+  }
+
+  return { success: true, errors: [], post: await db.post.findUnique({ where: { id } }) };
+};
+```
+
+## Testing Strategies
+
+Test mutations and subscriptions using mock PubSub and WebSocket test clients:
+
+```typescript
+describe("Message mutations and subscriptions", () => {
+  it("sends message and receives via subscription", async () => {
+    const pubsub = new PubSub();
+    const mockDb = createMockDb();
+    const server = createTestServer({ pubsub, db: mockDb });
+
+    // Subscribe
+    const subscription = server.executeSubscription({
+      query: `subscription { messageSent(channelId: "1") { id content } }`,
+    });
+
+    // Mutate
+    await server.executeOperation({
+      query: `mutation { sendMessage(input: { channelId: "1", content: "Hello" }) { success } }`,
+    });
+
+    // Verify subscription received the message
+    const result = await subscription.next();
+    expect(result.value.data.messageSent.content).toBe("Hello");
+  });
+});
+```
+
+## Future Outlook
+
+GraphQL subscriptions are evolving with the `graphql-ws` protocol replacing the deprecated `subscriptions-transport-ws`. Future developments include subscription batching, incremental delivery for large payloads, and better integration with edge computing platforms for low-latency real-time applications.
 
 ## Conclusion
 
-GraphQL Mutations and Subscriptions: Beyond Queries is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Mutations and subscriptions are essential for building interactive, real-time GraphQL applications. The key takeaways are:
+
+1. Use the payload pattern for typed mutation responses with explicit error handling
+2. Implement optimistic updates for responsive UIs that don't wait for server confirmation
+3. Use WebSocket transport with `graphql-ws` for modern, secure subscriptions
+4. Filter subscriptions at the server level to avoid sending irrelevant data to clients
+5. Handle authentication at the WebSocket connection level for subscription security
+
+Start with well-typed mutations using the payload pattern, then add subscriptions for the features that truly need real-time updates. Combined with optimistic updates, these patterns create applications that feel instant and responsive.

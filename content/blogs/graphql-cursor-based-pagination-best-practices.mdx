@@ -9,54 +9,461 @@ author: "MinhVo"
 
 ## Introduction
 
-GraphQL Cursor-Based Pagination Best Practices is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Pagination is a fundamental requirement for any API that returns lists of data. While offset-based pagination (skip/take) is simple to implement, it breaks down in real-time applications where items are frequently added or removed. Cursor-based pagination solves this by using opaque identifiers (cursors) to mark positions in a dataset, ensuring consistent results even as the underlying data changes.
 
-## Key Concepts
+GraphQL's cursor-based pagination, popularized by the Relay specification, has become the de facto standard for paginating GraphQL APIs. In this guide, we'll implement cursor pagination from scratch, explore the Relay connection specification, and learn performance optimization techniques that scale to millions of records.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Pagination architecture diagram](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Cursor-Based Pagination: Core Concepts
 
-## Practical Implementation
+### Why Cursors Over Offsets
 
-Let's look at a practical example:
+Offset-based pagination uses a numeric index to identify positions: "give me items 20-30." This approach has three critical problems. First, if an item is inserted before position 20 between requests, the user sees a duplicate. If an item is deleted, the user misses one entirely. Second, offset queries become increasingly slow at higher offsets because the database must scan and discard all preceding rows.
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+Cursor-based pagination solves both problems. Instead of a numeric offset, each item has an opaque cursor (typically a Base64-encoded identifier). When requesting the next page, you pass the cursor of the last item received: "give me 10 items after this cursor." Because the cursor identifies a specific item rather than a position, insertions and deletions don't cause inconsistencies.
+
+### The Relay Connection Specification
+
+The Relay specification defines a standard structure for paginated fields called "connections." A connection type contains edges (the actual data items with their cursors) and page info (metadata about the pagination state):
+
+```graphql
+type UserConnection {
+  edges: [UserEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type UserEdge {
+  node: User!
+  cursor: String!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
 }
 ```
 
-This pattern demonstrates the core approach to implementing GraphQL solutions in production environments.
+This structure may seem verbose, but it provides a consistent API that clients can build generic pagination components around. The `edges` array contains both the data (`node`) and the cursor, while `pageInfo` tells the client whether more pages exist.
 
-## Best Practices
+### Cursor Encoding Strategies
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+Cursors should be opaque to clients—they shouldn't be able to decode or manipulate them. Common encoding strategies include:
 
-## Common Pitfalls
+- **Base64-encoded IDs**: `Base64("User:42")` → `VXNlcjo0Mg==`
+- **Compound cursors**: `Base64(JSON.stringify({ createdAt: "...", id: "42" }))`
+- **Database row pointers**: Encoded primary key + sort column values
+
+The key requirement is that cursors must uniquely identify a position in the sorted result set, not just an item.
+
+## Architecture and Design Patterns
+
+### The Resolver Pattern
+
+GraphQL cursor pagination lives in your resolvers. The resolver receives `first`/`after` or `before`/`last` arguments and translates them into database queries:
+
+```typescript
+const resolvers = {
+  Query: {
+    users: async (_, { first, after, last, before }, { db }) => {
+      const cursor = after ? decodeCursor(after) : null;
+      const limit = first || 10;
+
+      const users = await db.user.findMany({
+        take: limit + 1, // Fetch one extra to determine hasNextPage
+        cursor: cursor ? { id: cursor.id } : undefined,
+        orderBy: { createdAt: "desc" },
+      });
+
+      const hasNextPage = users.length > limit;
+      const edges = users.slice(0, limit).map((user) => ({
+        node: user,
+        cursor: encodeCursor({ id: user.id, createdAt: user.createdAt }),
+      }));
+
+      return {
+        edges,
+        pageInfo: {
+          hasNextPage,
+          hasPreviousPage: !!after,
+          startCursor: edges[0]?.cursor,
+          endCursor: edges[edges.length - 1]?.cursor,
+        },
+        totalCount: await db.user.count(),
+      };
+    },
+  },
+};
+```
+
+### Bidirectional Pagination
+
+The Relay specification supports both forward and backward pagination. Forward pagination uses `first` and `after`, while backward pagination uses `last` and `before`. Implementing both allows clients to navigate in either direction:
+
+```typescript
+function buildPaginationArgs({ first, after, last, before }) {
+  if (first) {
+    return {
+      take: first + 1,
+      skip: after ? 1 : 0,
+      cursor: after ? { id: decodeCursor(after).id } : undefined,
+      orderBy: { createdAt: "desc" },
+    };
+  }
+
+  if (last) {
+    return {
+      take: -(last + 1), // Negative take = reverse order
+      skip: before ? 1 : 0,
+      cursor: before ? { id: decodeCursor(before).id } : undefined,
+      orderBy: { createdAt: "asc" },
+    };
+  }
+
+  return { take: 10, orderBy: { createdAt: "desc" } };
+}
+```
+
+### Cache Integration with Apollo Client
+
+Apollo Client's `InMemoryCache` has built-in support for relay-style pagination. Configure field policies to merge paginated results automatically:
+
+```typescript
+const cache = new InMemoryCache({
+  typePolicies: {
+    Query: {
+      fields: {
+        users: {
+          keyArgs: ["filter", "sort"],
+          merge(existing, incoming, { args }) {
+            if (!args?.after) return incoming;
+
+            return {
+              ...incoming,
+              edges: [...(existing?.edges || []), ...incoming.edges],
+            };
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+![Relay connection structure](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Defining the Schema
+
+Start with the connection types in your GraphQL schema. Use a consistent naming convention across all paginated fields:
+
+```graphql
+type Query {
+  users(first: Int, after: String, last: Int, before: String, filter: UserFilter): UserConnection!
+  posts(first: Int, after: String, category: String): PostConnection!
+}
+
+type UserConnection {
+  edges: [UserEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type UserEdge {
+  node: User!
+  cursor: String!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+input UserFilter {
+  role: Role
+  search: String
+}
+```
+
+### Implementing the Cursor Encoder/Decoder
+
+Create utility functions for encoding and decoding cursors. Use Base64 encoding with a type prefix for debugging:
+
+```typescript
+function encodeCursor(payload: { id: string; [key: string]: any }): string {
+  const data = JSON.stringify(payload);
+  return Buffer.from(data).toString("base64");
+}
+
+function decodeCursor(cursor: string): { id: string; [key: string]: any } {
+  try {
+    const data = Buffer.from(cursor, "base64").toString("utf-8");
+    return JSON.parse(data);
+  } catch {
+    throw new Error("Invalid cursor");
+  }
+}
+```
+
+### Building the Resolver
+
+Implement the resolver with proper validation, error handling, and database query optimization:
+
+```typescript
+const userResolvers = {
+  Query: {
+    users: async (
+      _: unknown,
+      args: { first?: number; after?: string; last?: number; before?: string; filter?: any },
+      context: { db: PrismaClient }
+    ) => {
+      const { first, after, last, before, filter } = args;
+      const { db } = context;
+
+      // Validate arguments
+      if (first && last) throw new UserInputError("Cannot use both first and last");
+      if (first && first > 100) throw new UserInputError("Maximum page size is 100");
+      if (last && last > 100) throw new UserInputError("Maximum page size is 100");
+
+      const limit = first || last || 10;
+      const cursor = after ? decodeCursor(after) : before ? decodeCursor(before) : null;
+
+      const where = {
+        ...(filter?.role && { role: filter.role }),
+        ...(filter?.search && {
+          OR: [
+            { name: { contains: filter.search, mode: "insensitive" } },
+            { email: { contains: filter.search, mode: "insensitive" } },
+          ],
+        }),
+      };
+
+      const [users, totalCount] = await Promise.all([
+        db.user.findMany({
+          where,
+          take: limit + 1,
+          cursor: cursor ? { id: cursor.id } : undefined,
+          orderBy: { createdAt: "desc" },
+        }),
+        db.user.count({ where }),
+      ]);
+
+      const hasNextPage = users.length > limit;
+      const edges = users.slice(0, limit).map((user) => ({
+        node: user,
+        cursor: encodeCursor({ id: user.id, createdAt: user.createdAt }),
+      }));
+
+      return {
+        edges,
+        pageInfo: {
+          hasNextPage: after ? hasNextPage : hasNextPage,
+          hasPreviousPage: !!after,
+          startCursor: edges[0]?.cursor || null,
+          endCursor: edges[edges.length - 1]?.cursor || null,
+        },
+        totalCount,
+      };
+    },
+  },
+};
+```
+
+### Implementing Infinite Scroll on the Client
+
+Use Apollo Client's `fetchMore` to implement infinite scrolling:
+
+```typescript
+function UserList() {
+  const { data, loading, fetchMore } = useGetUsersQuery({
+    variables: { first: 20 },
+  });
+
+  const loadMore = () => {
+    if (!data?.users.pageInfo.hasNextPage) return;
+
+    fetchMore({
+      variables: {
+        after: data.users.pageInfo.endCursor,
+      },
+      updateQuery: (prev, { fetchMoreResult }) => {
+        if (!fetchMoreResult) return prev;
+        return {
+          users: {
+            ...fetchMoreResult.users,
+            edges: [...prev.users.edges, ...fetchMoreResult.users.edges],
+          },
+        };
+      },
+    });
+  };
+
+  return (
+    <InfiniteScroll onReachEnd={loadMore} hasMore={data?.users.pageInfo.hasNextPage}>
+      {data?.users.edges.map(({ node, cursor }) => (
+        <UserCard key={node.id} user={node} />
+      ))}
+      {loading && <Spinner />}
+    </InfiniteScroll>
+  );
+}
+```
+
+![Infinite scroll implementation](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Social Media Feed
+
+A social media feed uses cursor pagination with a time-based cursor. New posts are added in real-time via subscriptions, and the cursor ensures that existing posts don't shift as new content arrives. The `hasNextPage` flag controls whether to show a "Load More" button or trigger infinite scroll.
+
+### E-Commerce Product Listing
+
+An e-commerce platform paginates products with compound cursors that include the sort column value and the product ID. This handles the case where multiple products have the same price (the sort column) by falling back to ID for deterministic ordering.
+
+### Admin Dashboard Data Tables
+
+Admin dashboards often need both forward and backward pagination along with total counts for displaying "Page 3 of 47" style indicators. The relay connection's `totalCount` and bidirectional pagination support make this straightforward.
+
+## Best Practices for Production
+
+1. **Set a maximum page size**: Always cap `first` and `last` at a reasonable maximum (50-100) to prevent clients from requesting thousands of records in a single query.
+
+2. **Use database indexes on cursor columns**: Ensure your database has indexes on the columns used for sorting and cursor lookups. A composite index on `(sort_column, id)` is typically optimal.
+
+3. **Fetch limit + 1 items**: Always request one more item than the requested page size. If you get the extra item, `hasNextPage` is true. This avoids an extra COUNT query.
+
+4. **Encode meaningful data in cursors**: Include the sort column values in the cursor to enable seek-based pagination instead of offset-based queries.
+
+5. **Handle empty pages gracefully**: When a page returns no results, set `hasNextPage` and `hasPreviousPage` to false and return empty edges arrays.
+
+6. **Use `keyArgs` in Apollo Client**: Specify which arguments create distinct cache entries to prevent pagination results from different filters being merged incorrectly.
+
+7. **Implement connection factories**: Create reusable functions that transform any dataset into the connection format to maintain consistency across resolvers.
+
+8. **Add monitoring for slow pagination queries**: Track query performance at different cursor positions to catch performance degradation early.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using offset instead of seek | Inconsistent results with concurrent writes | Always use seek-based (cursor) queries |
+| Non-deterministic sort order | Missing or duplicate items | Always include a unique column (ID) as a tiebreaker |
+| Missing database indexes | Slow queries at high offsets | Add composite indexes on sort + ID columns |
+| Exposing internal IDs in cursors | Security risk, cursor manipulation | Always Base64-encode cursors |
+| Not capping page size | Memory issues, slow responses | Validate and limit `first`/`last` arguments |
+
+## Performance Optimization
+
+For large datasets, use keyset pagination (seek method) instead of offset-based queries. This approach uses the cursor to jump directly to the correct position without scanning preceding rows:
+
+```typescript
+// Keyset pagination - O(log n) regardless of position
+const users = await db.user.findMany({
+  where: {
+    createdAt: { lt: cursor.createdAt },
+    ...(cursor.id && { id: { not: cursor.id } }),
+  },
+  take: limit + 1,
+  orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+});
+```
+
+## Comparison with Alternatives
+
+| Feature | Cursor-Based | Offset-Based | Page-Based |
+|---------|-------------|--------------|------------|
+| Consistency with mutations | Excellent | Poor | Poor |
+| Random page access | No | Yes | Yes |
+| Performance at high pages | Consistent | Degrades | Degrades |
+| Implementation complexity | Moderate | Simple | Simple |
+| Client state management | Simple | Complex | Moderate |
+| Infinite scroll support | Natural | Awkward | Awkward |
+
+## Advanced Patterns
+
+### Relay Compiler Integration
+
+For projects using Relay, the compiler generates optimized pagination containers automatically:
+
+```typescript
+const UserListFragment = graphql`
+  fragment UserList_users on Query
+  @refetchable(queryName: "UserListPaginationQuery") {
+    users(first: $count, after: $cursor)
+    @connection(key: "UserList_users") {
+      edges {
+        node {
+          id
+          name
+        }
+      }
+    }
+  }
+`;
+```
+
+### Subscription-Aware Pagination
+
+Combine cursor pagination with subscriptions to handle real-time updates without breaking pagination state:
+
+```typescript
+const useSubscriptionAwarePagination = (query, subscription) => {
+  const { data, fetchMore } = useQuery(query);
+
+  useSubscription(subscription, {
+    onData: ({ data: newData }) => {
+      // Prepend new items to the first page only
+      cache.modify({
+        fields: {
+          users(existing) {
+            return prependEdge(existing, newData);
+          },
+        },
+      });
+    },
+  });
+};
+```
+
+## Testing Strategies
+
+Test pagination behavior with edge cases including empty result sets, single-item pages, and concurrent modifications:
+
+```typescript
+describe("User pagination", () => {
+  it("returns correct page info for last page", async () => {
+    const result = await executeQuery(GET_USERS, { first: 10, after: lastCursor });
+    expect(result.users.pageInfo.hasNextPage).toBe(false);
+    expect(result.users.edges).toHaveLength(3); // Remaining items
+  });
+
+  it("handles empty results gracefully", async () => {
+    const result = await executeQuery(GET_USERS, { first: 10 });
+    expect(result.users.edges).toHaveLength(0);
+    expect(result.users.pageInfo.hasNextPage).toBe(false);
+  });
+});
+```
+
+## Future Outlook
+
+GraphQL pagination is evolving with the Cursor Connections Specification v2, which adds support for streaming and incremental delivery. These features allow servers to push page updates in real-time without full re-fetches. Schema-level pagination directives are also being discussed to reduce boilerplate.
 
 ## Conclusion
 
-GraphQL Cursor-Based Pagination Best Practices is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Cursor-based pagination is the recommended approach for GraphQL APIs, providing consistent results in dynamic datasets and excellent performance at scale. The key takeaways are:
+
+1. Use the Relay connection specification for a standardized pagination API
+2. Encode cursors with Base64 to keep them opaque and tamper-proof
+3. Use keyset pagination (seek method) for consistent performance at any page position
+4. Always include a unique tiebreaker column in your sort order
+5. Set maximum page sizes and validate pagination arguments
+
+Start by implementing the connection types for your most frequently paginated resources, then create reusable resolver utilities to maintain consistency across your API.

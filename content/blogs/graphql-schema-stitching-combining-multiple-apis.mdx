@@ -9,54 +9,535 @@ author: "MinhVo"
 
 ## Introduction
 
-GraphQL Schema Stitching: Combining Multiple APIs is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Modern applications rarely rely on a single data source. They combine user data from one service, product catalogs from another, payment information from a third, and perhaps legacy REST APIs from a fourth. Schema stitching solves this problem by combining multiple GraphQL schemas into a single unified schema that clients can query as if it were one API.
 
-## Key Concepts
+While Apollo Federation has become the more popular choice for new projects, schema stitching remains a powerful technique—especially when you need to combine schemas you don't own, integrate REST APIs, or work with heterogeneous data sources. In this guide, we'll implement schema stitching from scratch, explore advanced patterns, and understand when to choose stitching over federation.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Microservices architecture diagram](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Schema Stitching: Core Concepts
 
-## Practical Implementation
+### How Schema Stitching Works
 
-Let's look at a practical example:
+Schema stitching takes multiple independent GraphQL schemas and merges them into a single schema. The gateway receives client queries, determines which sub-schemas are involved, routes requests to the appropriate services, and combines the results. Unlike federation, which requires special directives in sub-schemas, stitching can work with any GraphQL schema—including third-party APIs.
+
+The stitching process involves three steps. First, the gateway introspects or loads all sub-schemas. Second, it merges the types, resolving conflicts and connecting related types across schemas. Third, it creates a merged schema with resolvers that delegate queries to the appropriate sub-schemas.
+
+### Stitching vs. Federation
+
+Schema stitching and federation solve the same problem—combining distributed schemas—but with different tradeoffs. Stitching is more flexible: it works with any GraphQL schema without modifications. Federation requires sub-schemas to use federation directives. However, federation provides better entity resolution, automatic batching, and a more opinionated architecture.
+
+| Feature | Schema Stitching | Apollo Federation |
+|---------|-----------------|-------------------|
+| Works with existing schemas | Yes | No (needs directives) |
+| Entity resolution | Manual | Automatic |
+| Batching | Manual (DataLoader) | Built-in |
+| Type conflicts | Manual resolution | Automatic composition |
+| Learning curve | Moderate | Steep |
+| Best for | Legacy integration | New microservices |
+
+### Type Merging
+
+Type merging is the core feature of schema stitching. When two schemas define the same type (like `User`), stitching merges them into a single type with fields from both schemas. The gateway needs to know how to resolve the merged type from either schema:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import { stitchSchemas } from "@graphql-tools/stitch";
+
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    {
+      schema: usersSchema,
+      merge: {
+        User: {
+          fieldName: "user",
+          selectionSet: "{ id }",
+          args: (originalObject) => ({ id: originalObject.id }),
+        },
+      },
+    },
+    {
+      schema: ordersSchema,
+      merge: {
+        User: {
+          fieldName: "user",
+          selectionSet: "{ id }",
+          args: (originalObject) => ({ id: originalObject.id }),
+        },
+      },
+    },
+  ],
+});
+```
+
+## Architecture and Design Patterns
+
+### The Gateway Pattern
+
+The gateway sits between clients and sub-schemas. It receives client queries, creates an execution plan, routes requests to the appropriate services, and assembles the results:
+
+```typescript
+import { stitchSchemas } from "@graphql-tools/stitch";
+import { schemaFromExecutor } from "@graphql-tools/wrap";
+
+async function createGateway() {
+  const usersSchema = await schemaFromExecutor(usersExecutor);
+  const ordersSchema = await schemaFromExecutor(ordersExecutor);
+  const productsSchema = await schemaFromExecutor(productsExecutor);
+
+  return stitchSchemas({
+    subschemas: [
+      { schema: usersSchema, executor: usersExecutor },
+      { schema: ordersSchema, executor: ordersExecutor },
+      { schema: productsSchema, executor: productsExecutor },
+    ],
+    typeMergingConfig: {
+      User: {
+        selectionSet: "{ id }",
+        fieldName: "user",
+        args: (originalObject) => ({ id: originalObject.id }),
+      },
+    },
+  });
 }
 ```
 
-This pattern demonstrates the core approach to implementing GraphQL solutions in production environments.
+### The Executor Pattern
 
-## Best Practices
+An executor is a function that takes a GraphQL request and returns a response. For remote schemas, this is typically an HTTP request. For local schemas, it's a direct execution:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+import { fetch } from "cross-fetch";
+import { print } from "graphql";
 
-## Common Pitfalls
+function createRemoteExecutor(url: string) {
+  return async ({ document, variables, context }) => {
+    const query = print(document);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: context?.authToken || "",
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    return response.json();
+  };
+}
+```
+
+### Schema Extension Pattern
+
+When you need to add fields that span multiple schemas, use schema extensions to connect types across sub-schemas:
+
+```typescript
+import { stitchSchemas } from "@graphql-tools/stitch";
+
+const gatewaySchema = stitchSchemas({
+  subschemas: [usersSchema, ordersSchema],
+  typeDefs: `
+    extend type User {
+      orders: [Order!]!
+      totalSpent: Float!
+    }
+  `,
+  resolvers: {
+    User: {
+      orders: {
+        selectionSet: "{ id }",
+        resolve(user, args, context, info) {
+          return info.mergeInfo.delegateToSchema({
+            schema: ordersSchema,
+            fieldName: "ordersByUserId",
+            args: { userId: user.id },
+            context,
+            info,
+          });
+        },
+      },
+      totalSpent: {
+        selectionSet: "{ id }",
+        async resolve(user, args, context, info) {
+          const orders = await info.mergeInfo.delegateToSchema({
+            schema: ordersSchema,
+            fieldName: "ordersByUserId",
+            args: { userId: user.id },
+            context,
+            info,
+          });
+          return orders.reduce((sum, order) => sum + order.total, 0);
+        },
+      },
+    },
+  },
+});
+```
+
+![Schema stitching flow](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Setting Up Sub-Schemas
+
+Create independent GraphQL services that each own their domain:
+
+```typescript
+// Users service (users-server.ts)
+import { ApolloServer } from "@apollo/server";
+import { startStandaloneServer } from "@apollo/server/standalone";
+import { gql } from "graphql-tag";
+
+const typeDefs = gql`
+  type User {
+    id: ID!
+    name: String!
+    email: String!
+    avatar: String
+    createdAt: String!
+  }
+
+  type Query {
+    user(id: ID!): User
+    users(limit: Int, offset: Int): [User!]!
+  }
+`;
+
+const resolvers = {
+  Query: {
+    user: (_, { id }) => db.users.findById(id),
+    users: (_, args) => db.users.findAll(args),
+  },
+};
+
+const server = new ApolloServer({ typeDefs, resolvers });
+const { url } = await startStandaloneServer(server, { listen: { port: 4001 } });
+```
+
+```typescript
+// Orders service (orders-server.ts)
+const typeDefs = gql`
+  type Order {
+    id: ID!
+    userId: ID!
+    items: [OrderItem!]!
+    total: Float!
+    status: OrderStatus!
+    createdAt: String!
+  }
+
+  type OrderItem {
+    productId: ID!
+    quantity: Int!
+    price: Float!
+  }
+
+  enum OrderStatus {
+    PENDING
+    CONFIRMED
+    SHIPPED
+    DELIVERED
+  }
+
+  type Query {
+    order(id: ID!): Order
+    ordersByUserId(userId: ID!, limit: Int): [Order!]!
+  }
+`;
+```
+
+### Creating the Stitched Gateway
+
+Combine the sub-schemas into a unified gateway:
+
+```typescript
+import { stitchSchemas } from "@graphql-tools/stitch";
+import { createRemoteExecutor } from "./executors";
+import { ApolloServer } from "@apollo/server";
+import { startStandaloneServer } from "@apollo/server/standalone";
+
+async function createGateway() {
+  const usersExecutor = createRemoteExecutor("http://localhost:4001/graphql");
+  const ordersExecutor = createRemoteExecutor("http://localhost:4002/graphql");
+  const productsExecutor = createRemoteExecutor("http://localhost:4003/graphql");
+
+  const gatewaySchema = stitchSchemas({
+    subschemas: [
+      {
+        schema: await schemaFromExecutor(usersExecutor),
+        executor: usersExecutor,
+        merge: {
+          User: {
+            selectionSet: "{ id }",
+            fieldName: "user",
+            args: (obj) => ({ id: obj.id }),
+          },
+        },
+      },
+      {
+        schema: await schemaFromExecutor(ordersExecutor),
+        executor: ordersExecutor,
+      },
+      {
+        schema: await schemaFromExecutor(productsExecutor),
+        executor: productsExecutor,
+      },
+    ],
+    typeDefs: `
+      extend type User {
+        orders: [Order!]!
+      }
+      extend type Order {
+        user: User!
+      }
+    `,
+    resolvers: {
+      User: {
+        orders: {
+          selectionSet: "{ id }",
+          resolve(user, args, context, info) {
+            return info.mergeInfo.delegateToSchema({
+              schema: ordersExecutor,
+              fieldName: "ordersByUserId",
+              args: { userId: user.id },
+              context,
+              info,
+            });
+          },
+        },
+      },
+      Order: {
+        user: {
+          selectionSet: "{ userId }",
+          resolve(order, args, context, info) {
+            return info.mergeInfo.delegateToSchema({
+              schema: usersExecutor,
+              fieldName: "user",
+              args: { id: order.userId },
+              context,
+              info,
+            });
+          },
+        },
+      },
+    },
+  });
+
+  return new ApolloServer({ schema: gatewaySchema });
+}
+```
+
+### Implementing DataLoader for Batching
+
+Without DataLoader, stitched schemas suffer from N+1 queries. Implement batching to resolve multiple entities in a single request:
+
+```typescript
+import DataLoader from "dataloader";
+
+function createBatchedExecutor(executor) {
+  const loader = new DataLoader(async (requests) => {
+    // Batch multiple requests into a single query
+    const batchedQuery = buildBatchedQuery(requests);
+    const result = await executor(batchedQuery);
+    return splitBatchedResult(result, requests);
+  });
+
+  return (args) => loader.load(args);
+}
+
+// In the gateway
+const usersExecutor = createBatchedExecutor(createRemoteExecutor("http://localhost:4001/graphql"));
+```
+
+### Adding Authentication Context
+
+Pass authentication tokens through the gateway to sub-schemas:
+
+```typescript
+const gateway = new ApolloServer({
+  schema: gatewaySchema,
+  context: async ({ req }) => ({
+    authToken: req.headers.authorization,
+    userId: extractUserId(req.headers.authorization),
+  }),
+});
+
+function createRemoteExecutor(url: string) {
+  return async ({ document, variables, context }) => {
+    const query = print(document);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: context?.authToken || "",
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    return response.json();
+  };
+}
+```
+
+![DataLoader batching pattern](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Legacy API Integration
+
+A company with a legacy REST API wants to add GraphQL without rewriting the backend. They create a thin GraphQL wrapper around the REST API using tools like `graphql-tools` and stitch it with their new GraphQL services. Clients see a single GraphQL API while the legacy service continues to work unchanged.
+
+### Multi-Team Microservices
+
+A large organization has multiple teams each running their own GraphQL service. Schema stitching combines them into a single gateway without requiring teams to adopt federation directives. Each team deploys independently, and the gateway is updated to reflect schema changes.
+
+### Third-Party API Aggregation
+
+An application combines its own GraphQL API with third-party APIs (GitHub, Stripe, Shopify). Schema stitching merges these disparate schemas into a unified API, allowing clients to query all data sources through a single endpoint.
+
+## Best Practices for Production
+
+1. **Use DataLoader for batching**: Always implement DataLoader when stitching schemas to avoid N+1 query problems. This is the single most important optimization.
+
+2. **Implement schema caching**: Cache the stitched schema to avoid re-introspecting sub-schemas on every request. Only rebuild when sub-schemas change.
+
+3. **Handle sub-schema failures gracefully**: Implement circuit breakers and fallbacks when sub-schemas are unavailable. Return partial results when possible.
+
+4. **Monitor delegation performance**: Track how long each sub-schema takes to respond. Identify bottlenecks and optimize the slowest services.
+
+5. **Use schema directives for metadata**: Add custom directives to control stitching behavior, like `@computed` for fields that require data from multiple schemas.
+
+6. **Version your gateway schema**: Even though GraphQL doesn't have formal versioning, track gateway schema changes and test them before deployment.
+
+7. **Implement request timeouts**: Set timeouts for sub-schema requests to prevent slow services from blocking the entire gateway.
+
+8. **Use managed schemas in production**: Replace `IntrospectAndCompose` with static schema files or a schema registry in production for reliability.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| N+1 queries without DataLoader | Severe performance degradation | Always implement DataLoader batching |
+| Type name conflicts | Schema composition fails | Use `typeMergingConfig` to resolve conflicts |
+| Missing selection sets | Incomplete entity resolution | Always specify `selectionSet` for merged types |
+| Authentication not forwarded | Unauthorized sub-schema access | Forward auth headers in executors |
+| Schema introspection in production | Security risk, performance overhead | Use static schema files in production |
+
+## Performance Optimization
+
+Optimize stitched schemas by caching executor responses, batching requests, and implementing query planning to minimize sub-schema calls:
+
+```typescript
+import { createBatchDelegate } from "@graphql-tools/batch-delegate";
+
+const UserOrdersField = createBatchDelegate({
+  schema: ordersSchema,
+  fieldName: "ordersByUserIds",
+  key: "userId",
+  argsFromKeys: (userIds) => ({ userIds }),
+});
+```
+
+## Comparison with Alternatives
+
+| Feature | Schema Stitching | Apollo Federation | REST Gateway | GraphQL Mesh |
+|---------|-----------------|-------------------|--------------|--------------|
+| Source flexibility | Any GraphQL | GraphQL only | REST only | Any source |
+| Type merging | Manual | Automatic | N/A | Automatic |
+| Batching | Manual | Built-in | N/A | Built-in |
+| Configuration | Complex | Moderate | Simple | Complex |
+| Performance | Good | Excellent | Moderate | Good |
+| Community | Declining | Growing | Stable | Growing |
+
+## Advanced Patterns
+
+### Computed Fields Across Schemas
+
+Create fields that require data from multiple sub-schemas:
+
+```typescript
+const resolvers = {
+  User: {
+    orderHistory: {
+      selectionSet: "{ id }",
+      async resolve(user, args, context, info) {
+        const orders = await delegateToSchema({
+          schema: ordersSchema,
+          fieldName: "ordersByUserId",
+          args: { userId: user.id },
+          context,
+          info,
+        });
+
+        const products = await delegateToSchema({
+          schema: productsSchema,
+          fieldName: "productsByIds",
+          args: { ids: orders.flatMap((o) => o.items.map((i) => i.productId)) },
+          context,
+          info,
+        });
+
+        return enrichOrdersWithProducts(orders, products);
+      },
+    },
+  },
+};
+```
+
+### Schema Transformation
+
+Transform sub-schema types before merging them:
+
+```typescript
+import { RenameTypes, FilterRootFields } from "@graphql-tools/wrap";
+
+const transformedSchema = wrapSchema({
+  schema: usersSchema,
+  executor: usersExecutor,
+  transforms: [
+    new RenameTypes((name) => `Users_${name}`),
+    new FilterRootFields((op, fieldName) => fieldName !== "secretField"),
+  ],
+});
+```
+
+## Testing Strategies
+
+Test stitched schemas by verifying that cross-schema queries work correctly:
+
+```typescript
+describe("Stitched schema", () => {
+  it("resolves User with orders from different schemas", async () => {
+    const result = await executeQuery(`
+      query {
+        user(id: "1") {
+          name
+          email
+          orders {
+            id
+            total
+            items {
+              product { name price }
+            }
+          }
+        }
+      }
+    `);
+    expect(result.data.user.name).toBeDefined();
+    expect(result.data.user.orders).toHaveLength(2);
+  });
+});
+```
+
+## Future Outlook
+
+Schema stitching is being superseded by Apollo Federation for new projects, but it remains relevant for integrating existing schemas and third-party APIs. GraphQL Mesh builds on stitching concepts with support for REST, gRPC, and other source types. The `@graphql-tools/stitch` library continues to be maintained and improved.
 
 ## Conclusion
 
-GraphQL Schema Stitching: Combining Multiple APIs is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Schema stitching enables you to combine multiple GraphQL schemas into a unified API, making it ideal for integrating existing services and third-party APIs. The key takeaways are:
+
+1. Use schema stitching when you need to combine schemas you don't control
+2. Always implement DataLoader for batching to avoid N+1 query problems
+3. Use type merging configuration to handle shared types across schemas
+4. Forward authentication context through executors to sub-schemas
+5. Consider Apollo Federation for new microservices projects
+
+Start by identifying which schemas need to be combined, implement the gateway with proper batching and error handling, and evolve your stitching configuration as your architecture matures.
