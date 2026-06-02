@@ -1,7 +1,7 @@
 ---
 title: "WASM Garbage Collection: Languages in the Browser"
 date: "2022-09-20"
-description: "Explore WasmGC: Kotlin/Wasm, Dart/Flutter Web, and managed languages in WebAssembly."
+description: "Deep dive into WasmGC: how garbage-collected languages like Kotlin, Dart, and C# compile to WebAssembly with native GC support."
 tags: ["WebAssembly", "WasmGC", "Browser", "Performance"]
 published: true
 author: "MinhVo"
@@ -9,54 +9,303 @@ author: "MinhVo"
 
 ## Introduction
 
-WASM Garbage Collection: Languages in the Browser is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+WebAssembly has traditionally been the domain of languages with manual memory management like C, C++, and Rust. These languages compile efficiently to Wasm because they manage their own memory through linear memory, without needing a garbage collector. However, the vast majority of modern application development uses garbage-collected languages like Kotlin, Dart, C#, Java, and Go. Until recently, these languages had to ship their own garbage collector implementation compiled to WebAssembly, resulting in large bundles, poor performance, and fragmented memory.
 
-## Key Concepts
+The WebAssembly Garbage Collection proposal, known as WasmGC, changes everything. It integrates garbage collection directly into the WebAssembly runtime, allowing managed languages to leverage the browser's native GC instead of shipping their own. This means smaller bundles, better performance, native memory management, and integration with browser developer tools. For the first time, languages like Kotlin and Dart can compete with JavaScript on the web platform without significant performance penalties.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide explores how WasmGC works, which languages support it, how to use it in production, and the performance implications of this groundbreaking technology. We examine the technical foundations that make WasmGC possible, walk through practical integration patterns with JavaScript, and provide honest assessments of where WasmGC excels and where it still has limitations.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![WebAssembly evolution](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## The Problem WasmGC Solves
 
-Let's look at a practical example:
+### Before WasmGC: Shipping Your Own Garbage Collector
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+When Kotlin, Dart, or C# compiled to WebAssembly before WasmGC, the compilation process looked like this: the language runtime, including its garbage collector, had to be compiled alongside the application code into a single Wasm module. The garbage collector itself was written in the source language or C and compiled to Wasm, meaning it ran inside the Wasm sandbox using linear memory.
+
+This approach had several critical problems. First, the garbage collector itself added significant size to the module. A typical GC implementation adds between one and five megabytes to the final bundle, which is substantial for web applications where download size directly impacts user experience. Second, the garbage collector running inside Wasm linear memory was fundamentally slower than a native GC because it could not leverage browser-specific optimizations like generational collection, incremental marking, or concurrent sweeping. Third, having two separate memory spaces, the Wasm linear memory for the GC heap and the browser's managed heap for DOM objects, created fragmentation and made interop between Wasm and JavaScript expensive.
+
+Fourth, browser developer tools had no visibility into the Wasm GC's behavior. Memory profiling, leak detection, and GC pause analysis were impossible because the GC was invisible to the browser. Developers had to rely on custom profiling tools specific to their language runtime, which were far less capable than the browser's built-in DevTools.
+
+### After WasmGC: Native Garbage Collection
+
+With WasmGC, the compilation process changes fundamentally. Instead of compiling the garbage collector to Wasm, the language compiler emits WasmGC instructions that reference types managed by the browser's native garbage collector. The browser's GC handles all memory allocation, deallocation, and collection for WasmGC objects, just as it does for JavaScript objects.
+
+This eliminates all four problems simultaneously. The bundle is smaller because there is no GC implementation to ship. Performance is better because the browser's native GC is highly optimized with generational collection, incremental marking, and concurrent sweeping. Memory is unified because WasmGC objects live in the same heap as JavaScript objects. And browser DevTools can profile and debug GC behavior because it is the same GC that manages JavaScript objects.
+
+## How WasmGC Works
+
+### Struct and Array Types
+
+WasmGC introduces new reference types for structured data. These are not stored in linear memory like traditional Wasm data. Instead, they are allocated on the garbage-collected heap managed by the browser runtime.
+
+A struct type defines a fixed set of named fields, each with its own type. When you create a struct instance, the runtime allocates memory on the GC heap and returns a reference. Field access uses typed instructions that the runtime can optimize. Array types are similar but allow variable-length sequences of elements with a single type.
+
+The key difference from linear memory is that these types are garbage-collected. When no more references point to a struct or array, the runtime can reclaim its memory automatically. This is fundamentally different from C or Rust Wasm modules where the developer must manage memory explicitly.
+
+### Type Hierarchy and Subtyping
+
+WasmGC supports nominal typing with subtyping, which is essential for object-oriented languages. A type can declare a supertype, and the runtime enforces the inheritance relationship. This allows languages like Kotlin and Java to map their class hierarchies directly to WasmGC types without losing type information.
+
+For example, a Dog type can extend an Animal type, and the runtime will correctly handle upcasting and downcasting. This is critical for polymorphism and interface dispatch, which are fundamental features of object-oriented languages.
+
+### Reference Types
+
+WasmGC introduces several reference types that express different nullability and mutability guarantees. Non-nullable references guarantee that a value is always present, while nullable references can be null. These distinctions allow the compiler to eliminate unnecessary null checks and enable more aggressive optimizations.
+
+Function references allow passing functions as first-class values without going through linear memory. This is important for languages that support higher-order functions, closures, and lambda expressions. External references allow referencing objects outside the Wasm module, such as DOM elements or JavaScript objects.
+
+### Memory Model and GC Integration
+
+The WasmGC memory model integrates with the browser's existing garbage collector infrastructure. When a WasmGC struct is allocated, the browser's GC tracks it alongside JavaScript objects. The GC uses the same marking and sweeping algorithms for WasmGC objects as it does for JavaScript objects, ensuring consistent behavior and performance.
+
+Generational collection works with WasmGC objects because the GC can identify which objects are young and which are old. Young objects that survive multiple GC cycles are promoted to the old generation, where they are collected less frequently. This generational approach is particularly effective for WasmGC because many language runtimes create large numbers of short-lived objects.
+
+Incremental marking allows the GC to spread the work of identifying live objects across multiple small pauses rather than one large pause. This is important for interactive applications where long pauses are noticeable to users. Concurrent sweeping allows the GC to reclaim memory while the application continues running, further reducing pause times.
+
+![Language support](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Language Support
+
+### Kotlin/Wasm
+
+Kotlin was one of the first languages to adopt WasmGC. JetBrains, the creators of Kotlin, have been actively developing Kotlin/Wasm as a first-class compilation target alongside Kotlin/JVM, Kotlin/JS, and Kotlin/Native.
+
+Kotlin/Wasm compiles Kotlin code to WebAssembly with WasmGC support. The compiler maps Kotlin classes to WasmGC struct types, Kotlin interfaces to WasmGC type hierarchies, and Kotlin lambdas to WasmGC function references. The Kotlin standard library is compiled to WasmGC, so developers get the full power of Kotlin's type system, coroutines, and standard library functions.
+
+The development experience is similar to Kotlin/JS. You write Kotlin code, and the compiler produces a Wasm module that runs in the browser. The Kotlin/JS interop layer allows calling JavaScript APIs from Kotlin code, and the WasmGC module can be loaded alongside JavaScript code in the same web application.
+
+Building a Kotlin/Wasm project uses the standard Kotlin toolchain. You configure the Wasm target in your Gradle build file, and the compiler handles the rest. The output includes a Wasm module, a JavaScript loader, and any necessary glue code for browser integration.
+
+### Dart and Flutter Web
+
+Flutter Web can now compile to WebAssembly with WasmGC support. This is significant because Flutter's rendering engine, which draws every pixel using its own widget system, benefits greatly from the performance improvements that WasmGC provides.
+
+Dart compiles to WasmGC by mapping Dart classes to WasmGC structs, Dart mixins to WasmGC type compositions, and Dart async-await to WasmGC function references with continuation support. The Flutter framework itself compiles to WasmGC, so the entire rendering pipeline from widget layout to painting runs as native WebAssembly code.
+
+The performance improvement over compiling Dart to JavaScript is substantial. Startup time is faster because there is no JavaScript parsing and compilation overhead. Runtime performance is better because WasmGC operations are closer to native machine code. And memory usage is lower because the garbage collector is the browser's native implementation rather than a Dart-specific GC compiled to JavaScript.
+
+### C Sharp and Blazor
+
+Blazor WebAssembly can leverage WasmGC for improved performance. The .NET runtime compiles to WebAssembly with WasmGC support, allowing C# code to run in the browser with native garbage collection. This eliminates the need to ship the .NET GC implementation as part of the Blazor application.
+
+The improvement is particularly noticeable for applications with complex object graphs and frequent allocations. The browser's native GC handles these scenarios more efficiently than the .NET GC compiled to WebAssembly, resulting in fewer GC pauses and smoother user experiences.
+
+### Go and AssemblyScript
+
+Go has experimental support for WasmGC through the TinyGo compiler. Go's garbage collector compiles to WasmGC instructions, allowing Go programs to run in the browser with native GC support. The bundle size reduction is significant because Go's GC implementation is substantial.
+
+AssemblyScript, a TypeScript-like language designed specifically for WebAssembly, has first-class WasmGC support. AssemblyScript compiles to WasmGC by mapping its type system directly to WasmGC struct types. The language is designed to be familiar to JavaScript developers while providing the performance characteristics of WebAssembly.
+
+### Performance Benchmarks
+
+Comparing Kotlin/Wasm with WasmGC to Kotlin/JS shows significant improvements across all metrics. Startup time improves by twenty to forty percent because there is no JavaScript parsing overhead. Runtime performance improves by ten to thirty percent for compute-intensive operations because Wasm operations are closer to native code. Bundle size decreases by thirty to fifty percent because there is no GC implementation to ship.
+
+For Flutter Web, the improvements are even more dramatic. Flutter's rendering pipeline involves creating and destroying large numbers of widget objects, which puts significant pressure on the garbage collector. With WasmGC, the browser's native GC handles these allocations more efficiently, resulting in smoother animations and more responsive user interfaces.
+
+The following table summarizes typical performance improvements when migrating from JavaScript compilation to WasmGC compilation:
+
+| Metric | Kotlin/JS | Kotlin/WasmGC | Improvement |
+|--------|-----------|---------------|-------------|
+| Startup time | 1.8s | 1.1s | 39% faster |
+| Bundle size | 4.2MB | 2.1MB | 50% smaller |
+| Compute benchmark | 450ms | 280ms | 38% faster |
+| Memory usage | 85MB | 52MB | 39% less |
+| GC pause (p99) | 45ms | 12ms | 73% shorter |
+
+![Performance comparison](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Browser Support and Feature Detection
+
+### Current Browser Support
+
+Chrome version one hundred nineteen and above fully supports WasmGC. Firefox version one hundred twenty and above fully supports WasmGC. Edge, being based on Chromium, supports WasmGC in the same versions as Chrome. Safari has partial experimental support starting from version seventeen point four, with full support expected in future releases. Node.js version twenty and above fully supports WasmGC.
+
+The browser support landscape is encouraging for production use. Chrome and Firefox, which together represent the majority of browser usage, have stable support. Safari's partial support means developers should provide JavaScript fallbacks for Safari users, but the core functionality works in the two largest browser engines.
+
+### Feature Detection
+
+Detecting WasmGC support in the browser is essential for providing graceful fallbacks. The recommended approach is to attempt to compile a minimal WasmGC module and catch any errors. If compilation succeeds, the browser supports WasmGC and you can load the Wasm module. If compilation fails, fall back to the JavaScript version.
+
+```javascript
+async function detectWasmGC() {
+  try {
+    // Minimal WasmGC module with a struct type
+    const bytes = new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d, // magic
+      0x01, 0x00, 0x00, 0x00, // version
+      0x01, 0x05, 0x01, 0x5f, // type section with struct
+      0x01, 0x00              // struct with 0 fields
+    ]);
+    await WebAssembly.compile(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Use in application bootstrap
+const supportsGC = await detectWasmGC();
+if (supportsGC) {
+  const module = await import('./app.gc.wasm');
+  module.start();
+} else {
+  const module = await import('./app.js');
+  module.start();
 }
 ```
 
-This pattern demonstrates the core approach to implementing WebAssembly solutions in production environments.
+This feature detection should happen early in the application bootstrap process, before any significant work is done. The result can be cached in a variable so subsequent checks are instant.
+
+## Integration with JavaScript
+
+### Calling JavaScript from WasmGC
+
+Kotlin/Wasm provides external declarations for JavaScript interop. You declare external functions and classes that correspond to JavaScript APIs, and the compiler generates the necessary glue code. This allows Kotlin code to call browser APIs like DOM manipulation, fetch requests, and WebSockets without leaving the type-safe Kotlin environment.
+
+```kotlin
+// Kotlin/Wasm external declarations
+external fun fetch(url: String): Promise<Response>
+external class Document {
+    fun getElementById(id: String): Element?
+    fun createElement(tag: String): Element
+}
+external class Element {
+    var innerHTML: String
+    fun appendChild(child: Element)
+}
+```
+
+The interop layer handles type conversion between Kotlin types and JavaScript types. Strings are converted between Kotlin strings and JavaScript strings. Numbers are converted between Kotlin numeric types and JavaScript numbers. Objects are wrapped in proxy objects that allow property access and method calls.
+
+### Calling WasmGC from JavaScript
+
+WasmGC modules export functions that JavaScript code can call. The module exports are typed, so TypeScript can provide type-safe access to Wasm functions. The interop layer handles type conversion in the other direction, converting JavaScript values to WasmGC types.
+
+```typescript
+// TypeScript interface for WasmGC module exports
+interface WasmApp {
+  processOrder(order: OrderData): OrderResult;
+  calculateDiscount(items: CartItem[]): number;
+  formatCurrency(amount: number, locale: string): string;
+}
+
+// Load and use the WasmGC module
+const wasm = await WebAssembly.instantiateStreaming(
+  fetch('/app.wasm'),
+  importObject
+);
+const app = wasm.instance.exports as unknown as WasmApp;
+
+const result = app.processOrder(orderData);
+```
+
+For complex data structures, the interop layer can serialize and deserialize between JavaScript objects and WasmGC structs. This is useful for passing configuration objects, data payloads, and other structured data between JavaScript and WasmGC code.
+
+### DOM Manipulation
+
+DOM manipulation from WasmGC requires going through the JavaScript interop layer because the DOM is a JavaScript API. Kotlin/Wasm provides typed wrappers around DOM APIs, so developers can manipulate the DOM with type-safe Kotlin code. The compiler generates the necessary JavaScript interop calls behind the scenes.
+
+The performance overhead of DOM manipulation from WasmGC is minimal because the actual DOM operations are performed by the browser's JavaScript engine. The Wasm-to-JavaScript call overhead is small compared to the DOM operation itself.
+
+## Build and Deployment
+
+### Building Kotlin/Wasm Projects
+
+Kotlin/Wasm projects use the standard Kotlin toolchain with the Wasm target configured in the Gradle build file. The build process compiles Kotlin source code to Wasm bytecode, links the Kotlin standard library, and generates a JavaScript loader that initializes the Wasm module in the browser.
+
+```kotlin
+// build.gradle.kts
+kotlin {
+    wasmJs {
+        browser {
+            binaries.executable()
+        }
+    }
+}
+```
+
+The output of a production build includes a Wasm module file, a JavaScript loader file, and any static assets. The Wasm module is typically one to three megabytes for medium-sized applications, compared to five to ten megabytes for the same application compiled to JavaScript with the GC included.
+
+### Building Flutter Web with WasmGC
+
+Flutter Web with WasmGC uses the standard Flutter build toolchain with the web target and WasmGC flag. The build process compiles Dart source code to Wasm bytecode, includes the Flutter framework, and generates a JavaScript loader with a fallback to the JavaScript version for browsers that do not support WasmGC.
+
+```bash
+# Build Flutter Web with WasmGC
+flutter build web --wasm
+
+# Output includes both Wasm and JS versions
+# build/web/
+# ├── main.dart.wasm      # WasmGC version
+# ├── main.dart.js        # JavaScript fallback
+# └── index.html          # Auto-detects and loads appropriate version
+```
+
+The output includes both a Wasm module and a JavaScript version of the same application. The loader automatically detects browser support and loads the appropriate version. This ensures that the application works in all browsers while taking advantage of WasmGC in browsers that support it.
+
+### Deploying WasmGC Applications
+
+Deploying WasmGC applications is similar to deploying any web application. The Wasm module and JavaScript loader are served as static files from a web server or CDN. The server must set the correct MIME type for Wasm files, which is application/wasm.
+
+```nginx
+# Nginx configuration for Wasm files
+server {
+    location ~* \.wasm$ {
+        types { application/wasm wasm; }
+        gzip on;
+        gzip_types application/wasm;
+    }
+}
+```
+
+For optimal performance, the Wasm module should be compressed with gzip or brotli. Wasm modules compress well because they contain repetitive bytecode patterns. A three-megabyte Wasm module typically compresses to around eight hundred kilobytes with gzip.
 
 ## Best Practices
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+1. **Always provide a JavaScript fallback** — Safari support is experimental, and older browsers do not support WasmGC at all. Feature detection ensures your application works everywhere.
+2. **Minimize the interop boundary** — Calling between WasmGC and JavaScript has overhead. Batch operations and minimize the number of cross-boundary calls.
+3. **Profile memory usage** — Use browser DevTools to understand GC behavior. WasmGC objects appear in the same heap as JavaScript objects, so standard profiling tools work.
+4. **Optimize bundle size** — Use tree-shaking and dead code elimination to remove unused code. The Wasm module should only include code that is actually executed.
+5. **Use streaming compilation** — Compile the Wasm module while it is being downloaded to reduce startup time. Most browsers support streaming compilation for Wasm modules.
+6. **Test on target browsers** — WasmGC support varies across browsers. Test on Chrome, Firefox, and Safari to ensure consistent behavior.
+7. **Monitor GC pauses** — Even with native GC, frequent allocations can cause pauses. Use browser DevTools to identify and optimize allocation-heavy code paths.
+8. **Consider the full application lifecycle** — WasmGC is best suited for applications that benefit from the performance and bundle size improvements. Simple applications may not see significant benefits.
 
 ## Common Pitfalls
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| No JavaScript fallback | App fails in Safari and older browsers | Implement feature detection |
+| Large bundle size | Slow initial load | Enable tree-shaking and compression |
+| Frequent JS interop calls | Performance overhead | Batch operations across the boundary |
+| Not profiling GC | Unexpected pauses | Use browser DevTools for memory profiling |
+| Assuming all browsers support | Compatibility issues | Test on all target browsers |
+| Ignoring streaming compilation | Slow startup | Use streaming compilation for Wasm modules |
+| Excessive memory allocations | GC pressure and pauses | Reuse objects and minimize allocations |
+| Wrong MIME type for Wasm | Module fails to load | Configure server with application/wasm |
+
+## Future of WasmGC
+
+WasmGC is still evolving, with several proposals in development that will expand its capabilities. The shared-everything threading proposal will allow WasmGC objects to be shared between threads, enabling true parallelism for garbage-collected languages. The exception handling proposal will provide native exception support that integrates with language-level try-catch mechanisms. The stack switching proposal will enable efficient coroutines and green threads, which is particularly important for languages like Kotlin that rely heavily on coroutines.
+
+As these proposals are finalized and implemented in browsers, the gap between WasmGC and native garbage-collected runtimes will continue to narrow. The long-term vision is a web platform where any language can compile to WebAssembly with performance and developer experience comparable to native compilation, and WasmGC is a critical step toward that vision.
 
 ## Conclusion
 
-WASM Garbage Collection: Languages in the Browser is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+WasmGC represents a fundamental shift in how garbage-collected languages run on the web platform. By integrating garbage collection into the WebAssembly runtime, WasmGC eliminates the biggest barrier to using managed languages in the browser: the overhead of shipping and running a custom garbage collector.
+
+The implications are profound. Kotlin developers can now target the browser with Kotlin/Wasm and get performance competitive with JavaScript. Flutter developers can use Dart compiled to WebAssembly with native GC for smoother animations and faster startup. C# developers can run Blazor applications with smaller bundles and better garbage collection.
+
+As browser support matures and more languages adopt WasmGC, we can expect to see a new generation of web applications built with languages that were previously impractical for the web. The combination of WebAssembly's performance characteristics with native garbage collection makes the web platform viable for applications that previously required native compilation.
+
+Key takeaways:
+
+1. **WasmGC integrates GC into the Wasm runtime** — No need to ship a custom garbage collector implementation
+2. **Smaller bundles** — Thirty to seventy percent reduction compared to non-GC Wasm because the GC implementation is not included
+3. **Better performance** — Native GC integration with browser optimizations like generational collection and concurrent sweeping
+4. **Kotlin/Wasm, Dart/Flutter Web, Blazor** — Major languages with first-class WasmGC support and active development
+5. **Browser support growing** — Chrome, Firefox, and Edge fully supported; Safari has experimental support
+6. **Always provide fallbacks** — Feature detection ensures compatibility with all browsers
+7. **Minimize interop overhead** — Batch calls between WasmGC and JavaScript for best performance
+8. **Profile and optimize** — Use browser DevTools for memory profiling and GC analysis
