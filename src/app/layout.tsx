@@ -64,7 +64,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={cn("min-h-screen bg-background font-sans antialiased", fontSans.variable, fontHeading.variable)}>
+      <body className={cn("min-h-screen lg:h-screen lg:overflow-hidden bg-background font-sans antialiased", fontSans.variable, fontHeading.variable)}>
         <RootProviders>{children}</RootProviders>
       </body>
     </html>

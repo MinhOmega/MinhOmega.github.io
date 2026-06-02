@@ -1,18 +1,33 @@
 "use client";
 
 import { ArrowUp } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export function ScrollToTop({ className }: { className?: string }) {
   const [visible, setVisible] = useState(false);
 
+  const getContainer = useCallback(
+    () => document.getElementById("tab-section"),
+    [],
+  );
+
   useEffect(() => {
-    const onScroll = () => setVisible(window.scrollY > 300);
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
+    const container = getContainer();
+    if (!container) return;
+    const onScroll = () => setVisible(container.scrollTop > 300);
+    container.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => container.removeEventListener("scroll", onScroll);
+  }, [getContainer]);
+
+  const scrollToTop = () => {
+    const container = getContainer();
+    if (container) {
+      container.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
 
   return (
     <Button
@@ -23,7 +38,7 @@ export function ScrollToTop({ className }: { className?: string }) {
         visible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4 pointer-events-none",
         className
       )}
-      onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+      onClick={scrollToTop}
       aria-label="Scroll to top"
     >
       <ArrowUp size={18} />
