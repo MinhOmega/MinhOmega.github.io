@@ -179,6 +179,117 @@ function contentNegotiatedRoute(handlers: VersionHandler) {
 }
 ```
 
+### URL Path Versioning with Spring Boot
+
+Java/Spring Boot provides elegant versioning through annotations and request mapping:
+
+```java
+@RestController
+@RequestMapping("/api")
+public class UserController {
+
+    // Version 1: flat response structure
+    @GetMapping("/v1/users")
+    public List<UserV1Response> listUsersV1() {
+        return userService.findAll().stream()
+            .map(user -> UserV1Response.builder()
+                .id(user.getId())
+                .name(user.getFullName())
+                .email(user.getEmail())
+                .build())
+            .collect(Collectors.toList());
+    }
+
+    // Version 2: structured response with pagination
+    @GetMapping("/v2/users")
+    public PagedResponse<UserV2Response> listUsersV2(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        Page<User> users = userService.findAll(PageRequest.of(page, size));
+        return PagedResponse.<UserV2Response>builder()
+            .data(users.getContent().stream()
+                .map(user -> UserV2Response.builder()
+                    .id(user.getId())
+                    .firstName(user.getFirstName())
+                    .lastName(user.getLastName())
+                    .email(user.getEmail())
+                    .createdAt(user.getCreatedAt())
+                    .build())
+                .collect(Collectors.toList()))
+            .page(users.getNumber())
+            .totalPages(users.getTotalPages())
+            .totalElements(users.getTotalElements())
+            .build();
+    }
+}
+```
+
+### Query Parameter Versioning with FastAPI
+
+Python's FastAPI makes query parameter versioning straightforward with dependency injection:
+
+```python
+from fastapi import FastAPI, Query, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+app = FastAPI()
+
+class UserV1(BaseModel):
+    id: int
+    name: str
+    email: str
+
+class UserV2(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+    email: str
+    created_at: datetime
+
+async def get_api_version(
+    version: Optional[str] = Query(default="2", alias="v")
+) -> str:
+    supported = {"1", "2"}
+    if version not in supported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported version '{version}'. Supported: {supported}"
+        )
+    return version
+
+@app.get("/api/users")
+async def list_users(
+    version: str = Depends(get_api_version),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=100),
+):
+    users = await user_service.list_all(skip=(page - 1) * size, limit=size)
+
+    if version == "1":
+        return {
+            "users": [
+                {"id": u.id, "name": f"{u.first_name} {u.last_name}", "email": u.email}
+                for u in users
+            ]
+        }
+
+    return {
+        "data": [
+            {
+                "id": u.id,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "email": u.email,
+                "created_at": u.created_at.isoformat(),
+            }
+            for u in users
+        ],
+        "meta": {"page": page, "size": size},
+    }
+```
+
 ### Deprecation Middleware
 
 ```typescript
@@ -295,23 +406,334 @@ Use CDN caching carefully with versioned APIs — include the version in the cac
 
 Allow clients to specify a minimum acceptable version. The server responds with the highest version that's ≤ the requested version and ≥ the minimum. This enables clients to take advantage of new features when available.
 
+```typescript
+// Server-side version negotiation
+app.get('/api/users', (req, res) => {
+  const requestedVersion = parseInt(req.headers['x-api-version'] || '2');
+  const minVersion = parseInt(req.headers['x-min-version'] || '1');
+
+  // Find the highest available version within the client's range
+  const availableVersions = [1, 2, 3];
+  const negotiatedVersion = availableVersions
+    .filter(v => v >= minVersion && v <= requestedVersion)
+    .pop();
+
+  if (!negotiatedVersion) {
+    return res.status(400).json({
+      error: 'No compatible version available',
+      available: availableVersions,
+      requested: requestedVersion,
+      minimum: minVersion,
+    });
+  }
+
+  res.set('X-Negotiated-Version', negotiatedVersion.toString());
+  handlers[negotiatedVersion](req, res);
+});
+```
+
+This pattern is particularly useful for mobile apps that may lag behind the latest API version. The app requests version 3 as its target but declares version 1 as its minimum, allowing the server to serve the best available response.
+
 ### Automatic Version Migration
 
 Build tooling that automatically generates version translation code from API specifications. When you define a v2 OpenAPI spec, the tool generates transformation functions that convert between v1 and v2 request/response formats.
 
+```typescript
+// Auto-generated version transformer from OpenAPI diff
+interface VersionTransformer {
+  toV1(response: V2Response): V1Response;
+  toV2(response: V1Response): V2Response;
+}
+
+const userTransformer: VersionTransformer = {
+  toV1(v2) {
+    return {
+      id: v2.data.id,
+      name: `${v2.data.firstName} ${v2.data.lastName}`, // v2 splits name
+      email: v2.data.email,
+    };
+  },
+  toV2(v1) {
+    const [firstName, ...rest] = (v1.name || '').split(' ');
+    return {
+      data: {
+        id: v1.id,
+        firstName,
+        lastName: rest.join(' '),
+        email: v1.email,
+        createdAt: new Date().toISOString(), // default for missing field
+      },
+    };
+  },
+};
+```
+
+Tools like Optic, Speakeasy, and oapi-codegen can generate these transformers from OpenAPI specification diffs, eliminating manual translation code.
+
 ### GraphQL as Versioning Alternative
 
-GraphQL's field selection model eliminates much of the need for versioning. Clients request exactly the fields they need, and new fields are added without breaking existing queries. Deprecation is built into the schema.
+GraphQL's field selection model eliminates much of the need for versioning. Clients request exactly the fields they need, and new fields are added without breaking existing queries. Deprecation is built into the schema:
+
+```graphql
+type User {
+  id: ID!
+  # @deprecated Use firstName and lastName instead
+  name: String @deprecated(reason: "Use firstName and lastName")
+  firstName: String!
+  lastName: String!
+  email: String!
+  createdAt: DateTime!
+}
+```
+
+GraphQL's `@deprecated` directive signals clients to migrate while keeping the field functional. Schema evolution tools like Apollo Studio track field usage across clients, showing exactly which consumers still use deprecated fields.
+
+### Feature Flag-Based Versioning
+
+Instead of explicit version numbers, use feature flags to control API behavior per client or consumer group:
+
+```typescript
+app.get('/api/users/:id', async (req, res) => {
+  const user = await getUserById(req.params.id);
+  const flags = await getFeatureFlags(req.apiKey);
+
+  const response: any = {
+    id: user.id,
+    email: user.email,
+  };
+
+  if (flags.has('new-name-format')) {
+    response.firstName = user.firstName;
+    response.lastName = user.lastName;
+  } else {
+    response.name = `${user.firstName} ${user.lastName}`;
+  }
+
+  if (flags.has('include-metadata')) {
+    response.createdAt = user.createdAt;
+    response.updatedAt = user.updatedAt;
+  }
+
+  res.json(response);
+});
+```
+
+This approach enables gradual rollouts and A/B testing of API changes without formal version numbers. LaunchDarkly, Unleash, and Flagsmith are popular feature flag platforms that support this pattern.
+
+## Implementation in Other Frameworks
+
+### FastAPI (Python) with Header Versioning
+
+```python
+from fastapi import FastAPI, Header, HTTPException
+from typing import Optional
+
+app = FastAPI()
+
+async def get_user_v1(user_id: int):
+    user = await db.users.find_one({"id": user_id})
+    return {"id": user["id"], "name": user["name"], "email": user["email"]}
+
+async def get_user_v2(user_id: int):
+    user = await db.users.find_one({"id": user_id})
+    return {
+        "data": {
+            "id": user["id"],
+            "first_name": user["first_name"],
+            "last_name": user["last_name"],
+            "email": user["email"],
+            "created_at": user["created_at"].isoformat(),
+        }
+    }
+
+@app.get("/api/users/{user_id}")
+async def read_user(
+    user_id: int,
+    x_api_version: Optional[str] = Header(default="2"),
+):
+    handlers = {"1": get_user_v1, "2": get_user_v2}
+    if x_api_version not in handlers:
+        raise HTTPException(status_code=400, detail=f"Unsupported version: {x_api_version}")
+    return await handlers[x_api_version](user_id)
+```
+
+### Spring Boot (Java) with URL Versioning
+
+```java
+@RestController
+@RequestMapping("/api")
+public class UserController {
+
+    @GetMapping("/v1/users/{id}")
+    public ResponseEntity<UserV1> getUserV1(@PathVariable Long id) {
+        User user = userService.findById(id);
+        return ResponseEntity.ok(UserV1.builder()
+            .id(user.getId())
+            .name(user.getFullName())
+            .email(user.getEmail())
+            .build());
+    }
+
+    @GetMapping("/v2/users/{id}")
+    public ResponseEntity<ApiResponse<UserV2>> getUserV2(@PathVariable Long id) {
+        User user = userService.findById(id);
+        return ResponseEntity.ok(ApiResponse.of(UserV2.builder()
+            .id(user.getId())
+            .firstName(user.getFirstName())
+            .lastName(user.getLastName())
+            .email(user.getEmail())
+            .createdAt(user.getCreatedAt())
+            .build()));
+    }
+}
+```
+
+Spring Boot also supports custom `@Version` annotations via `spring-restdocs` and Spring Cloud Contract for API versioning with less boilerplate.
 
 ## Future Outlook
 
 API versioning is moving toward **continuous evolution** — APIs that change without explicit versions, using backward-compatible changes, feature flags, and gradual rollouts. Stripe's date-based versioning model, where clients pin to a specific API date, is gaining adoption as it enables continuous deployment without breaking clients.
 
-The convergence of API versioning with **API management platforms** will automate much of the versioning lifecycle — automatically detecting breaking changes, generating migration guides, and managing deprecation timelines.
+The convergence of API versioning with **API management platforms** will automate much of the versioning lifecycle — automatically detecting breaking changes, generating migration guides, and managing deprecation timelines. Tools like Optic and Speakeasy already provide automated breaking change detection by comparing OpenAPI specifications across commits.
+
+**AI-powered migration assistants** are emerging that can automatically update client code when an API version changes. Given a migration guide and client code, these tools generate pull requests that update API calls to the new version. This dramatically reduces the cost of maintaining multiple versions and accelerates client migration.
 
 ## Versioning in Microservices
 
-In microservices architectures, API versioning becomes more complex because multiple services may depend on different versions of the same API. Strategies include using an API gateway that routes requests to the appropriate service version based on the version header or URL path. Service mesh technologies like Istio can manage traffic splitting between API versions, enabling gradual rollouts and canary deployments. Document version compatibility matrices so teams understand which service versions are compatible with each other. Consider using contract testing tools like Pact to verify that API consumers and providers agree on the interface for each version. Automated contract tests catch breaking changes before they reach production, regardless of which versioning strategy you use.
+In microservices architectures, API versioning becomes more complex because multiple services may depend on different versions of the same API. Strategies include using an API gateway that routes requests to the appropriate service version based on the version header or URL path.
+
+```yaml
+# Kong API Gateway version routing
+services:
+- name: users-v1
+  url: http://users-service-v1:8080
+  routes:
+  - name: users-v1-route
+    paths: ["/api/v1/users"]
+    strip_path: false
+
+- name: users-v2
+  url: http://users-service-v2:8080
+  routes:
+  - name: users-v2-route
+    paths: ["/api/v2/users"]
+    strip_path: false
+```
+
+Service mesh technologies like Istio can manage traffic splitting between API versions, enabling gradual rollouts and canary deployments:
+
+```yaml
+# Istio VirtualService for version-based traffic splitting
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: users-api
+spec:
+  hosts:
+  - users-api.example.com
+  http:
+  - match:
+    - headers:
+        x-api-version:
+          exact: "1"
+    route:
+    - destination:
+        host: users-service
+        subset: v1
+  - match:
+    - headers:
+        x-api-version:
+          exact: "2"
+    route:
+    - destination:
+        host: users-service
+        subset: v2
+  # Default: 90% v2, 10% v1 (gradual migration)
+  - route:
+    - destination:
+        host: users-service
+        subset: v2
+      weight: 90
+    - destination:
+        host: users-service
+        subset: v1
+      weight: 10
+```
+
+### Contract Testing with Pact
+
+Contract testing verifies that API consumers and providers agree on the interface for each version. Pact generates consumer-driven contracts that catch breaking changes before they reach production:
+
+```typescript
+// Consumer test (Pact)
+import { Pact } from '@pact-foundation/pact';
+
+const provider = new Pact({
+  consumer: 'WebApp',
+  provider: 'UsersAPI',
+});
+
+describe('Users API v2', () => {
+  beforeAll(() => provider.setup());
+  afterAll(() => provider.finalize());
+
+  it('returns users with v2 structure', async () => {
+    await provider.addInteraction({
+      state: 'users exist',
+      uponReceiving: 'a request for users v2',
+      withRequest: {
+        method: 'GET',
+        path: '/api/v2/users',
+        headers: { 'Accept-Version': '2' },
+      },
+      willRespondWith: {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          data: [
+            {
+              id: 1,
+              firstName: 'John',
+              lastName: 'Doe',
+              email: 'john@example.com',
+              createdAt: like('2024-01-01T00:00:00Z'),
+            },
+          ],
+          pagination: { page: 1, total: like(10) },
+        },
+      },
+    });
+
+    const response = await getUsersV2();
+    expect(response.data[0]).toHaveProperty('firstName');
+    expect(response.data[0]).not.toHaveProperty('name'); // v1 field
+  });
+});
+```
+
+### OpenAPI Diff for Breaking Change Detection
+
+Use openapi-diff tools in CI pipelines to automatically detect breaking changes between API versions:
+
+```bash
+# Install openapi-diff
+npm install -g @openapitools/openapi-diff
+
+# Compare two OpenAPI specs
+openapi-diff v1-openapi.yaml v2-openapi.yaml \
+  --fail-on-incompatible \
+  --output JSON > diff-report.json
+
+# In CI pipeline
+if openapi-diff main-openapi.yaml pr-openapi.yaml --fail-on-incompatible; then
+  echo "No breaking changes detected"
+else
+  echo "BREAKING CHANGES: requires version bump"
+  exit 1
+fi
+```
+
+Document version compatibility matrices so teams understand which service versions are compatible with each other. Automated contract tests catch breaking changes before they reach production, regardless of which versioning strategy you use.
 
 Choosing a versioning strategy early and documenting it clearly prevents breaking changes from disrupting API consumers in production environments.
 
