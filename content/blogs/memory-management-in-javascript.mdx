@@ -482,6 +482,145 @@ for (let i = 0; i < 1000; i++) {
 | Object pooling | Reduces allocations | More code to maintain |
 | Arena allocation | Very fast bulk allocation | All-or-nothing deallocation |
 
+## WeakRef and FinalizationRegistry
+
+ES2021 introduced WeakRef and FinalizationRegistry for fine-grained memory control. These APIs allow you to hold weak references to objects that do not prevent garbage collection:
+
+```javascript
+// WeakRef: weak reference to an object
+let target = { data: 'large dataset' };
+let weakRef = new WeakRef(target);
+
+console.log(weakRef.deref()); // { data: 'large dataset' }
+target = null; // Object is now eligible for GC
+
+// After GC runs:
+console.log(weakRef.deref()); // undefined (object was collected)
+
+// FinalizationRegistry: callback when object is collected
+const registry = new FinalizationRegistry((heldValue) => {
+    console.log(`Object with key "${heldValue}" was garbage collected`);
+});
+
+let obj = { name: 'temporary' };
+registry.register(obj, 'my-object');
+
+obj = null; // Eventually triggers the callback after GC
+```
+
+WeakRef is particularly useful for implementing caches that automatically evict entries when memory pressure increases. Unlike WeakMap (which only works as a key in a map), WeakRef allows you to store a reference that becomes undefined when the object is collected:
+
+```javascript
+class WeakCache {
+    constructor() {
+        this.cache = new Map();
+    }
+
+    set(key, value) {
+        this.cache.set(key, new WeakRef(value));
+    }
+
+    get(key) {
+        const ref = this.cache.get(key);
+        if (!ref) return undefined;
+
+        const value = ref.deref();
+        if (value === undefined) {
+            this.cache.delete(key); // Clean up dead reference
+            return undefined;
+        }
+
+        return value;
+    }
+}
+```
+
+## Memory Management in Node.js
+
+Node.js applications have additional memory considerations beyond the browser. The V8 engine in Node.js has configurable heap limits that affect how much memory your application can use:
+
+```bash
+# Increase the maximum heap size to 4GB
+node --max-old-space-size=4096 app.js
+
+# Enable garbage collection logging
+node --trace-gc app.js
+
+# Enable detailed heap profiling
+node --inspect app.js
+```
+
+Server-side applications are particularly susceptible to memory leaks because they run for extended periods. A leak that releases 1 MB per hour is imperceptible in a browser tab that gets refreshed, but it will crash a Node.js server after a few days. Common server-side leak patterns include accumulating request data in module-level variables, growing log buffers, and connection pools that never release connections.
+
+Monitor your Node.js process memory using the process.memoryUsage API:
+
+```javascript
+setInterval(() => {
+    const { heapUsed, heapTotal, rss, external } = process.memoryUsage();
+    console.log({
+        heapUsed: `${(heapUsed / 1024 / 1024).toFixed(1)} MB`,
+        heapTotal: `${(heapTotal / 1024 / 1024).toFixed(1)} MB`,
+        rss: `${(rss / 1024 / 1024).toFixed(1)} MB`,
+        external: `${(external / 1024 / 1024).toFixed(1)} MB`,
+    });
+}, 30000);
+```
+
+## Memory Management in Web Workers
+
+Web Workers have their own heap, separate from the main thread. This means a memory leak in a worker does not directly affect the main thread, but it can still crash the worker. When transferring large data between the main thread and workers, use Transferable objects to avoid copying:
+
+```javascript
+// Main thread
+const buffer = new ArrayBuffer(1024 * 1024); // 1 MB
+const data = new Float32Array(buffer);
+
+// Transfer ownership (zero-copy) instead of structured clone (copy)
+worker.postMessage({ data }, [data.buffer]);
+// data.buffer is now detached - do not use it
+
+// Worker thread
+self.onmessage = (event) => {
+    const { data } = event.data;
+    // Process data - worker now owns the buffer
+    processLargeDataset(data);
+};
+```
+
+## Real-World Case Study: Single-Page Application
+
+A common memory leak in single-page applications occurs during route transitions. When navigating between pages, the old page's event listeners, timers, and subscriptions must be cleaned up. Without proper cleanup, each navigation adds memory that is never released.
+
+```javascript
+// React example with proper cleanup
+function Dashboard() {
+    const [data, setData] = useState(null);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        const ws = new WebSocket('wss://api.example.com/stream');
+
+        ws.onmessage = (event) => {
+            setData(JSON.parse(event.data));
+        };
+
+        fetch('/api/dashboard', { signal: controller.signal })
+            .then(res => res.json())
+            .then(setData);
+
+        // Cleanup on unmount
+        return () => {
+            controller.abort(); // Cancel fetch
+            ws.close();         // Close WebSocket
+        };
+    }, []);
+
+    return <div>{/* render data */}</div>;
+}
+```
+
+Without the cleanup function, every navigation to and from the Dashboard would leak a WebSocket connection and potentially an active fetch request. Over a user session with dozens of navigations, this accumulates significant memory and network resource waste.
+
 ## Conclusion
 
 Understanding JavaScript memory management is essential for building performant applications. By recognizing common leak patterns and applying proper cleanup strategies, you can prevent memory-related performance issues.
@@ -493,5 +632,7 @@ Key takeaways:
 4. Always clean up resources when components are destroyed
 5. Use WeakMap/WeakSet for object associations
 6. Profile memory usage regularly with Chrome DevTools
+7. WeakRef and FinalizationRegistry provide fine-grained control for caches
+8. Node.js servers require active memory monitoring for long-running processes
 
 Master memory management to build JavaScript applications that remain fast and responsive over extended usage periods.

@@ -332,6 +332,161 @@ WebGPU performance varies significantly across hardware. High-end desktop GPUs c
 
 Preparing models for WebGPU inference requires a conversion pipeline. Start with a model trained in PyTorch, TensorFlow, or another framework. Export the model to ONNX format, which provides a standardized representation of the model architecture and weights. Use ONNX Simplifier to optimize the model graph by removing redundant nodes and fusing operations. Quantize the model to reduce size and improve inference speed. Test the converted model against the original to verify that accuracy is preserved. Automate this pipeline using scripts so that model updates can be deployed to the web application quickly and reliably.
 
+## Browser Support and Feature Detection
+
+WebGPU is supported in Chrome 113+, Edge 113+, and Firefox Nightly (behind a flag). Safari has experimental support in Technology Preview. Before deploying WebGPU-based ML applications, implement robust feature detection:
+
+```javascript
+async function checkWebGPUSupport() {
+    if (!navigator.gpu) {
+        return { supported: false, reason: 'WebGPU not available in this browser' };
+    }
+
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            return { supported: false, reason: 'No suitable GPU adapter found' };
+        }
+
+        const features = [...adapter.features];
+        const limits = adapter.limits;
+
+        return {
+            supported: true,
+            features,
+            maxBufferSize: limits.maxBufferSize,
+            maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+            maxComputeWorkgroupsPerDimension: limits.maxComputeWorkgroupsPerDimension,
+        };
+    } catch (error) {
+        return { supported: false, reason: error.message };
+    }
+}
+```
+
+For applications that must work across all browsers, implement a graceful degradation strategy. Use WebGPU as the primary backend with WASM as the fallback for browsers without WebGPU support. ONNX Runtime Web handles this automatically when you specify multiple execution providers:
+
+```javascript
+const session = await ort.InferenceSession.create('./model.onnx', {
+    executionProviders: ['webgpu', 'wasm'],
+});
+```
+
+The runtime will attempt WebGPU first and fall back to WASM if WebGPU is unavailable. This ensures your application works everywhere while taking advantage of GPU acceleration where available.
+
+## Building a Complete ML Pipeline
+
+A production ML pipeline in the browser involves more than just running inference. You need to handle model loading, preprocessing, postprocessing, and result visualization. Here is a complete pipeline for real-time image classification:
+
+```javascript
+class MLPipeline {
+    constructor(modelUrl, labelsUrl) {
+        this.modelUrl = modelUrl;
+        this.labelsUrl = labelsUrl;
+        this.session = null;
+        this.labels = null;
+    }
+
+    async initialize() {
+        const [sessionResponse, labelsResponse] = await Promise.all([
+            fetch(this.modelUrl),
+            fetch(this.labelsUrl),
+        ]);
+
+        const modelBuffer = await sessionResponse.arrayBuffer();
+        this.labels = await labelsResponse.json();
+
+        this.session = await ort.InferenceSession.create(modelBuffer, {
+            executionProviders: ['webgpu', 'wasm'],
+        });
+
+        // Warm up the GPU with a dummy inference
+        const dummyInput = new ort.Tensor('float32', new Float32Array(1 * 3 * 224 * 224), [1, 3, 224, 224]);
+        await this.session.run({ input: dummyInput });
+    }
+
+    async classify(imageData) {
+        const tensor = this.preprocess(imageData);
+        const results = await this.session.run({ input: tensor });
+        return this.postprocess(results);
+    }
+
+    preprocess(imageData) {
+        const { data, width, height } = imageData;
+        const float32Data = new Float32Array(3 * width * height);
+
+        for (let i = 0; i < width * height; i++) {
+            float32Data[i] = (data[i * 4] / 255 - 0.485) / 0.229;
+            float32Data[i + width * height] = (data[i * 4 + 1] / 255 - 0.456) / 0.224;
+            float32Data[i + 2 * width * height] = (data[i * 4 + 2] / 255 - 0.406) / 0.225;
+        }
+
+        return new ort.Tensor('float32', float32Data, [1, 3, height, width]);
+    }
+
+    postprocess(results) {
+        const output = results.output.data;
+        const softmax = this.softmax(output);
+
+        return softmax
+            .map((score, index) => ({ label: this.labels[index], score }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5);
+    }
+
+    softmax(arr) {
+        const max = Math.max(...arr);
+        const exps = arr.map(x => Math.exp(x - max));
+        const sumExps = exps.reduce((a, b) => a + b, 0);
+        return exps.map(x => x / sumExps);
+    }
+}
+
+// Usage
+const pipeline = new MLPipeline('./mobilenet.onnx', './labels.json');
+await pipeline.initialize();
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+const predictions = await pipeline.classify(imageData);
+console.log('Top prediction:', predictions[0].label, predictions[0].score);
+```
+
+## GPU Memory Management
+
+WebGPU requires explicit memory management for GPU buffers. Failing to destroy buffers after use leads to GPU memory leaks that can crash the application:
+
+```javascript
+class GPUBufferManager {
+    constructor(device) {
+        this.device = device;
+        this.buffers = new Set();
+    }
+
+    createBuffer(descriptor) {
+        const buffer = this.device.createBuffer(descriptor);
+        this.buffers.add(buffer);
+        return buffer;
+    }
+
+    destroyBuffer(buffer) {
+        buffer.destroy();
+        this.buffers.delete(buffer);
+    }
+
+    destroyAll() {
+        for (const buffer of this.buffers) {
+            buffer.destroy();
+        }
+        this.buffers.clear();
+    }
+}
+```
+
+For long-running applications that process multiple images or video frames, allocate a pool of reusable buffers instead of creating new ones for each inference. This reduces memory allocation overhead and prevents GPU memory fragmentation.
+
 ## Conclusion
 
 WebGPU enables running machine learning models at near-native performance in the browser. With ONNX Runtime Web and Transformers.js, you can run image classifiers, text generators, and other ML models entirely client-side—no server required.
@@ -343,3 +498,4 @@ Key takeaways:
 3. **Transformers.js** provides a high-level API for transformer models
 4. **Quantized models** reduce download size and improve performance
 5. **Always check WebGPU support** and provide fallbacks
+6. **GPU memory management** is critical for long-running applications

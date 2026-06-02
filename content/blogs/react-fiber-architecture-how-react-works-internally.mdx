@@ -434,6 +434,180 @@ React's rendering process is divided into two distinct phases that have very dif
 
 The concurrent rendering capabilities enabled by the Fiber architecture represent a fundamental shift in how React handles updates and asynchronous operations. Concurrent features allow React to prepare multiple versions of the user interface simultaneously, switching between them based on priority and user interaction. This capability enables patterns like automatic batching of state updates, transition APIs that keep the current interface responsive while preparing new content, and Suspense boundaries that provide elegant loading states for asynchronous operations. Developers who understand the underlying Fiber mechanics can leverage these concurrent features more effectively, building applications that feel faster and more responsive even when performing complex operations like data fetching, code splitting, and heavy computations.
 
+## React DevTools and Fiber
+
+The React DevTools Profiler is built on top of the Fiber architecture. When you profile a React application, DevTools hooks into Fiber's commit phase to record timing information for each component:
+
+```javascript
+// What DevTools records during profiling:
+{
+  componentName: "UserProfile",
+  duration: 4.2,      // Time in ms for this component's render phase
+  startTime: 1234.5,  // When rendering began
+  commitTime: 1240.1, // When commit phase reached this component
+  phases: {
+    "render": 3.1,    // Time spent in render phase
+    "commit": 1.1,    // Time spent in commit phase
+  }
+}
+```
+
+The Profiler's flamegraph view shows the component tree as Fiber sees it — each bar represents a Fiber node, and the width represents how long that node took to render. The ranked chart sorts components by render time, helping you identify the most expensive components. Understanding Fiber's two-phase architecture helps you interpret these profiles correctly: a long render phase suggests expensive component logic, while a long commit phase suggests expensive DOM mutations.
+
+### Why Components Re-render
+
+Understanding Fiber explains why certain patterns trigger unnecessary re-renders. When a parent Fiber node receives new props during reconciliation, React creates a new work-in-progress Fiber for it. If the component returns the same element structure with the same props, React can skip re-rendering children — but only if `React.memo` or the component's comparison logic says the props haven't changed. Without memoization, React traverses the entire subtree even if nothing changed:
+
+```typescript
+// This component re-renders whenever Parent re-renders
+function ExpensiveChild({ data }) {
+  return <div>{heavyComputation(data)}</div>;
+}
+
+// This component only re-renders when data actually changes
+const ExpensiveChild = React.memo(function ExpensiveChild({ data }) {
+  return <div>{heavyComputation(data)}</div>;
+});
+```
+
+The React Compiler (React Forget), announced alongside React 19, aims to automate this memoization. It analyzes component code at build time and inserts memoization where it's safe to do so, eliminating the need for manual `React.memo`, `useMemo`, and `useCallback` calls. This works because the compiler understands Fiber's reconciliation rules and can determine when a component's output is guaranteed to be the same for the same inputs.
+
+## Performance Optimization Patterns
+
+### Avoiding Fiber Tree Thrashing
+
+Certain patterns force React to do more work in the Fiber tree than necessary. Changing a component's position in the tree causes React to unmount the old Fiber and mount a new one, which destroys all state and DOM nodes:
+
+```typescript
+// BAD: Conditional rendering changes tree structure
+function Page({ isLoggedIn }) {
+  if (isLoggedIn) {
+    return <Dashboard />;
+  }
+  return <Login />;
+}
+// Switching between these unmounts one and mounts the other
+
+// BETTER: Same component, conditional content
+function Page({ isLoggedIn }) {
+  return isLoggedIn ? <DashboardContent /> : <LoginContent />;
+}
+// Both are always mounted, only content changes
+```
+
+### Fragment Keys in Lists
+
+When rendering lists with multiple elements per item, use Fragment with a key to help Fiber match items correctly:
+
+```typescript
+// BAD: Each <li> gets a separate key, Fiber can't group them
+items.map(item => [
+  <li key={`${item.id}-name`}>{item.name}</li>,
+  <li key={`${item.id}-value`}>{item.value}</li>,
+]);
+
+// GOOD: Fragment groups the elements with a single key
+items.map(item => (
+  <Fragment key={item.id}>
+    <li>{item.name}</li>
+    <li>{item.value}</li>
+  </Fragment>
+));
+```
+
+### Lazy Loading with Suspense
+
+Fiber's ability to pause rendering enables code splitting with Suspense. When a lazy component hasn't loaded yet, Fiber suspends that subtree and renders the fallback:
+
+```typescript
+const HeavyChart = React.lazy(() => import('./HeavyChart'));
+
+function Dashboard() {
+  return (
+    <Suspense fallback={<ChartSkeleton />}>
+      <HeavyChart data={chartData} />
+    </Suspense>
+  );
+}
+```
+
+When `HeavyChart` finishes loading, Fiber resumes rendering that subtree without re-rendering the rest of the Dashboard. This is only possible because Fiber can pause and resume work at any node in the tree.
+
+## React 19 and the Future of Fiber
+
+React 19 builds on the Fiber architecture with several enhancements that further leverage its capabilities. The React Compiler (formerly React Forget) automatically memoizes components and hooks, reducing the need for manual `useMemo` and `useCallback` calls. This works by analyzing component code during compilation and inserting memoization where the Fiber architecture would benefit from it.
+
+Server Components integrate with Fiber by allowing components to render on the server and stream their results to the client. The Fiber tree on the client receives these pre-rendered components and incorporates them without re-executing the render phase. This reduces the amount of JavaScript sent to the browser and improves initial page load performance.
+
+The `use()` hook in React 19 is a new primitive that works with Fiber's suspense mechanism. Unlike `useEffect` or `useMemo`, `use()` can be called conditionally and during rendering, allowing components to suspend based on promises or context values without wrapping in `Suspense` boundaries at every level:
+
+```typescript
+// React 19 use() hook
+function UserProfile({ userId }) {
+  const user = use(fetchUser(userId)); // Suspends if promise is pending
+  const theme = use(ThemeContext);      // Reads context during render
+
+  return (
+    <div style={{ color: theme.primary }}>
+      <h1>{user.name}</h1>
+      <p>{user.email}</p>
+    </div>
+  );
+}
+```
+
+React 19 also introduces Actions — functions that handle form submissions and async transitions natively. Actions integrate with Fiber's lane system to provide automatic pending states, error handling, and optimistic updates:
+
+```typescript
+// React 19 Actions
+function UpdateName() {
+  const [error, action, isPending] = useActionState(async (prev, formData) => {
+    const newName = formData.get('name');
+    const error = await updateName(newName);
+    if (error) return error;
+    redirect('/profile');
+    return null;
+  }, null);
+
+  return (
+    <form action={action}>
+      <input type="text" name="name" />
+      <button disabled={isPending}>{isPending ? 'Updating...' : 'Update'}</button>
+      {error && <p>{error}</p>}
+    </form>
+  );
+}
+```
+
+These additions demonstrate that Fiber's architecture continues to evolve, enabling new patterns that improve developer experience and application performance.
+
+## Debugging Fiber
+
+Understanding Fiber internals helps when debugging performance issues. React DevTools Profiler visualizes the render phase, showing which components rendered and how long each took:
+
+```typescript
+// Measure render performance with Profiler API
+import { Profiler } from 'react';
+
+function onRenderCallback(id, phase, actualDuration, baseDuration, startTime, commitTime) {
+  console.log(`Component ${id} ${phase}: ${actualDuration}ms (base: ${baseDuration}ms)`);
+  // actualDuration: time spent rendering this update
+  // baseDuration: estimated time for full re-render without memoization
+}
+
+function App() {
+  return (
+    <Profiler id="App" onRender={onRenderCallback}>
+      <Dashboard />
+    </Profiler>
+  );
+}
+```
+
+When components render unexpectedly, check for missing keys in lists causing full re-renders, object or array literals in JSX props creating new references each render, context value changes propagating to all consumers, and state updates in render causing infinite loops. Use `React.StrictMode` in development to detect side effects in the render phase. StrictMode intentionally double-invokes component functions to surface impure render logic that would cause bugs in concurrent mode.
+
+The React DevTools flamegraph chart shows the render duration of each component. Components that take longer than 16ms to render are candidates for optimization. The ranked chart sorts components by render time, making it easy to identify the most expensive components. Use these tools to guide optimization efforts rather than prematurely memoizing everything.
+
 ## Conclusion
 
 React Fiber is a complete rethinking of how React renders. By breaking work into small units, React can prioritize updates, pause rendering, and keep the UI responsive even under heavy load. The linked-list tree structure, double buffering, and lane-based scheduling enable features like Suspense, useTransition, and automatic batching.
@@ -448,3 +622,5 @@ Key takeaways:
 4. **Lanes model** — Priority-based scheduling for different update types
 5. **Suspense and transitions** — Built on Fiber's ability to pause and resume work
 6. **Keys and functional updates** — Critical for correctness in concurrent mode
+7. **DevTools Profiler** reveals Fiber's two-phase timing for each component
+8. **React Compiler** automates memoization based on Fiber's reconciliation rules
