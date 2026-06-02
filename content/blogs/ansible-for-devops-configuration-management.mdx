@@ -23,21 +23,151 @@ The declarative model is what makes Ansible powerful. Instead of writing imperat
 
 The inventory defines the hosts Ansible manages. It can be a simple static file listing hostnames, or a dynamic script that queries your cloud provider for current instances. Hosts can be organized into groups, and variables can be assigned at the host or group level.
 
+A static inventory file in INI format looks like:
+
+```ini
+[webservers]
+web1.example.com http_port=80
+web2.example.com http_port=80
+
+[databases]
+db1.example.com postgres_version=15
+db2.example.com postgres_version=15
+
+[monitoring]
+mon1.example.com
+
+[all:vars]
+ansible_user=deploy
+ansible_ssh_private_key_file=~/.ssh/deploy_key
+```
+
+For cloud environments, **dynamic inventory** scripts query AWS EC2, GCP, or Azure for current instances automatically. This eliminates the need to maintain static inventory files as infrastructure scales up and down:
+
+```python
+#!/usr/bin/env python3
+# inventory/aws_ec2.py — Dynamic inventory for AWS EC2
+import boto3
+import json
+
+def get_inventory():
+    ec2 = boto3.client('ec2', region_name='us-east-1')
+    instances = ec2.describe_instances(
+        Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
+    )
+
+    inventory = {'_meta': {'hostvars': {}}, 'all': {'children': []}}
+
+    for reservation in instances['Reservations']:
+        for instance in reservation['Instances']:
+            name = next(
+                (t['Value'] for t in instance.get('Tags', []) if t['Key'] == 'Name'),
+                instance['InstanceId']
+            )
+            inventory['_meta']['hostvars'][name] = {
+                'ansible_host': instance['PublicIpAddress'],
+                'instance_type': instance['InstanceType'],
+                'private_ip': instance['PrivateIpAddress'],
+            }
+
+    return json.dumps(inventory, indent=2)
+
+if __name__ == '__main__':
+    print(get_inventory())
+```
+
 ### Playbooks
 
 Playbooks are Ansible's configuration files, written in YAML. They define a list of plays, each targeting a set of hosts and executing a sequence of tasks. Playbooks are the primary unit of automation in Ansible — they're version-controlled, testable, and reusable.
 
+A playbook consists of one or more **plays**, each of which maps a set of hosts to a set of tasks. Within a play, you can define variables, include roles, specify handlers, and apply tags for selective execution.
+
 ### Tasks and Modules
 
-Tasks are the individual steps within a play. Each task calls an Ansible module — a reusable unit of code that performs a specific action (install a package, copy a file, start a service, manage users). Ansible ships with thousands of modules for every common system administration task.
+Tasks are the individual steps within a play. Each task calls an Ansible module — a reusable unit of code that performs a specific action (install a package, copy a file, start a service, manage users). Ansible ships with over 3,000 modules for every common system administration task across Linux, Windows, network devices, and cloud platforms.
+
+Common module categories include: **package management** (`apt`, `yum`, `dnf`, `pip`), **file management** (`copy`, `template`, `file`, `lineinfile`), **service management** (`service`, `systemd`), **user management** (`user`, `group`, `authorized_key`), **networking** (`uri`, `get_url`, `git`), and **cloud** (`ec2_instance`, `gcp_compute_instance`, `azure_rm_virtualmachine`).
 
 ### Roles
 
 Roles are reusable collections of tasks, variables, files, templates, and handlers. They enable you to decompose complex playbooks into modular, shareable components. A web server role might include tasks for installing nginx, configuring virtual hosts, setting up SSL, and starting the service.
 
+Roles follow a standardized directory structure:
+
+```
+roles/nginx/
+├── defaults/main.yml      # Default variables (lowest priority)
+├── vars/main.yml          # Role variables (higher priority)
+├── tasks/main.yml         # Task definitions
+├── handlers/main.yml      # Handler definitions
+├── templates/             # Jinja2 templates
+│   ├── nginx.conf.j2
+│   └── vhost.conf.j2
+├── files/                 # Static files to copy
+├── meta/main.yml          # Role metadata and dependencies
+└── tests/                 # Molecule test files
+    └── test.yml
+```
+
 ### Handlers
 
 Handlers are tasks that only run when notified by other tasks. They're used for actions that should only happen when something changes — like restarting a service after a configuration file is modified. This ensures services are only restarted when necessary, not on every playbook run.
+
+Handlers are defined at the play level and notified by tasks using the `notify` directive. Multiple tasks can notify the same handler, and the handler runs only once at the end of the play — even if notified by multiple tasks.
+
+### Variables and Templating
+
+Ansible uses Jinja2 templating for dynamic content. Variables can be defined at multiple levels with a strict precedence order: role defaults → inventory vars → playbook vars → extra vars (command-line `-e`). Understanding this precedence is critical for managing configuration across environments.
+
+```yaml
+# group_vars/production.yml
+app_environment: production
+app_debug: false
+app_log_level: warning
+database_host: prod-db.example.com
+database_pool_size: 20
+
+# group_vars/staging.yml
+app_environment: staging
+app_debug: true
+app_log_level: debug
+database_host: staging-db.example.com
+database_pool_size: 5
+```
+
+Jinja2 templates enable dynamic configuration files:
+
+```jinja2
+{# templates/nginx.conf.j2 #}
+worker_processes {{ nginx_worker_processes }};
+worker_connections {{ nginx_worker_connections }};
+
+events {
+    worker_connections {{ nginx_worker_connections }};
+}
+
+http {
+    upstream app {
+        {% for host in groups['webservers'] %}
+        server {{ hostvars[host]['ansible_host'] }}:{{ http_port }};
+        {% endfor %}
+    }
+
+    server {
+        listen {{ https_port }} ssl;
+        server_name {{ domain_name }};
+
+        ssl_certificate {{ ssl_certificate_path }};
+        ssl_certificate_key {{ ssl_certificate_key_path }};
+
+        location / {
+            proxy_pass http://app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+}
+```
 
 ![Ansible architecture](https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=800&h=400&fit=crop)
 
@@ -46,6 +176,18 @@ Handlers are tasks that only run when notified by other tasks. They're used for 
 ### The Layered Playbook Pattern
 
 Organize playbooks into layers: base configuration (users, SSH, security), platform configuration (packages, services), application configuration (app-specific files, deployments). Each layer is independent and can be applied separately or combined.
+
+A site-level playbook orchestrates the layers:
+
+```yaml
+# site.yml — Top-level playbook
+---
+- import_playbook: playbooks/base.yml
+- import_playbook: playbooks/security.yml
+- import_playbook: playbooks/webservers.yml
+- import_playbook: playbooks/databases.yml
+- import_playbook: playbooks/monitoring.yml
+```
 
 ### The Role-Based Pattern
 
@@ -57,7 +199,12 @@ Use Ansible's variable system to handle differences between environments (dev, s
 
 ### The Pull Pattern
 
-Instead of pushing configurations from a central server, use ansible-pull on each node to pull and apply configurations from a Git repository. This scales better for large deployments and enables self-healing infrastructure.
+Instead of pushing configurations from a central server, use `ansible-pull` on each node to pull and apply configurations from a Git repository. This scales better for large deployments and enables self-healing infrastructure — each node periodically pulls the latest configuration and corrects any drift.
+
+```bash
+# Cron job on each managed node
+*/15 * * * * ansible-pull -U https://github.com/org/ansible-config.git -i localhost site.yml
+```
 
 ## Step-by-Step Implementation
 
@@ -75,14 +222,14 @@ all:
       vars:
         http_port: 80
         https_port: 443
-    
+
     databases:
       hosts:
         db1.example.com:
         db2.example.com:
       vars:
         postgres_version: 15
-    
+
     monitoring:
       hosts:
         mon1.example.com:
@@ -94,17 +241,17 @@ all:
 - name: Configure web servers
   hosts: webservers
   become: true
-  
+
   vars:
     nginx_worker_processes: auto
     nginx_worker_connections: 1024
-  
+
   roles:
     - common
     - nginx
     - ssl
     - monitoring
-  
+
   tasks:
     - name: Install required packages
       apt:
@@ -272,6 +419,44 @@ nginx_ssl_certificate_key: ""
   notify: Restart postgresql
 ```
 
+### Ansible Vault for Secrets Management
+
+Ansible Vault encrypts sensitive data so it can be safely stored in version control:
+
+```bash
+# Create an encrypted secrets file
+ansible-vault create group_vars/production/vault.yml
+
+# Edit an encrypted file
+ansible-vault edit group_vars/production/vault.yml
+
+# Run a playbook with encrypted secrets
+ansible-playbook site.yml --ask-vault-pass
+
+# Or use a vault password file (for CI/CD)
+ansible-playbook site.yml --vault-password-file ~/.vault_pass
+```
+
+The encrypted file contains sensitive variables:
+
+```yaml
+# group_vars/production/vault.yml (encrypted)
+vault_database_password: "super-secret-password"
+vault_api_key: "sk-proj-abc123..."
+vault_ssl_private_key: |
+  -----BEGIN RSA PRIVATE KEY-----
+  ...
+  -----END RSA PRIVATE KEY-----
+```
+
+Reference vault variables in regular variable files:
+
+```yaml
+# group_vars/production/vars.yml
+database_password: "{{ vault_database_password }}"
+api_key: "{{ vault_api_key }}"
+```
+
 ![Ansible playbook execution](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
 ## Real-World Use Cases
@@ -280,17 +465,54 @@ nginx_ssl_certificate_key: ""
 
 Automate security hardening across your fleet: disable password authentication, configure firewalls, set up automatic security updates, enforce password policies, and audit system configurations against CIS benchmarks. Run the hardening playbook on every new server to ensure consistent security posture.
 
+A hardening playbook might include: disabling root SSH login, setting up fail2ban, configuring UFW/iptables, enabling automatic security updates, setting file permissions, disabling unused services, and configuring audit logging.
+
 ### Application Deployment
 
 Deploy applications consistently across environments using Ansible. Pull the latest code from Git, install dependencies, run database migrations, update configuration files, and restart services — all in a single, idempotent playbook.
+
+A typical deployment playbook includes tasks for: pulling code from Git, creating a virtual environment, installing Python dependencies, running database migrations with Alembic, updating Nginx configuration, and restarting the application service.
 
 ### Infrastructure Provisioning
 
 Combine Ansible with cloud provider modules to provision infrastructure: create VMs, configure networking, set up load balancers, and configure DNS. This infrastructure-as-code approach enables reproducible environments and disaster recovery.
 
+```yaml
+- name: Create EC2 instance
+  amazon.aws.ec2_instance:
+    name: "{{ instance_name }}"
+    instance_type: "{{ instance_type }}"
+    image_id: "{{ ami_id }}"
+    key_name: "{{ ssh_key_name }}"
+    vpc_subnet_id: "{{ subnet_id }}"
+    security_groups:
+      - "{{ security_group }}"
+    tags:
+      Environment: "{{ app_environment }}"
+      Project: "{{ project_name }}"
+    state: present
+  register: ec2_result
+```
+
 ### Compliance Auditing
 
 Write playbooks that audit server configurations against compliance standards (PCI-DSS, HIPAA, SOC2). The playbook checks each requirement and generates a compliance report, identifying non-compliant servers and the specific issues.
+
+```yaml
+- name: Audit SSH configuration
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    state: present
+    validate: '/usr/sbin/sshd -t -f %s'
+  loop:
+    - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+    - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+    - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+    - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+  notify: Restart sshd
+```
 
 ## Best Practices for Production
 
@@ -310,6 +532,10 @@ Write playbooks that audit server configurations against compliance standards (P
 
 8. **Document with comments** — Add YAML comments explaining why, not just what. Document variable meanings, task purposes, and non-obvious dependencies.
 
+9. **Limit privilege escalation** — Use `become: true` only on tasks that require root. Don't run entire plays as root when only specific tasks need it.
+
+10. **Use `ansible-lint` for linting** — Run `ansible-lint` on your playbooks and roles to catch common errors, enforce style guidelines, and ensure best practices.
+
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
@@ -321,14 +547,49 @@ Write playbooks that audit server configurations against compliance standards (P
 | Storing secrets in plain text | Security breach | Use Ansible Vault for secrets |
 | No testing | Bugs discovered in production | Use Molecule for role testing |
 | Running as root unnecessarily | Security risk | Use become: true only for specific tasks |
+| Ignoring `ansible-lint` | Style violations, potential bugs | Integrate linting into CI/CD |
+| Using `when` with `command` modules | Tasks still run, just skipped | Use `creates`/`removes` parameters |
+| Not using `check_mode` | No dry-run capability | Test with `--check` before applying |
 
 ### Debugging Ansible Playbooks
 
 Use `--check` mode to preview changes without applying them. Use `--diff` to see exactly what will change. Use `-v`, `-vv`, or `-vvv` for increasing verbosity. Use `--step` to confirm each task before execution.
 
+```bash
+# Dry run with diff output
+ansible-playbook site.yml --check --diff
+
+# Verbose execution
+ansible-playbook site.yml -vvv
+
+# Step through tasks interactively
+ansible-playbook site.yml --step
+
+# Run only on a specific host
+ansible-playbook site.yml --limit web1.example.com
+
+# Run only tagged tasks
+ansible-playbook site.yml --tags "config,security"
+
+# Start at a specific task
+ansible-playbook site.yml --start-at-task "Deploy nginx configuration"
+```
+
 ## Performance Optimization
 
 Optimize Ansible performance by enabling pipelining (reduces SSH connections per task), using Mitogen (a faster execution strategy), parallelizing play execution across hosts, and using `strategy: free` to let hosts proceed independently.
+
+```ini
+# ansible.cfg — Performance optimizations
+[defaults]
+forks = 20                    # Parallel execution across 20 hosts
+pipelining = True             # Reduce SSH connections per task
+strategy_plugins = mitogen_linear  # Use Mitogen strategy (optional)
+
+[ssh_connection]
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s
+control_path = %(directory)s/ansible-ssh-%%h-%%p-%%r
+```
 
 For large deployments (1000+ hosts), use `ansible-pull` instead of push mode, implement rolling updates to avoid overwhelming the control node, and use dynamic inventory to avoid maintaining large static files.
 
@@ -344,6 +605,8 @@ For large deployments (1000+ hosts), use `ansible-pull` instead of push mode, im
 | Provisioning | ★★★ | ★★ | ★★ | ★★★★★ |
 | Best For | Config mgmt, automation | Large enterprises | Complex infra | Infrastructure provisioning |
 
+Ansible and Terraform are complementary — Terraform provisions infrastructure (creating VMs, networks, load balancers), while Ansible configures the provisioned servers (installing software, deploying applications, managing services). Many teams use both: Terraform for infrastructure provisioning and Ansible for configuration management.
+
 ## Advanced Patterns
 
 ### Dynamic Inventory
@@ -354,9 +617,42 @@ Use dynamic inventory scripts to automatically discover and manage cloud resourc
 
 Collections bundle roles, modules, plugins, and playbooks into distributable packages. Create organization-specific collections for shared automation patterns and distribute them via Ansible Galaxy or private registries.
 
+```yaml
+# requirements.yml — Install collections from Galaxy
+collections:
+  - name: community.general
+    version: ">=5.0.0"
+  - name: amazon.aws
+    version: ">=5.0.0"
+  - name: community.postgresql
+    version: ">=2.0.0"
+```
+
 ### Ansible Tower / AWX
 
 AWX (open-source) and Ansible Tower (commercial) provide a web UI, RBAC, scheduling, logging, and API for Ansible automation. They enable team collaboration and enterprise-grade workflow management.
+
+### Molecule Testing
+
+Test Ansible roles in isolated environments using Molecule:
+
+```yaml
+# molecule/default/molecule.yml
+dependency:
+  name: galaxy
+driver:
+  name: docker
+platforms:
+  - name: ubuntu-2204
+    image: geerlingguy/docker-ubuntu2204-ansible
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+provisioner:
+  name: ansible
+verifier:
+  name: ansible
+```
 
 ## Future Outlook
 
