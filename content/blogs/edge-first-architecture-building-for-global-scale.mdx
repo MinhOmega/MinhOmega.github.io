@@ -9,54 +9,634 @@ author: "MinhVo"
 
 ## Introduction
 
-Edge-First Architecture: Building for Global Scale is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Building for global scale has traditionally meant deploying to multiple cloud regions, configuring load balancers, managing database replicas, and handling the complexity of distributed systems. Edge-first architecture flips this model: instead of replicating your application across regions, you design it to run at the edge by default, with the cloud as a fallback for heavy computation.
 
-## Key Concepts
+An edge-first application delivers sub-50ms responses to users anywhere on the planet. Authentication happens at the nearest edge node. Database queries hit a local replica. Server-side rendering executes at the edge. Only complex operations like ML inference or batch processing reach the origin server. This architecture doesn't just improve performance — it fundamentally changes how applications are designed, built, and scaled.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers the principles of edge-first architecture, the component stack (edge functions, edge databases, edge caching, edge state), and the design patterns that make global-scale applications practical without the complexity of traditional multi-region deployments.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Global edge network architecture diagram](https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Edge-First Architecture: Core Concepts
 
-Let's look at a practical example:
+### The Edge-First Principle
+
+The edge-first principle is simple: every component of your application should run at the edge by default. If a component cannot run at the edge, it should be explicitly designed as an origin component with clear justification for why it needs centralized execution.
+
+This inverts the traditional cloud-first model where everything runs in one region and the CDN is an afterthought for static assets. In an edge-first architecture, the CDN is the application runtime, and the origin server is the exception.
+
+### The Edge-First Stack
+
+An edge-first application consists of these layers, each executing at the edge:
+
+**Edge Layer 1 — Routing and Security**: DNS resolution, DDoS protection, WAF rules, and geographic routing. This is the first line of defense and runs at every edge location.
+
+**Edge Layer 2 — Application Logic**: Business logic, authentication, authorization, rate limiting, and request transformation. This is where edge functions execute.
+
+**Edge Layer 3 — Data Access**: Database queries, cache reads, and session lookups. This is where edge databases and edge KV stores operate.
+
+**Edge Layer 4 — Rendering**: Server-side rendering, template hydration, and content personalization. This is where edge rendering engines execute.
+
+**Origin Layer — Heavy Computation**: ML inference, video transcoding, batch processing, and operations that require persistent connections or large memory. This is the only layer that runs in a traditional cloud region.
+
+### Global Data Strategy
+
+The hardest problem in edge-first architecture is data. Compute is stateless and easy to replicate, but data is stateful and requires careful consistency management. A global data strategy defines how data flows between edge locations and the origin.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Global data strategy configuration
+interface GlobalDataConfig {
+  // User session data: edge KV (strong consistency per user)
+  sessions: { store: 'edge-kv'; ttl: 3600 };
+
+  // Product catalog: edge database (eventual consistency, 5s lag acceptable)
+  catalog: { store: 'turso'; consistency: 'eventual'; maxLag: 5000 };
+
+  // User profiles: edge database with read-after-write guarantee
+  profiles: { store: 'turso'; consistency: 'read-after-write' };
+
+  // Order processing: origin database (strong consistency required)
+  orders: { store: 'postgres'; region: 'us-east-1' };
+
+  // Analytics: origin (eventual consistency, batch writes)
+  analytics: { store: 'clickhouse'; region: 'us-east-1' };
 }
 ```
 
-This pattern demonstrates the core approach to implementing Edge solutions in production environments.
+![Distributed data architecture with edge replicas](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-## Best Practices
+## Architecture and Design Patterns
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+### The Edge Request Lifecycle
 
-## Common Pitfalls
+In an edge-first architecture, every request follows this lifecycle:
+
+```
+Client Request
+    │
+    ▼
+┌─────────────────┐
+│ Edge Router      │  ← DNS resolution, geographic routing
+│ (Every location) │
+├─────────────────┤
+│ 1. WAF check     │  ← Block malicious requests
+│ 2. Rate limit    │  ← Per-user/IP throttling
+│ 3. Auth check    │  ← JWT verification (edge-local)
+│ 4. Cache check   │  ← Edge cache hit? Return immediately
+└──────┬──────────┘
+       │ Cache miss
+       ▼
+┌─────────────────┐
+│ Edge Application │  ← Business logic at the edge
+│ (Nearest location)│
+├─────────────────┤
+│ 5. Edge DB query │  ← Local replica, <5ms
+│ 6. Personalize   │  ← A/B tests, geo-content
+│ 7. SSR render    │  ← Server-side rendering
+│ 8. Cache store   │  ← Populate edge cache
+└──────┬──────────┘
+       │ Complex operation needed
+       ▼
+┌─────────────────┐
+│ Origin Server    │  ← Only for heavy compute
+│ (Single region)  │
+├─────────────────┤
+│ 9. ML inference  │
+│ 10. Batch process│
+│ 11. File write   │
+└─────────────────┘
+```
+
+### The Edge-First Component Pattern
+
+Every component in an edge-first application is designed to run at the edge. Here's how to structure a typical web application:
+
+```typescript
+// Edge-first application structure
+import { Hono } from 'hono';
+import { createClient } from '@libsql/client';
+
+const app = new Hono();
+
+// Edge middleware: runs at every edge location
+app.use('*', edgeTiming());
+app.use('*', edgeAuth());
+app.use('*', edgeRateLimit());
+
+// Edge routes: application logic at the edge
+app.get('/api/products', async (c) => {
+  const db = createClient({
+    url: c.env.TURSO_URL,
+    authToken: c.env.TURSO_AUTH_TOKEN,
+  });
+
+  const category = c.req.query('category');
+  const page = parseInt(c.req.query('page') || '1');
+  const limit = 20;
+  const offset = (page - 1) * limit;
+
+  const products = await db.execute({
+    sql: `SELECT * FROM products WHERE category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    args: [category, limit, offset],
+  });
+
+  return c.json({
+    products: products.rows,
+    page,
+    total: products.rows.length,
+    edgeLocation: c.req.header('cf-colo'),
+  });
+});
+
+// Origin route: only for operations requiring centralized execution
+app.post('/api/orders', async (c) => {
+  // Orders require strong consistency — route to origin
+  const order = await c.env.ORIGIN_SERVICE.createOrder(await c.req.json());
+  return c.json(order, 201);
+});
+```
+
+### The Edge Cache-Aside Pattern
+
+Cache-aside at the edge means checking the edge cache before querying the edge database:
+
+```typescript
+async function edgeCacheAside<T>(
+  key: string,
+  fetchFn: () => Promise<T>,
+  options: { ttl: number; cache: KVNamespace }
+): Promise<T> {
+  // L1: Check edge KV cache
+  const cached = await options.cache.get(key, 'json');
+  if (cached) return cached as T;
+
+  // L2: Fetch from source (edge DB or origin)
+  const data = await fetchFn();
+
+  // Populate cache asynchronously (don't block response)
+  options.cache.put(key, JSON.stringify(data), {
+    expirationTtl: options.ttl,
+  }).catch(() => {}); // Ignore cache write failures
+
+  return data;
+}
+
+// Usage
+const product = await edgeCacheAside(
+  `product:${id}`,
+  () => db.execute({ sql: 'SELECT * FROM products WHERE id = ?', args: [id] }),
+  { ttl: 300, cache: c.env.KV }
+);
+```
+
+### The Edge State Machine Pattern
+
+For applications that need stateful interactions (multi-step forms, shopping carts, collaborative editing), use edge Durable Objects:
+
+```typescript
+// Edge state machine using Durable Objects
+export class ShoppingCart {
+  state: DurableObjectState;
+  cart: Map<string, number>;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+    this.cart = new Map();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    switch (url.pathname) {
+      case '/add': {
+        const { productId, quantity } = await request.json();
+        const current = this.cart.get(productId) || 0;
+        this.cart.set(productId, current + quantity);
+        await this.state.storage.put('cart', Object.fromEntries(this.cart));
+        return Response.json({ cart: Object.fromEntries(this.cart) });
+      }
+
+      case '/get': {
+        return Response.json({ cart: Object.fromEntries(this.cart) });
+      }
+
+      case '/clear': {
+        this.cart.clear();
+        await this.state.storage.delete('cart');
+        return Response.json({ cart: {} });
+      }
+
+      default:
+        return new Response('Not found', { status: 404 });
+    }
+  }
+}
+```
+
+## Step-by-Step Implementation
+
+Let's build a complete edge-first e-commerce application that demonstrates all the patterns.
+
+### Setting Up the Edge-First Stack
+
+```bash
+# Create edge-first project
+npm create cloudflare@latest edge-ecommerce -- --type=hello-world
+cd edge-ecommerce
+
+# Install edge-compatible dependencies
+npm install hono @libsql/client
+```
+
+### Database Schema (Turso)
+
+```sql
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT,
+  price REAL NOT NULL,
+  category TEXT NOT NULL,
+  stock INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  region TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER REFERENCES users(id),
+  total REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Edge-First Application
+
+```typescript
+import { Hono } from 'hono';
+import { createClient } from '@libsql/client';
+
+type Bindings = {
+  TURSO_URL: string;
+  TURSO_AUTH_TOKEN: string;
+  KV: KVNamespace;
+  CART: DurableObjectNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// Edge middleware: timing and geo headers
+app.use('*', async (c, next) => {
+  const start = Date.now();
+  await next();
+  c.header('X-Edge-Time', `${Date.now() - start}ms`);
+  c.header('X-Edge-Region', c.req.header('cf-colo') || 'unknown');
+  c.header('X-User-Country', c.req.header('cf-ipcountry') || 'unknown');
+});
+
+// Product listing with edge caching
+app.get('/api/products', async (c) => {
+  const cacheKey = c.req.url;
+  const cached = await c.env.KV.get(cacheKey, 'json');
+
+  if (cached) {
+    c.header('X-Cache', 'HIT');
+    return c.json(cached);
+  }
+
+  const db = createClient({
+    url: c.env.TURSO_URL,
+    authToken: c.env.TURSO_AUTH_TOKEN,
+  });
+
+  const category = c.req.query('category');
+  const products = await db.execute({
+    sql: 'SELECT * FROM products WHERE category = ? LIMIT 20',
+    args: [category || 'all'],
+  });
+
+  // Cache for 1 minute
+  await c.env.KV.put(cacheKey, JSON.stringify(products.rows), {
+    expirationTtl: 60,
+  });
+
+  c.header('X-Cache', 'MISS');
+  return c.json(products.rows);
+});
+
+// Product detail with edge database
+app.get('/api/products/:id', async (c) => {
+  const id = c.req.param('id');
+
+  const db = createClient({
+    url: c.env.TURSO_URL,
+    authToken: c.env.TURSO_AUTH_TOKEN,
+  });
+
+  const product = await db.execute({
+    sql: 'SELECT * FROM products WHERE id = ?',
+    args: [id],
+  });
+
+  if (product.rows.length === 0) {
+    return c.json({ error: 'Product not found' }, 404);
+  }
+
+  return c.json(product.rows[0]);
+});
+
+// Shopping cart via Durable Object
+app.post('/api/cart/add', async (c) => {
+  const userId = c.get('userId');
+  const { productId, quantity } = await c.req.json();
+
+  const cartId = c.env.CART.idFromName(`cart:${userId}`);
+  const cart = c.env.CART.get(cartId);
+
+  const response = await cart.fetch(
+    new Request('https://cart/add', {
+      method: 'POST',
+      body: JSON.stringify({ productId, quantity }),
+    })
+  );
+
+  return response;
+});
+
+// SSR at the edge
+app.get('/products/:id', async (c) => {
+  const id = c.req.param('id');
+  const country = c.req.header('cf-ipcountry') || 'US';
+
+  const db = createClient({
+    url: c.env.TURSO_URL,
+    authToken: c.env.TURSO_AUTH_TOKEN,
+  });
+
+  const product = await db.execute({
+    sql: 'SELECT * FROM products WHERE id = ?',
+    args: [id],
+  });
+
+  if (product.rows.length === 0) {
+    return c.html('<h1>Product not found</h1>', 404);
+  }
+
+  const p = product.rows[0];
+
+  // Localize price based on country
+  const currency = getCurrency(country);
+  const localizedPrice = convertPrice(p.price, currency);
+
+  return c.html(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>${p.name} | Edge Shop</title>
+        <meta name="description" content="${p.description}">
+      </head>
+      <body>
+        <h1>${p.name}</h1>
+        <p>${p.description}</p>
+        <span class="price">${localizedPrice}</span>
+        <button onclick="addToCart(${p.id})">Add to Cart</button>
+        <script>
+          async function addToCart(productId) {
+            await fetch('/api/cart/add', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ productId, quantity: 1 }),
+            });
+            alert('Added to cart!');
+          }
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+export default app;
+```
+
+![Edge-first e-commerce architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: Global Marketplace
+
+A marketplace serving 2 million users across 50 countries adopted edge-first architecture. Product listings are served from Turso edge replicas in 35 locations. Shopping carts use Durable Objects for stateful edge management. Order processing routes to the origin for payment and fulfillment. The result: TTFB dropped from 180ms to 12ms globally, and the marketplace's conversion rate increased by 15%.
+
+### Use Case 2: Multi-Tenant SaaS
+
+A B2B SaaS platform with 5,000 tenants moved to edge-first architecture. Tenant identification, rate limiting, and permission checks happen at the edge in under 5ms. Tenant-specific data is cached in edge KV, updated via webhooks when configuration changes. The platform handles 100,000 API requests per second with P99 latency under 30ms, down from 250ms.
+
+### Use Case 3: Content Platform
+
+A content platform with 500,000 articles uses edge-first rendering. Article content is stored in Turso and rendered to HTML at the edge. Comments are loaded via client-side JavaScript from a separate API. The platform achieves perfect Lighthouse scores (100/100) globally because the server-rendered HTML arrives in under 20ms from the nearest edge location.
+
+## Best Practices for Production
+
+1. **Classify every component**: For each component, decide if it belongs at the edge or the origin. Authentication, routing, caching, and read-heavy queries belong at the edge. Payment processing, ML inference, and complex transactions belong at the origin.
+
+2. **Design for eventual consistency**: Edge databases replicate asynchronously. Accept that reads may be a few seconds behind writes. Use read-after-write consistency only when the user experience demands it.
+
+3. **Implement progressive enhancement**: Serve a functional page from edge cache even if the edge database is unavailable. Use stale-while-revalidate patterns. Users prefer a slightly outdated page over an error.
+
+4. **Use edge-native frameworks**: Hono, itty-router, and Elysia are designed for edge constraints. They use Web Standard APIs and have minimal bundle sizes. Express and Fastify do not work at the edge.
+
+5. **Monitor the full request lifecycle**: Track time spent at each edge layer — routing, authentication, database query, rendering, and caching. Identify which layer adds the most latency and optimize it.
+
+6. **Test from multiple locations**: Use VPNs, Cloudflare's `cf-ray` header, or geographic testing tools to verify behavior from different regions. An application that works perfectly in Virginia may behave differently in Tokyo.
+
+7. **Implement graceful degradation**: If the edge database is unreachable, serve from edge KV cache. If edge KV is also unavailable, serve stale content from the CDN cache. If everything fails, redirect to a static error page.
+
+8. **Optimize for cold starts**: Keep edge function bundles under 500KB. Use dynamic imports for heavy dependencies. Pre-warm critical functions with synthetic traffic if your platform supports it.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Moving everything to the edge | Complexity, edge runtime limitations | Classify components; keep heavy compute at origin |
+| Assuming strong consistency | Race conditions, stale reads | Design for eventual consistency; use read-after-write sparingly |
+| Large edge function bundles | Slow cold starts, size limit errors | Tree-shake aggressively, keep under 500KB |
+| No edge failure handling | Complete outage when edge is down | Multi-layer fallback: edge cache → edge KV → origin |
+| Ignoring edge-specific limits | Runtime errors | Know limits: execution time, bundle size, KV size, etc. |
+| Vendor lock-in | Migration difficulty | Use runtime-agnostic frameworks and Web Standard APIs |
+
+## Performance Optimization
+
+Edge-first architecture delivers measurable performance improvements. Here's how to measure and optimize:
+
+```typescript
+// Edge performance monitoring middleware
+function edgePerformanceMonitor() {
+  return async (c: Context, next: () => Promise<void>) => {
+    const timings: Record<string, number> = {};
+    const mark = (name: string) => { timings[name] = Date.now(); };
+
+    mark('start');
+
+    await next();
+
+    mark('end');
+
+    const totalTime = timings.end - timings.start;
+
+    // Log to analytics
+    c.executionCtx.waitUntil(
+      fetch('https://analytics.example.com/edge-perf', {
+        method: 'POST',
+        body: JSON.stringify({
+          path: c.req.path,
+          method: c.req.method,
+          totalTime,
+          edgeLocation: c.req.header('cf-colo'),
+          country: c.req.header('cf-ipcountry'),
+          cacheStatus: c.res.headers.get('X-Cache'),
+        }),
+      })
+    );
+  };
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Edge-First | Multi-Region Cloud | Single Region | CDN + Origin |
+|---------|-----------|-------------------|---------------|-------------|
+| Global Latency | <50ms | 50-100ms | 50-300ms | Static: <20ms, Dynamic: 50-300ms |
+| Complexity | Medium | High | Low | Low-Medium |
+| Cost | Low (per-request) | High (multi-region infra) | Low | Medium |
+| Data Strategy | Edge replicas | Regional replicas | Single DB | Cache + origin |
+| Scaling | Automatic | Auto per region | Manual | CDN auto, origin manual |
+| Best For | Global apps | Enterprise | Regional apps | Content-heavy sites |
+
+## Advanced Patterns
+
+### Edge-First Data Mesh
+
+For complex data requirements, implement a data mesh at the edge:
+
+```typescript
+// Edge data mesh: route queries to appropriate data stores
+class EdgeDataMesh {
+  private stores: Map<string, EdgeDataStore>;
+
+  constructor(env: Env) {
+    this.stores = new Map([
+      ['catalog', new TursoStore(env.TURSO_URL, env.TURSO_TOKEN)],
+      ['sessions', new KVStore(env.KV)],
+      ['analytics', new OriginStore(env.ANALYTICS_URL)],
+    ]);
+  }
+
+  async query<T>(store: string, sql: string, args?: unknown[]): Promise<T> {
+    const dataStore = this.stores.get(store);
+    if (!dataStore) throw new Error(`Unknown store: ${store}`);
+
+    return dataStore.query<T>(sql, args);
+  }
+}
+```
+
+### Edge Canary Deployment
+
+Deploy edge functions with canary routing:
+
+```typescript
+// Canary: route 5% of traffic to new version
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const userId = request.headers.get('CF-Connecting-IP') || '0';
+    const hash = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(userId)
+    );
+    const hashValue = new Uint8Array(hash)[0];
+    const isCanary = hashValue < 13; // ~5% of 256
+
+    if (isCanary && env.CANARY_VERSION) {
+      // Route to canary version
+      return env.CANARY_VERSION.fetch(request);
+    }
+
+    // Route to stable version
+    return env.STABLE_VERSION.fetch(request);
+  },
+};
+```
+
+## Testing Strategies
+
+```typescript
+import { unstable_dev } from 'wrangler';
+
+describe('Edge-First Application', () => {
+  let worker: any;
+
+  beforeAll(async () => {
+    worker = await unstable_dev('src/index.ts', {
+      experimental: { disableExperimentalWarning: true },
+    });
+  });
+
+  afterAll(async () => {
+    await worker.stop();
+  });
+
+  test('products API returns within 20ms', async () => {
+    const start = performance.now();
+    const resp = await worker.fetch('/api/products');
+    const latency = performance.now() - start;
+
+    expect(resp.status).toBe(200);
+    expect(latency).toBeLessThan(20);
+  });
+
+  test('edge timing headers present', async () => {
+    const resp = await worker.fetch('/api/products');
+    expect(resp.headers.get('X-Edge-Time')).toBeDefined();
+    expect(resp.headers.get('X-Edge-Region')).toBeDefined();
+  });
+
+  test('product page renders HTML', async () => {
+    const resp = await worker.fetch('/products/1');
+    const html = await resp.text();
+    expect(html).toContain('<!DOCTYPE html>');
+    expect(html).toContain('Add to Cart');
+  });
+
+  test('cache headers present', async () => {
+    const resp = await worker.fetch('/api/products');
+    expect(resp.headers.get('X-Cache')).toBeDefined();
+  });
+});
+```
+
+## Future Outlook
+
+Edge-first architecture is becoming the default for new web applications. As edge databases add vector search, real-time subscriptions, and full-text search, more application logic can move to the edge. The WebAssembly component model will enable running any language at the edge, not just JavaScript.
+
+The economics are also shifting. Edge computing is becoming cheaper than centralized cloud computing for read-heavy workloads. When you combine lower latency, lower cost, and simpler architecture, edge-first becomes the obvious choice for most web applications.
 
 ## Conclusion
 
-Edge-First Architecture: Building for Global Scale is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Edge-first architecture represents a fundamental shift in how we build globally distributed applications. By designing every component to run at the edge by default, we achieve sub-50ms latency worldwide without the complexity of traditional multi-region deployments.
+
+Key takeaways:
+1. Classify every component as edge or origin — edge is the default
+2. Use edge databases for read-heavy data, origin databases for write-heavy data
+3. Implement multi-layer caching: edge cache → edge KV → edge database → origin
+4. Design for eventual consistency; use read-after-write only when necessary
+5. Use edge-native frameworks (Hono) and Web Standard APIs
+6. Monitor per-edge-location performance and implement graceful degradation
+
+Start with edge caching and authentication, then progressively move application logic and data to the edge. The result is a faster, simpler, and more cost-effective application that serves users equally well from Tokyo to London to São Paulo.

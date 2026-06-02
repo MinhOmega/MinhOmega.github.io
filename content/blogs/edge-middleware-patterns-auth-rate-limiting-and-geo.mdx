@@ -9,54 +9,682 @@ author: "MinhVo"
 
 ## Introduction
 
-Edge Middleware Patterns: Auth, Rate Limiting, and Geo is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Middleware is the backbone of any web application — it handles authentication, rate limiting, logging, geolocation, and dozens of other cross-cutting concerns. Traditionally, middleware runs on your origin server, meaning every request must travel to a single region before it's even checked for validity. A malicious request from Sydney still makes the 16,000km round-trip to Virginia before being rejected.
 
-## Key Concepts
+Edge middleware moves these concerns to the network edge, where they execute in under 5ms at the location closest to the user. Authentication happens before the request reaches your application. Rate limiting uses distributed counters across edge locations. Geolocation-based routing directs users to the nearest data center. A/B test assignment happens at the edge, ensuring consistent experiences.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers the four most common edge middleware patterns — authentication, rate limiting, geolocation, and A/B testing — with production-ready implementations using Cloudflare Workers and the Web Crypto API. You'll learn how to implement JWT verification at the edge, distributed rate limiting with Durable Objects, geo-based content personalization, and consistent A/B test assignment.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Security and middleware architecture diagram](https://images.unsplash.com/photo-1555949963-aa79dcee981c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Edge Middleware: Core Concepts
 
-Let's look at a practical example:
+### What is Edge Middleware
+
+Edge middleware is code that runs at CDN edge locations before requests reach your origin server. It intercepts every request and can modify, redirect, block, or pass through requests based on any criteria — headers, cookies, IP address, geolocation, request body, or custom logic.
+
+The key difference from traditional middleware is execution location. Traditional middleware runs in your application server, usually in a single region. Edge middleware runs at 300+ locations worldwide, processing requests at the nearest point to the user. This means a blocked malicious request never reaches your origin, a cached response is served from the edge, and authentication is verified in single-digit milliseconds.
+
+### Edge Runtime Constraints
+
+Edge middleware runs in constrained environments with specific limitations:
+
+**Execution Time**: Typically 50ms maximum. Long-running operations must be deferred to the origin.
+
+**API Surface**: Web Standard APIs only — Fetch, Web Crypto, Streams, URL, Headers. No Node.js-specific APIs like `fs`, `child_process`, or `net`.
+
+**State**: Stateless by default. Use KV stores for persistent state or Durable Objects for stateful operations.
+
+**Bundle Size**: Usually 1MB compressed. Large dependencies increase cold start time.
+
+These constraints actually improve code quality — they force middleware to be fast, focused, and dependency-light.
+
+### The Web Crypto API
+
+The Web Crypto API is the cornerstone of edge security. It provides cryptographic operations (HMAC, RSA, ECDSA, AES) that work in all edge runtimes. Unlike Node.js's `crypto` module, the Web Crypto API is asynchronous and designed for the web platform.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Web Crypto API — works at the edge
+async function createHMAC(data: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
 }
 ```
 
-This pattern demonstrates the core approach to implementing Edge solutions in production environments.
+![Web Crypto API architecture diagram](https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=800&h=400&fit=crop)
 
-## Best Practices
+## Architecture and Design Patterns
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+### Pattern 1: Edge JWT Authentication
 
-## Common Pitfalls
+JWT verification is the most common edge middleware pattern. Instead of calling an auth service on every request, verify the JWT at the edge using the Web Crypto API.
+
+```typescript
+// Edge JWT verification — no external dependencies
+async function verifyJWT(token: string, secret: string): Promise<JwtPayload> {
+  const [headerB64, payloadB64, signatureB64] = token.split('.');
+
+  if (!headerB64 || !payloadB64 || !signatureB64) {
+    throw new Error('Invalid JWT format');
+  }
+
+  // Verify signature using Web Crypto
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
+
+  const data = encoder.encode(`${headerB64}.${payloadB64}`);
+  const signature = Uint8Array.from(atob(signatureB64), (c) => c.charCodeAt(0));
+
+  const valid = await crypto.subtle.verify('HMAC', key, signature, data);
+  if (!valid) throw new Error('Invalid JWT signature');
+
+  // Decode payload
+  const payload = JSON.parse(atob(payloadB64));
+
+  // Check expiration
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+    throw new Error('JWT expired');
+  }
+
+  return payload;
+}
+
+// Edge middleware using JWT verification
+export function authMiddleware() {
+  return async (c: Context, next: () => Promise<void>) => {
+    const authHeader = c.req.header('Authorization');
+
+    if (!authHeader?.startsWith('Bearer ')) {
+      return c.json({ error: 'Missing authorization token' }, 401);
+    }
+
+    try {
+      const token = authHeader.slice(7);
+      const payload = await verifyJWT(token, c.env.JWT_SECRET);
+      c.set('user', payload);
+      await next();
+    } catch (err) {
+      return c.json({ error: 'Invalid or expired token' }, 401);
+    }
+  };
+}
+```
+
+### Pattern 2: Distributed Rate Limiting
+
+Rate limiting at the edge prevents abusive traffic from reaching your origin. The challenge is counting requests across 300+ edge locations — a counter in Tokyo shouldn't know about requests in London.
+
+The solution is Durable Objects, which provide a globally coordinated state machine. Each rate limit key (user ID, IP address, API key) maps to a Durable Object that maintains the counter:
+
+```typescript
+// Durable Object for distributed rate limiting
+export class RateLimiter {
+  state: DurableObjectState;
+  requests: Map<string, number[]>;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+    this.requests = new Map();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const { key, limit, windowMs } = await request.json();
+
+    const now = Date.now();
+    const windowStart = now - windowMs;
+
+    // Get existing requests for this key
+    let timestamps = this.requests.get(key) || [];
+
+    // Remove expired entries
+    timestamps = timestamps.filter((t) => t > windowStart);
+
+    if (timestamps.length >= limit) {
+      // Rate limited
+      const retryAfter = Math.ceil((timestamps[0] + windowMs - now) / 1000);
+      return Response.json({
+        allowed: false,
+        remaining: 0,
+        retryAfter,
+      });
+    }
+
+    // Allow request
+    timestamps.push(now);
+    this.requests.set(key, timestamps);
+
+    return Response.json({
+      allowed: true,
+      remaining: limit - timestamps.length,
+      reset: Math.ceil((windowStart + windowMs) / 1000),
+    });
+  }
+}
+
+// Edge middleware using Durable Objects
+export function rateLimitMiddleware(options: {
+  limit: number;
+  windowMs: number;
+  keyFn: (c: Context) => string;
+}) {
+  return async (c: Context, next: () => Promise<void>) => {
+    const key = options.keyFn(c);
+    const limiterId = c.env.RATE_LIMITER.idFromName(key);
+    const limiter = c.env.RATE_LIMITER.get(limiterId);
+
+    const response = await limiter.fetch(
+      new Request('https://rate-limit', {
+        method: 'POST',
+        body: JSON.stringify({
+          key,
+          limit: options.limit,
+          windowMs: options.windowMs,
+        }),
+      })
+    );
+
+    const result = await response.json<{ allowed: boolean; remaining: number }>();
+
+    c.header('X-RateLimit-Limit', String(options.limit));
+    c.header('X-RateLimit-Remaining', String(result.remaining));
+
+    if (!result.allowed) {
+      return c.json({ error: 'Rate limit exceeded' }, 429);
+    }
+
+    await next();
+  };
+}
+```
+
+### Pattern 3: Geolocation-Based Routing
+
+Edge middleware can access the user's geographic location from request headers and route accordingly:
+
+```typescript
+// Geolocation middleware
+export function geoMiddleware() {
+  return async (c: Context, next: () => Promise<void>) => {
+    const country = c.req.header('cf-ipcountry') || 'US';
+    const city = c.req.header('cf-ipcity') || 'Unknown';
+    const latitude = c.req.header('cf-iplatitude');
+    const longitude = c.req.header('cf-iplongitude');
+    const timezone = c.req.header('cf-timezone') || 'UTC';
+
+    const geo = {
+      country,
+      city,
+      latitude: latitude ? parseFloat(latitude) : null,
+      longitude: longitude ? parseFloat(longitude) : null,
+      timezone,
+    };
+
+    c.set('geo', geo);
+
+    // Geo-based content routing
+    const region = getRegion(country);
+    c.set('region', region);
+
+    await next();
+  };
+}
+
+function getRegion(country: string): string {
+  const regions: Record<string, string> = {
+    US: 'na', CA: 'na', MX: 'na',
+    GB: 'eu', DE: 'eu', FR: 'eu', IT: 'eu', ES: 'eu', NL: 'eu',
+    JP: 'ap', KR: 'ap', CN: 'ap', IN: 'ap', AU: 'ap', SG: 'ap',
+    BR: 'sa', AR: 'sa', CO: 'sa',
+  };
+  return regions[country] || 'global';
+}
+```
+
+### Pattern 4: Edge A/B Testing
+
+A/B testing at the edge ensures consistent test assignment across all requests. The assignment is deterministic based on a user identifier, so the same user always sees the same variant regardless of which edge location handles the request.
+
+```typescript
+// Deterministic A/B test assignment at the edge
+export function abTestMiddleware(tests: ABTestConfig[]) {
+  return async (c: Context, next: () => Promise<void>) => {
+    const userId = c.req.header('CF-Connecting-IP') ||
+                   c.req.header('Cookie')?.match(/uid=([^;]+)/)?.[1] ||
+                   'anonymous';
+
+    const assignments: Record<string, string> = {};
+
+    for (const test of tests) {
+      // Deterministic assignment based on user ID and test name
+      const hash = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(`${userId}:${test.name}`)
+      );
+      const hashValue = new Uint8Array(hash)[0];
+      const bucket = hashValue % 100;
+
+      let cumulative = 0;
+      for (const variant of test.variants) {
+        cumulative += variant.weight;
+        if (bucket < cumulative) {
+          assignments[test.name] = variant.name;
+          break;
+        }
+      }
+    }
+
+    c.set('abTests', assignments);
+
+    // Set response headers for debugging
+    c.header('X-AB-Tests', JSON.stringify(assignments));
+
+    await next();
+  };
+}
+
+// Usage
+const tests: ABTestConfig[] = [
+  {
+    name: 'checkout-button-color',
+    variants: [
+      { name: 'control', weight: 50 },
+      { name: 'green', weight: 25 },
+      { name: 'blue', weight: 25 },
+    ],
+  },
+  {
+    name: 'pricing-display',
+    variants: [
+      { name: 'monthly', weight: 50 },
+      { name: 'annual', weight: 50 },
+    ],
+  },
+];
+```
+
+## Step-by-Step Implementation
+
+Let's build a complete edge middleware stack with all four patterns.
+
+### Setting Up the Middleware Stack
+
+```bash
+npm create cloudflare@latest edge-middleware -- --type=hello-world
+cd edge-middleware
+npm install hono
+```
+
+### Composing the Middleware Stack
+
+```typescript
+import { Hono } from 'hono';
+
+type Bindings = {
+  JWT_SECRET: string;
+  RATE_LIMITER: DurableObjectNamespace;
+  KV: KVNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// Global middleware: timing
+app.use('*', async (c, next) => {
+  const start = Date.now();
+  await next();
+  c.header('X-Edge-Time', `${Date.now() - start}ms`);
+  c.header('X-Edge-Location', c.req.header('cf-colo') || 'unknown');
+});
+
+// Global middleware: geolocation
+app.use('*', geoMiddleware());
+
+// Public routes (no auth)
+app.get('/api/health', (c) => c.json({ status: 'ok' }));
+app.get('/api/products', async (c) => {
+  const products = await getProducts(c);
+  return c.json(products);
+});
+
+// Rate-limited routes
+app.use('/api/*',
+  rateLimitMiddleware({
+    limit: 100,
+    windowMs: 60000, // 100 requests per minute
+    keyFn: (c) => c.req.header('CF-Connecting-IP') || 'unknown',
+  })
+);
+
+// A/B test routes
+app.use('/products/*', abTestMiddleware([
+  {
+    name: 'product-layout',
+    variants: [
+      { name: 'grid', weight: 50 },
+      { name: 'list', weight: 50 },
+    ],
+  },
+]));
+
+// Protected routes (require auth)
+app.use('/api/account/*', authMiddleware());
+app.use('/api/orders/*', authMiddleware());
+
+app.get('/api/account/profile', async (c) => {
+  const user = c.get('user');
+  return c.json({ user });
+});
+
+app.post('/api/orders', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json();
+
+  // Process order at origin (requires strong consistency)
+  const order = await fetch('https://origin.example.com/orders', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-ID': user.sub,
+    },
+    body: JSON.stringify(body),
+  });
+
+  return c.json(await order.json(), 201);
+});
+
+// SSR with geo-personalization
+app.get('/products/:id', async (c) => {
+  const geo = c.get('geo');
+  const abTests = c.get('abTests');
+  const product = await getProduct(c.req.param('id'));
+
+  const layout = abTests['product-layout'] || 'grid';
+  const currency = getCurrency(geo.country);
+
+  return c.html(`
+    <!DOCTYPE html>
+    <html lang="${getLanguage(geo.country)}">
+      <head><title>${product.name}</title></head>
+      <body class="layout-${layout}">
+        <h1>${product.name}</h1>
+        <span class="price">${formatPrice(product.price, currency)}</span>
+        <p>Ships to ${geo.country} in ${getShippingDays(geo.country)} days</p>
+      </body>
+    </html>
+  `);
+});
+
+export default app;
+```
+
+![Edge middleware request flow diagram](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: API Gateway Authentication
+
+A SaaS API serves 10,000 customers with 50 million API requests per day. Before edge middleware, every request reached the origin server for authentication and rate limiting. After moving these concerns to the edge, 95% of invalid or rate-limited requests are blocked at the edge in under 5ms. Origin server load dropped by 80%, and the team reduced their server fleet from 20 instances to 4.
+
+### Use Case 2: Geo-Based Content Delivery
+
+A media company serves news content in 15 languages across 40 countries. Edge middleware detects the user's country and language preference, then serves localized content from the nearest edge database. The geolocation check adds less than 1ms of latency, and users see content in their language within 20ms of clicking a link.
+
+### Use Case 3: E-Commerce A/B Testing
+
+An e-commerce platform runs 10 concurrent A/B tests on product pages, pricing, and checkout flows. Edge middleware assigns test variants deterministically — the same user always sees the same variant. This eliminates the "flickering" problem where users saw different variants on different page loads when A/B testing was implemented client-side. Conversion measurement accuracy improved by 12%.
+
+### Use Case 4: DDoS Protection
+
+A gaming platform was targeted by a DDoS attack generating 500,000 requests per second. Edge rate limiting with Durable Objects identified and blocked the attack at 300+ edge locations before it reached the origin. Legitimate users experienced no degradation because the rate limiter operated at the edge with <5ms overhead.
+
+## Best Practices for Production
+
+1. **Keep middleware fast**: Every millisecond of middleware adds to response time. JWT verification should complete in <2ms, rate limit checks in <1ms. If your middleware takes 10ms, it's too slow for the edge.
+
+2. **Use Web Crypto, not third-party crypto**: The Web Crypto API is built into all edge runtimes. Libraries like `jsonwebtoken` don't work at the edge because they depend on Node.js `crypto`. Implement JWT verification with Web Crypto directly.
+
+3. **Implement rate limiting with Durable Objects**: In-memory rate limiting per edge location is easily bypassed by distributing requests across locations. Durable Objects provide globally coordinated counters that cannot be bypassed.
+
+4. **Cache auth results**: If a user's JWT is valid, cache the parsed payload in KV for 60 seconds. This avoids re-verifying the signature on every request. The trade-off is that revoked tokens may be accepted for up to 60 seconds.
+
+5. **Use consistent A/B test assignment**: Hash the user identifier with the test name to produce deterministic assignments. Use SHA-256 from Web Crypto for uniform distribution. Store assignments in cookies for client-side access.
+
+6. **Handle edge middleware failures gracefully**: If JWT verification fails due to a Web Crypto error (not an invalid token), pass the request through to the origin rather than blocking it. The origin can handle the auth check as a fallback.
+
+7. **Log edge middleware decisions**: Log authentication failures, rate limit hits, and geo-routing decisions to an analytics service. This data helps identify attack patterns, optimize rate limits, and understand user distribution.
+
+8. **Test middleware in isolation**: Use Cloudflare's `unstable_dev` to test middleware functions locally before deploying. Test edge cases like expired JWTs, missing headers, and rate limit boundaries.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using Node.js crypto at edge | Runtime errors | Use Web Crypto API for all cryptographic operations |
+| In-memory rate limiting per location | Easily bypassed | Use Durable Objects for globally coordinated rate limiting |
+| Verifying JWT on every request | Unnecessary CPU overhead | Cache verified JWT payloads in KV with 60s TTL |
+| Hardcoded geo-routing rules | Inflexible, maintenance burden | Use configuration-driven routing with KV-stored rules |
+| A/B test assignment on client | Inconsistent experiences | Assign at the edge deterministically based on user ID hash |
+| Missing edge error handling | Requests blocked by middleware failures | Implement try/catch with origin fallback |
+
+## Performance Optimization
+
+```typescript
+// Optimized edge JWT verification with KV caching
+async function cachedJWTVerification(
+  token: string,
+  secret: string,
+  kv: KVNamespace
+): Promise<JwtPayload> {
+  // Check cache first
+  const cacheKey = `jwt:${token.slice(0, 50)}`; // Use token prefix as key
+  const cached = await kv.get<JwtPayload>(cacheKey, 'json');
+
+  if (cached) return cached;
+
+  // Verify JWT
+  const payload = await verifyJWT(token, secret);
+
+  // Cache for 60 seconds (balances performance vs revocation latency)
+  await kv.put(cacheKey, JSON.stringify(payload), { expirationTtl: 60 });
+
+  return payload;
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Edge Middleware | Origin Middleware | Client-Side | WAF Rules |
+|---------|---------------|------------------|-------------|-----------|
+| Latency | <5ms | 50-200ms | 0ms (local) | <1ms |
+| Flexibility | Full code | Full code | Limited | Rule-based |
+| Auth Verification | JWT at edge | Session/JWT | Token storage | N/A |
+| Rate Limiting | Durable Objects | In-memory/Redis | N/A | Per-IP rules |
+| Geo Routing | Per-request | Per-request | IP lookup | N/A |
+| A/B Testing | Deterministic | Server-side | Client-side | N/A |
+| Security | Blocks before origin | After arrival | Client-trusted | Pattern matching |
+
+## Advanced Patterns
+
+### Edge Web Application Firewall (WAF)
+
+```typescript
+// Custom WAF rules at the edge
+export function wafMiddleware(rules: WAFRule[]) {
+  return async (c: Context, next: () => Promise<void>) => {
+    const url = c.req.url;
+    const headers = c.req.header();
+    const body = c.req.method === 'POST' ? await c.req.text() : '';
+
+    for (const rule of rules) {
+      const target = rule.location === 'url' ? url :
+                     rule.location === 'header' ? headers[rule.header!] || '' :
+                     body;
+
+      if (rule.pattern.test(target)) {
+        // Log the blocked request
+        c.executionCtx.waitUntil(
+          logWAFBlock({
+            rule: rule.name,
+            ip: c.req.header('CF-Connecting-IP'),
+            url,
+            timestamp: new Date().toISOString(),
+          })
+        );
+
+        return c.json({ error: 'Blocked by WAF' }, 403);
+      }
+    }
+
+    await next();
+  };
+}
+
+// SQL injection detection
+const sqlInjectionPattern = /(\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|ALTER)\b.*\b(FROM|INTO|WHERE|TABLE)\b)|(--|\/\*|\*\/|;)/i;
+
+const wafRules: WAFRule[] = [
+  {
+    name: 'sql-injection',
+    location: 'url',
+    pattern: sqlInjectionPattern,
+  },
+  {
+    name: 'xss-attempt',
+    location: 'url',
+    pattern: /<script[^>]*>|javascript:|on\w+\s*=/i,
+  },
+  {
+    name: 'path-traversal',
+    location: 'url',
+    pattern: /\.\.\/|\.\.\\|%2e%2e%2f|%2e%2e\//i,
+  },
+];
+```
+
+### Edge Request Coalescing
+
+```typescript
+// Deduplicate concurrent requests for the same resource
+const inflightRequests = new Map<string, Promise<Response>>();
+
+export function coalesceMiddleware() {
+  return async (c: Context, next: () => Promise<void>) => {
+    const key = `${c.req.method}:${c.req.url}`;
+
+    if (inflightRequests.has(key)) {
+      // Wait for the existing request
+      const response = await inflightRequests.get(key)!;
+      return new Response(response.body, response);
+    }
+
+    // Create a promise for this request
+    const promise = (async () => {
+      await next();
+      return c.res!;
+    })();
+
+    inflightRequests.set(key, promise);
+
+    try {
+      return await promise;
+    } finally {
+      inflightRequests.delete(key);
+    }
+  };
+}
+```
+
+## Testing Strategies
+
+```typescript
+import { unstable_dev } from 'wrangler';
+
+describe('Edge Middleware', () => {
+  let worker: any;
+
+  beforeAll(async () => {
+    worker = await unstable_dev('src/index.ts', {
+      experimental: { disableExperimentalWarning: true },
+      vars: { JWT_SECRET: 'test-secret' },
+    });
+  });
+
+  afterAll(async () => {
+    await worker.stop();
+  });
+
+  test('blocks requests without auth token', async () => {
+    const resp = await worker.fetch('/api/account/profile');
+    expect(resp.status).toBe(401);
+  });
+
+  test('allows requests with valid JWT', async () => {
+    const token = await createTestJWT({ sub: 'user-123' }, 'test-secret');
+    const resp = await worker.fetch('/api/account/profile', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  test('rate limits excessive requests', async () => {
+    const responses = [];
+    for (let i = 0; i < 110; i++) {
+      responses.push(await worker.fetch('/api/products'));
+    }
+
+    const rateLimited = responses.filter((r) => r.status === 429);
+    expect(rateLimited.length).toBeGreaterThan(0);
+  });
+
+  test('geo headers present', async () => {
+    const resp = await worker.fetch('/api/health', {
+      headers: {
+        'CF-IPCountry': 'JP',
+        'CF-IPCity': 'Tokyo',
+      },
+    });
+    expect(resp.headers.get('X-Edge-Location')).toBeDefined();
+  });
+
+  test('edge middleware completes within 10ms', async () => {
+    const start = performance.now();
+    await worker.fetch('/api/products');
+    const latency = performance.now() - start;
+    expect(latency).toBeLessThan(50);
+  });
+});
+```
+
+## Future Outlook
+
+Edge middleware is evolving toward a standardized model. The WinterCG (Web-interoperable Runtimes Community Group) is working on standardizing edge runtime APIs across Cloudflare, Deno, Vercel, and other platforms. The Web Crypto API will gain new algorithms and hardware-backed key storage. Edge AI middleware will enable real-time threat detection using ML models running at the edge.
+
+The middleware-as-a-service model is also emerging. Services like Clerk, Auth0, and Stytch provide edge-compatible auth middleware that handles JWT verification, session management, and MFA without custom implementation. This reduces the surface area of security-critical code that developers need to maintain.
 
 ## Conclusion
 
-Edge Middleware Patterns: Auth, Rate Limiting, and Geo is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Edge middleware is the foundation of secure, performant edge applications. By moving authentication, rate limiting, geolocation, and A/B testing to the edge, you reduce latency, improve security, and lower origin server load.
+
+Key takeaways:
+1. Use Web Crypto API for all cryptographic operations at the edge — no Node.js crypto
+2. Implement rate limiting with Durable Objects for globally coordinated counters
+3. Cache verified JWT payloads in KV to avoid re-verification on every request
+4. Use deterministic A/B test assignment based on user ID hash
+5. Handle edge middleware failures gracefully with origin fallback
+6. Log all middleware decisions for security auditing and debugging
+
+Start with JWT authentication and rate limiting — these two middleware patterns alone will improve your application's security and performance significantly. Then add geolocation and A/B testing as your application grows.

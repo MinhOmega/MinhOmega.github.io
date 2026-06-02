@@ -9,54 +9,505 @@ author: "MinhVo"
 
 ## Introduction
 
-Building a Custom React Renderer is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+React's power lies not in its DOM manipulation capabilities, but in its reconciliation algorithm—the process of computing the minimal set of changes needed to update a UI tree. This reconciliation logic is abstracted behind a "host config" interface that can target any rendering environment: the DOM, iOS/Android (React Native), WebGL (React Three Fiber), PDF documents (react-pdf), or even the terminal (Ink).
 
-## Key Concepts
+Building a custom React renderer is an advanced undertaking that reveals React's internal architecture at the deepest level. It's also one of the most powerful patterns in the React ecosystem—a single renderer can bring React's declarative programming model to any platform. This guide walks through the architecture, implementation, and production considerations for building your own React renderer from scratch.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![React architecture](https://images.unsplash.com/photo-1633356122544-f134324a6cee?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding React's Renderer Architecture: Core Concepts
 
-## Practical Implementation
+### The Reconciler and Host Config
 
-Let's look at a practical example:
+React's architecture is split into two layers:
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+1. **The Reconciler** (`react-reconciler`): Contains the fiber tree algorithm, scheduling logic, hooks implementation, and diffing algorithm. This is shared across all renderers.
+
+2. **The Host Config**: A plain object that the reconciler calls to perform platform-specific operations. This is what you implement when building a custom renderer. The host config defines how to create instances, append children, commit updates, and handle text.
+
+When React needs to create a DOM node, it calls `createInstance` on the host config. When it needs to append a child, it calls `appendChild`. The reconciler handles *when* and *what* to update; the host config handles *how* to update.
+
+### Fibers and the Work Loop
+
+React's fiber architecture is a linked list of work units. Each fiber represents a component instance, a DOM element, or a text node. The work loop processes fibers in two phases:
+
+**Render phase** (can be interrupted): React traverses the fiber tree, calling component functions to produce new elements, and diffs them against the previous tree. This phase produces a "work-in-progress" tree.
+
+**Commit phase** (synchronous): React applies the computed changes to the host environment. This is where your host config methods are called—`createInstance`, `appendChild`, `removeChild`, `commitUpdate`.
+
+### The Host Config Interface
+
+The host config is a TypeScript interface with ~30 methods. The most important ones are:
+
+- `createInstance(type, props)`: Create a new platform element
+- `createTextInstance(text)`: Create a text node
+- `appendChild(parent, child)`: Add a child to a parent
+- `removeChild(parent, child)`: Remove a child
+- `commitUpdate(instance, payload)`: Apply prop changes to an instance
+- `appendChildToContainer(container, child)`: Add a child to the root container
+
+![Fiber architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### The Instance Model
+
+Every custom renderer needs an instance model—a way to represent platform elements in memory. For a canvas renderer, an instance might be a shape object with position, size, and color properties. For a PDF renderer, it might be a text block with font, size, and coordinates. The instance model is the bridge between React's virtual tree and your platform's actual rendering.
+
+### The Container Pattern
+
+React renderers operate on a container—the root element that holds the entire tree. For the DOM, the container is a DOM element (e.g., `document.getElementById('root')`). For a custom renderer, it might be a canvas context, a PDF document, or a terminal screen.
+
+### The Reconciliation Strategy
+
+React's reconciler needs to know how to diff your instances. If a component's props change, the reconciler calls `commitUpdate` with the new props. Your implementation decides what "updating" means for your platform—redrawing a canvas shape, repositioning a PDF element, or updating a terminal cell.
+
+### Event Handling
+
+Custom renderers need to handle events in their platform-specific way. A canvas renderer listens for mouse events on the canvas element and translates coordinates to hit-test against rendered shapes. A terminal renderer listens for keyboard input. The renderer can then call React's event system or implement its own.
+
+## Step-by-Step Implementation
+
+### Project Setup
+
+```bash
+mkdir react-custom-renderer && cd react-custom-renderer
+npm init -y
+npm install react react-reconciler
+npm install --save-dev typescript @types/react
+```
+
+### TypeScript Configuration
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
 }
 ```
 
-This pattern demonstrates the core approach to implementing React solutions in production environments.
+### Defining the Host Config
 
-## Best Practices
+We'll build a simple canvas renderer that draws rectangles, circles, and text on an HTML5 canvas.
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// src/types.ts
+export interface CanvasInstance {
+  type: string;
+  props: Record<string, any>;
+  children: CanvasInstance[];
+  parent: CanvasInstance | null;
+}
 
-## Common Pitfalls
+export interface TextInstance {
+  type: "TEXT_INSTANCE";
+  text: string;
+  parent: CanvasInstance | null;
+}
+```
+
+```typescript
+// src/CanvasRenderer.ts
+import Reconciler from "react-reconciler";
+import { DefaultEventPriority } from "react-reconciler/constants";
+import type { CanvasInstance, TextInstance } from "./types";
+
+const canvasElements = new Map<CanvasInstance | TextInstance, CanvasRenderingContext2D>();
+
+function createInstance(type: string, props: Record<string, any>): CanvasInstance {
+  return {
+    type,
+    props: { ...props },
+    children: [],
+    parent: null,
+  };
+}
+
+function createTextInstance(text: string): TextInstance {
+  return {
+    type: "TEXT_INSTANCE",
+    text,
+    parent: null,
+  };
+}
+
+function appendChild(parent: CanvasInstance, child: CanvasInstance | TextInstance) {
+  child.parent = parent;
+  parent.children.push(child);
+}
+
+function removeChild(parent: CanvasInstance, child: CanvasInstance | TextInstance) {
+  const index = parent.children.indexOf(child);
+  if (index !== -1) {
+    parent.children.splice(index, 1);
+  }
+  child.parent = null;
+}
+
+function insertBefore(
+  parent: CanvasInstance,
+  child: CanvasInstance | TextInstance,
+  beforeChild: CanvasInstance | TextInstance
+) {
+  const index = parent.children.indexOf(beforeChild);
+  if (index !== -1) {
+    child.parent = parent;
+    parent.children.splice(index, 0, child);
+  }
+}
+
+function commitUpdate(
+  instance: CanvasInstance,
+  _type: string,
+  _oldProps: Record<string, any>,
+  newProps: Record<string, any>
+) {
+  instance.props = { ...newProps };
+}
+
+function renderInstance(
+  ctx: CanvasRenderingContext2D,
+  instance: CanvasInstance | TextInstance,
+  x: number = 0,
+  y: number = 0
+) {
+  if (instance.type === "TEXT_INSTANCE") {
+    ctx.fillStyle = instance.parent?.props?.color || "#000";
+    ctx.font = instance.parent?.props?.font || "16px sans-serif";
+    ctx.fillText(instance.text, x, y);
+    return;
+  }
+
+  const { width = 100, height = 100, fill = "#ccc", radius } = instance.props;
+  const instanceX = instance.props.x ?? x;
+  const instanceY = instance.props.y ?? y;
+
+  ctx.fillStyle = fill;
+
+  if (instance.type === "rect") {
+    ctx.fillRect(instanceX, instanceY, width, height);
+  } else if (instance.type === "circle") {
+    ctx.beginPath();
+    ctx.arc(instanceX + width / 2, instanceY + height / 2, radius || width / 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  let childY = instanceY + 20;
+  for (const child of instance.children) {
+    renderInstance(ctx, child, instanceX + 10, childY);
+    childY += 20;
+  }
+}
+
+const reconcilerConfig = {
+  supportsMutation: true,
+  supportsPersistence: false,
+  supportsHydration: false,
+  isPrimaryRenderer: false,
+  createInstance,
+  createTextInstance,
+  appendChild,
+  removeChild,
+  insertBefore,
+  commitUpdate,
+  appendInitialChild: appendChild,
+  finalizeInitialChildren: () => false,
+  prepareUpdate: () => true,
+  prepareForCommit: () => null,
+  resetAfterCommit: () => {},
+  preparePortalMount: () => {},
+  scheduleTimeout: setTimeout,
+  cancelTimeout: clearTimeout,
+  noTimeout: -1,
+  getInstanceFromNode: () => null,
+  beforeActiveInstanceBlur: () => {},
+  afterActiveInstanceBlur: () => {},
+  getInstanceFromScope: () => null,
+  detachDeletedInstance: () => {},
+  getChildHostContext: () => ({}),
+  getPublicInstance: (instance: CanvasInstance) => instance,
+ getRootHostContext: () => ({}),
+  shouldSetTextContent: () => false,
+  clearContainer: () => {},
+  getCurrentEventPriority: () => DefaultEventPriority,
+};
+
+const CanvasReconciler = Reconciler(reconcilerConfig);
+
+export function renderToCanvas(
+  element: React.ReactNode,
+  canvas: HTMLCanvasElement
+) {
+  const ctx = canvas.getContext("2d")!;
+  const container = CanvasReconciler.createContainer(
+    canvas,     // container
+    0,          // tag (LegacyRoot)
+    null,       // hydrationCallbacks
+    false,      // isStrictMode
+    false,      // concurrentUpdatesByDefaultOverride
+    "",         // identifierPrefix
+    (error: Error) => console.error(error), // onUncaughtError
+    (error: Error) => console.error(error), // onCaughtError
+  );
+
+  CanvasReconciler.updateContainer(element, container, null, () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const root = canvas as any;
+    if (root.children) {
+      for (const child of root.children) {
+        renderInstance(ctx, child);
+      }
+    }
+  });
+
+  return {
+    unmount: () => CanvasReconciler.updateContainer(null, container, null, () => {}),
+  };
+}
+```
+
+### Using the Renderer
+
+```typescript
+// src/App.tsx
+import React from "react";
+
+function CanvasApp() {
+  return (
+    <>
+      <rect x={10} y={10} width={200} height={100} fill="#4A90D9">
+        <text color="#fff" font="bold 18px sans-serif">Hello Canvas!</text>
+      </rect>
+      <circle x={250} y={50} width={80} height={80} fill="#E74C3C" radius={40} />
+    </>
+  );
+}
+
+// Mount in a browser
+const canvas = document.getElementById("canvas") as HTMLCanvasElement;
+const { unmount } = renderToCanvas(<CanvasApp />, canvas);
+```
+
+![Canvas rendering](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### React Three Fiber (3D Graphics)
+
+React Three Fiber is the most successful custom React renderer. It maps React components to Three.js objects, enabling declarative 3D scene construction. A `<mesh>` component creates a Three.js Mesh, a `<boxGeometry>` creates geometry, and React's reconciler handles the Three.js scene graph updates.
+
+### Ink (Terminal UIs)
+
+Ink renders React components to the terminal. Components like `<Box>`, `<Text>`, and `<Color>` map to terminal cells using a Yoga-based layout engine. Developers build CLI tools with the same component model they use for web UIs.
+
+### react-pdf (PDF Generation)
+
+react-pdf renders React components to PDF documents. Components like `<Page>`, `<View>`, `<Text>`, and `<Image>` map to PDF primitives. The renderer handles pagination, font embedding, and PDF stream generation.
+
+### React Native (Mobile)
+
+React Native is the original custom renderer. It maps React components to native iOS and Android views via a bridge. The renderer handles view creation, layout (via Yoga), style application, and event dispatching.
+
+## Best Practices for Production
+
+1. **Start with the minimum host config** — Implement only `createInstance`, `createTextInstance`, `appendChild`, `removeChild`, and `commitUpdate` first. Add more methods as needed.
+
+2. **Use TypeScript for the host config** — The `react-reconciler` package has TypeScript definitions that enforce the correct method signatures. Use them to catch errors early.
+
+3. **Test with `react-test-renderer` patterns** — Create a test environment that renders your components and asserts on the instance tree. This catches reconciliation bugs before they reach production.
+
+4. **Handle the commit phase carefully** — The commit phase is synchronous and cannot be interrupted. Keep side effects (DOM updates, canvas redraws) in the commit phase, not the render phase.
+
+5. **Implement `prepareUpdate` efficiently** — This method is called on every render to determine if an update is needed. Return `null` if nothing changed to avoid unnecessary commit work.
+
+6. **Support concurrent mode** — If your renderer will be used with concurrent React features, implement `getCurrentEventPriority` and handle interruptible work correctly.
+
+7. **Document your component API** — Custom renderers define their own component vocabulary. Document each component's props, default values, and behavior clearly.
+
+8. **Provide a development mode** — Add warnings for invalid props, missing required fields, and common mistakes. React's development mode provides hooks for this.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Not implementing `removeChild` | Memory leaks, stale instances | Always clean up parent-child references on removal |
+| Mutating props directly | Stale renders, React warnings | Always create new prop objects in `commitUpdate` |
+| Blocking the commit phase | UI freezes | Keep expensive operations (canvas redraws) batched and async |
+| Not handling text instances | Text children render incorrectly | Implement `createTextInstance` and handle TEXT_INSTANCE in all child operations |
+| Forgetting `supportsMutation` | Renderer won't work | Set `supportsMutation: true` in the config |
+| Concurrent mode issues | Glitches, double renders | Use `getCurrentEventPriority` and handle interruptions |
+
+## Performance Optimization
+
+### Batched Canvas Redraws
+
+Instead of redrawing the canvas on every `commitUpdate`, batch updates and redraw once per animation frame:
+
+```typescript
+let needsRedraw = false;
+
+function commitUpdate(instance: CanvasInstance, ...args: any[]) {
+  instance.props = { ...args[3] };
+  needsRedraw = true;
+}
+
+function scheduleRedraw(canvas: HTMLCanvasElement) {
+  if (needsRedraw) {
+    requestAnimationFrame(() => {
+      const ctx = canvas.getContext("2d")!;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Redraw entire tree
+      needsRedraw = false;
+    });
+  }
+}
+```
+
+### Instance Pooling
+
+For renderers that create and destroy many instances (e.g., a particle system), pool instances instead of garbage-collecting them:
+
+```typescript
+const instancePool: CanvasInstance[] = [];
+
+function createInstance(type: string, props: Record<string, any>): CanvasInstance {
+  const instance = instancePool.pop() || { type: "", props: {}, children: [], parent: null };
+  instance.type = type;
+  instance.props = { ...props };
+  instance.children = [];
+  instance.parent = null;
+  return instance;
+}
+
+function removeChild(parent: CanvasInstance, child: CanvasInstance | TextInstance) {
+  const index = parent.children.indexOf(child);
+  if (index !== -1) parent.children.splice(index, 1);
+  child.parent = null;
+  if (child.type !== "TEXT_INSTANCE") {
+    instancePool.push(child);
+  }
+}
+```
+
+## Comparison with Alternatives
+
+| Approach | Declarative | Performance | Ecosystem | Learning Curve |
+|----------|-------------|-------------|-----------|----------------|
+| Custom React Renderer | Yes | High | React ecosystem | High |
+| Direct DOM manipulation | No | Highest | None | Low |
+| Virtual DOM library (Preact) | Yes | High | Small | Medium |
+| Imperative canvas library | No | High | Small | Low |
+| Web Components | Yes | Medium | Growing | Medium |
+
+## Advanced Patterns
+
+### Portals for Overlay Rendering
+
+Support rendering to multiple targets (e.g., a main canvas and an overlay canvas) using React portals:
+
+```typescript
+import { createPortal } from "react-dom";
+
+function Overlay({ children }: { children: React.ReactNode }) {
+  const overlayCanvas = document.getElementById("overlay")!;
+  return createPortal(children, overlayCanvas);
+}
+```
+
+### Custom Hooks for Renderer State
+
+```typescript
+function useCanvasSize(canvasRef: React.RefObject<HTMLCanvasElement>) {
+  const [size, setSize] = React.useState({ width: 0, height: 0 });
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      setSize({
+        width: entry.contentRect.width,
+        height: entry.contentRect.height,
+      });
+    });
+
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [canvasRef]);
+
+  return size;
+}
+```
+
+## Testing Strategies
+
+```typescript
+// __tests__/renderer.test.ts
+import { createInstance, createTextInstance, appendChild } from "../src/CanvasRenderer";
+
+describe("Canvas Renderer", () => {
+  it("creates instances with correct type and props", () => {
+    const instance = createInstance("rect", { width: 100, height: 50, fill: "red" });
+    expect(instance.type).toBe("rect");
+    expect(instance.props.width).toBe(100);
+    expect(instance.children).toEqual([]);
+  });
+
+  it("creates text instances", () => {
+    const text = createTextInstance("Hello");
+    expect(text.type).toBe("TEXT_INSTANCE");
+    expect(text.text).toBe("Hello");
+  });
+
+  it("appends children correctly", () => {
+    const parent = createInstance("div", {});
+    const child = createInstance("span", {});
+    appendChild(parent, child);
+    expect(parent.children).toContain(child);
+    expect(child.parent).toBe(parent);
+  });
+
+  it("handles nested children", () => {
+    const root = createInstance("root", {});
+    const group = createInstance("group", {});
+    const rect = createInstance("rect", { fill: "blue" });
+
+    appendChild(root, group);
+    appendChild(group, rect);
+
+    expect(root.children).toContain(group);
+    expect(group.children).toContain(rect);
+    expect(rect.parent).toBe(group);
+  });
+});
+```
+
+## Future Outlook
+
+React's renderer API continues to evolve. The `react-reconciler` package is being updated to support React's concurrent features, server components, and the new React compiler. Custom renderers that implement the full host config will benefit from these improvements automatically.
+
+The ecosystem of custom renderers is growing. Beyond the established players (React Native, React Three Fiber, Ink), new renderers are emerging for WebGPU, WebAssembly, and even hardware interfaces. The pattern of using React's declarative model for non-DOM targets is becoming a standard architectural choice.
+
+The React team has signaled that the reconciler API will stabilize further, making it easier to build and maintain custom renderers. Combined with React Server Components, this opens the possibility of renderers that span client and server—rendering a 3D scene on the server for SEO, then hydrating it on the client for interactivity.
 
 ## Conclusion
 
-Building a Custom React Renderer is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Building a custom React renderer is one of the most advanced React projects you can undertake. The key takeaways:
+
+1. **React is a reconciler, not a DOM library** — The reconciler algorithm is platform-agnostic and can target any rendering environment
+2. **The host config is your API** — Implement ~15-20 methods to bridge React's virtual tree to your platform's real objects
+3. **Start small, iterate** — Begin with `createInstance`, `appendChild`, and `commitUpdate`. Add complexity as needed
+4. **The instance model matters most** — How you represent platform elements in memory determines your renderer's capabilities and performance
+5. **Real-world renderers validate the pattern** — React Three Fiber, Ink, and react-pdf prove that custom renderers can be production-grade
+
+Start by reading the source code of React Three Fiber or Ink. Both are well-structured and demonstrate the host config patterns you'll need. Then build a minimal renderer for a simple target—a canvas, a terminal, or even a JSON structure. The exercise will deepen your understanding of React more than any tutorial can.

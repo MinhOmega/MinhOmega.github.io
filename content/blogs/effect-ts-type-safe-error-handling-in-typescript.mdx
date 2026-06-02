@@ -9,54 +9,644 @@ author: "MinhVo"
 
 ## Introduction
 
-Effect-TS: Type-Safe Error Handling in TypeScript is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+TypeScript's type system is powerful, but it has a blind spot: errors. A function that returns `Promise<User>` tells you nothing about what can go wrong. It might throw a network error, a database error, a validation error, or an authentication error — none of which are visible in the type signature. Developers resort to `try/catch` blocks with `any` error types, defensive null checks, and runtime hope.
 
-## Key Concepts
+Effect-TS (simply "Effect") solves this by making errors part of the type system. A function that returns `Effect<User, NetworkError | DatabaseError, never>` declares exactly which errors it can produce, which dependencies it needs, and that it's pure (no unexpected side effects). Errors are values, not exceptions. They flow through your code like data, with full type safety and composability.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers Effect's core primitives — the Effect type, tagged errors, service layers, and concurrency. You'll learn how to replace `try/catch` with typed error handling, build composable service architectures, and leverage Effect's powerful concurrency model. By the end, you'll understand why Effect is gaining traction as the foundation for production TypeScript applications.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![TypeScript code with type-safe error handling](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Effect: Core Concepts
 
-Let's look at a practical example:
+### The Problem with Traditional Error Handling
+
+Traditional TypeScript error handling has three fundamental problems:
+
+**1. Errors are invisible in types.** A function signature `getUser(id: string): Promise<User>` reveals nothing about failure modes. The caller must read the implementation (or documentation, which is often outdated) to know what can go wrong.
+
+**2. `try/catch` is untyped.** The `catch` block receives `unknown` (or `any` in older TypeScript). You lose all type information and must resort to runtime checks like `if (error instanceof Error)`.
+
+**3. Errors are not composable.** Combining multiple operations that can fail requires nested `try/catch` blocks or manual error propagation. The code becomes defensive and hard to read.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Traditional: errors invisible, untyped, not composable
+async function processOrder(orderId: string): Promise<Order> {
+  try {
+    const order = await getOrder(orderId);         // May throw
+    const user = await getUser(order.userId);       // May throw
+    const payment = await chargePayment(user, order); // May throw
+    return { ...order, payment };
+  } catch (error) {
+    // What errors? Network? Validation? Payment?
+    // Type is 'unknown' — no type safety
+    throw new Error('Order processing failed');
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing Effect solutions in production environments.
+### The Effect Type
 
-## Best Practices
+Effect's core type is `Effect<A, E, R>`:
+- **A** — the success type (what the effect produces)
+- **E** — the error type (what can go wrong)
+- **R** — the requirements type (dependencies needed)
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+import { Effect } from 'effect';
 
-## Common Pitfalls
+// An effect that succeeds with User, fails with DatabaseError,
+// and requires DatabaseService
+type GetUserEffect = Effect.Effect<User, DatabaseError, DatabaseService>;
+
+// An effect that succeeds with Payment, fails with PaymentError | ValidationError,
+// and requires PaymentService
+type ChargeEffect = Effect.Effect<Payment, PaymentError | ValidationError, PaymentService>;
+```
+
+### Errors as Values
+
+In Effect, errors are values, not exceptions. They are returned from functions just like success values, and they carry full type information:
+
+```typescript
+// Tagged errors — errors with discriminant tags
+class NetworkError {
+  readonly _tag = 'NetworkError';
+  constructor(readonly url: string, readonly status: number) {}
+}
+
+class ValidationError {
+  readonly _tag = 'ValidationError';
+  constructor(readonly field: string, readonly message: string) {}
+}
+
+// Function that returns typed errors
+function fetchUser(id: string): Effect.Effect<User, NetworkError | ValidationError> {
+  if (!id) {
+    return Effect.fail(new ValidationError('id', 'User ID is required'));
+  }
+
+  return Effect.tryPromise({
+    try: () => fetch(`/api/users/${id}`).then((r) => r.json()),
+    catch: (error) => new NetworkError(`/api/users/${id}`, 0),
+  });
+}
+```
+
+### Error Composition
+
+Effect's power comes from composition. When you combine effects, their error types are automatically merged:
+
+```typescript
+// Each function declares its errors
+function getOrder(id: string): Effect.Effect<Order, NetworkError | NotFoundError> { ... }
+function getUser(id: string): Effect.Effect<User, NetworkError | NotFoundError> { ... }
+function charge(user: User, order: Order): Effect.Effect<Payment, PaymentError> { ... }
+
+// Composed effect — error type is the union of all errors
+const processOrder = (orderId: string) =>
+  Effect.gen(function* () {
+    const order = yield* getOrder(orderId);      // May fail with NetworkError | NotFoundError
+    const user = yield* getUser(order.userId);    // May fail with NetworkError | NotFoundError
+    const payment = yield* charge(user, order);   // May fail with PaymentError
+    return { ...order, payment };
+  });
+// Type: Effect<{...}, NetworkError | NotFoundError | PaymentError>
+```
+
+![Functional programming composition diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Pattern 1: Tagged Error Hierarchy
+
+Tagged errors use a discriminant field (`_tag`) for exhaustive pattern matching:
+
+```typescript
+// Base error class
+abstract class AppError {
+  abstract readonly _tag: string;
+}
+
+// Domain-specific errors
+class DatabaseError extends AppError {
+  readonly _tag = 'DatabaseError';
+  constructor(readonly query: string, readonly cause: unknown) { super(); }
+}
+
+class NetworkError extends AppError {
+  readonly _tag = 'NetworkError';
+  constructor(readonly url: string, readonly status: number) { super(); }
+}
+
+class ValidationError extends AppError {
+  readonly _tag = 'ValidationError';
+  constructor(readonly field: string, readonly message: string) { super(); }
+}
+
+class NotFoundError extends AppError {
+  readonly _tag = 'NotFoundError';
+  constructor(readonly resource: string, readonly id: string) { super(); }
+}
+
+// Exhaustive error handling
+function formatError(error: AppError): string {
+  switch (error._tag) {
+    case 'DatabaseError':
+      return `Database error on query: ${error.query}`;
+    case 'NetworkError':
+      return `Network error: ${error.url} returned ${error.status}`;
+    case 'ValidationError':
+      return `Validation error on ${error.field}: ${error.message}`;
+    case 'NotFoundError':
+      return `${error.resource} not found: ${error.id}`;
+  }
+}
+```
+
+### Pattern 2: Service Layer with Dependencies
+
+Effect's service layer pattern provides dependency injection with full type safety:
+
+```typescript
+import { Context, Layer, Effect } from 'effect';
+
+// Define service interfaces
+class DatabaseService extends Context.Tag('DatabaseService')<
+  DatabaseService,
+  {
+    readonly query: <T>(sql: string, params: unknown[]) => Effect.Effect<T, DatabaseError>;
+    readonly transaction: <T>(fn: () => Effect.Effect<T, DatabaseError>) => Effect.Effect<T, DatabaseError>;
+  }
+>() {}
+
+class CacheService extends Context.Tag('CacheService')<
+  CacheService,
+  {
+    readonly get: <T>(key: string) => Effect.Effect<T | null, never>;
+    readonly set: <T>(key: string, value: T, ttl: number) => Effect.Effect<void, never>;
+  }
+>() {}
+
+// Implement services
+const DatabaseLive = Layer.succeed(DatabaseService, {
+  query: (sql, params) =>
+    Effect.tryPromise({
+      try: () => db.execute(sql, params),
+      catch: (error) => new DatabaseError(sql, error),
+    }),
+  transaction: (fn) =>
+    Effect.gen(function* () {
+      yield* Effect.tryPromise({ try: () => db.beginTransaction(), catch: (e) => new DatabaseError('BEGIN', e) });
+      const result = yield* fn();
+      yield* Effect.tryPromise({ try: () => db.commit(), catch: (e) => new DatabaseError('COMMIT', e) });
+      return result;
+    }),
+});
+
+const CacheLive = Layer.succeed(CacheService, {
+  get: (key) =>
+    Effect.tryPromise({
+      try: () => redis.get(key).then((v) => (v ? JSON.parse(v) : null)),
+      catch: () => null,
+    }),
+  set: (key, value, ttl) =>
+    Effect.tryPromise({
+      try: () => redis.set(key, JSON.stringify(value), 'EX', ttl),
+      catch: () => undefined,
+    }),
+});
+```
+
+### Pattern 3: Composable Business Logic
+
+```typescript
+// Business logic using services — fully typed, composable
+function getUserById(id: string) {
+  return Effect.gen(function* () {
+    const db = yield* DatabaseService;
+    const cache = yield* CacheService;
+
+    // Check cache first
+    const cached = yield* cache.get<User>(`user:${id}`);
+    if (cached) return cached;
+
+    // Query database
+    const users = yield* db.query<User[]>(
+      'SELECT * FROM users WHERE id = $1',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return yield* Effect.fail(new NotFoundError('User', id));
+    }
+
+    const user = users[0];
+
+    // Cache for 5 minutes
+    yield* cache.set(`user:${id}`, user, 300);
+
+    return user;
+  });
+}
+
+// Compose multiple operations
+function processOrder(orderId: string) {
+  return Effect.gen(function* () {
+    const db = yield* DatabaseService;
+
+    const order = yield* db.query<Order[]>(
+      'SELECT * FROM orders WHERE id = $1',
+      [orderId]
+    );
+
+    if (order.length === 0) {
+      return yield* Effect.fail(new NotFoundError('Order', orderId));
+    }
+
+    const user = yield* getUserById(order[0].userId);
+    const payment = yield* processPayment(user, order[0]);
+
+    return { order: order[0], user, payment };
+  });
+}
+```
+
+### Pattern 4: Error Recovery and Retry
+
+```typescript
+import { Schedule } from 'effect';
+
+// Retry with exponential backoff
+function fetchWithRetry(url: string) {
+  return Effect.retry(
+    Effect.tryPromise({
+      try: () => fetch(url).then((r) => r.json()),
+      catch: (error) => new NetworkError(url, 0),
+    }),
+    Schedule.exponential('100 millis').pipe(
+      Schedule.compose(Schedule.recurs(3)) // Max 3 retries
+    )
+  );
+}
+
+// Recover from specific errors
+function getUserWithFallback(id: string) {
+  return getUserById(id).pipe(
+    Effect.catchTag('NetworkError', (error) =>
+      Effect.succeed(getDefaultUser()) // Fallback on network error
+    ),
+    Effect.catchTag('NotFoundError', (error) =>
+      Effect.succeed(getAnonymousUser()) // Fallback on not found
+    )
+  );
+}
+```
+
+## Step-by-Step Implementation
+
+Let's build a complete API service with Effect, demonstrating error handling, service layers, and concurrency.
+
+### Setting Up Effect
+
+```bash
+npm install effect
+```
+
+### Defining the Error Hierarchy
+
+```typescript
+// src/errors.ts
+export class DatabaseError {
+  readonly _tag = 'DatabaseError';
+  constructor(readonly query: string, readonly cause: unknown) {}
+}
+
+export class NetworkError {
+  readonly _tag = 'NetworkError';
+  constructor(readonly url: string, readonly status: number) {}
+}
+
+export class ValidationError {
+  readonly _tag = 'ValidationError';
+  constructor(readonly field: string, readonly message: string) {}
+}
+
+export class NotFoundError {
+  readonly _tag = 'NotFoundError';
+  constructor(readonly resource: string, readonly id: string) {}
+}
+
+export class AuthenticationError {
+  readonly _tag = 'AuthenticationError';
+  constructor(readonly reason: string) {}
+}
+
+export type AppError =
+  | DatabaseError
+  | NetworkError
+  | ValidationError
+  | NotFoundError
+  | AuthenticationError;
+```
+
+### Defining Services
+
+```typescript
+// src/services/database.ts
+import { Context, Layer, Effect } from 'effect';
+import { DatabaseError } from '../errors';
+
+export class DatabaseService extends Context.Tag('DatabaseService')<
+  DatabaseService,
+  {
+    readonly query: <T>(sql: string, params?: unknown[]) => Effect.Effect<T, DatabaseError>;
+    readonly execute: (sql: string, params?: unknown[]) => Effect.Effect<void, DatabaseError>;
+  }
+>() {}
+
+export const DatabaseLive = Layer.succeed(DatabaseService, {
+  query: (sql, params = []) =>
+    Effect.tryPromise({
+      try: () => db.execute(sql, params),
+      catch: (error) => new DatabaseError(sql, error),
+    }),
+  execute: (sql, params = []) =>
+    Effect.tryPromise({
+      try: () => db.execute(sql, params),
+      catch: (error) => new DatabaseError(sql, error),
+    }),
+});
+```
+
+### Building the Application
+
+```typescript
+// src/main.ts
+import { Effect, pipe } from 'effect';
+import { DatabaseService, DatabaseLive } from './services/database';
+import { AppError, NotFoundError, ValidationError } from './errors';
+
+// User service
+function getUser(id: string) {
+  return Effect.gen(function* () {
+    if (!id) {
+      return yield* Effect.fail(new ValidationError('id', 'User ID is required'));
+    }
+
+    const db = yield* DatabaseService;
+    const users = yield* db.query<User[]>(
+      'SELECT * FROM users WHERE id = $1',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return yield* Effect.fail(new NotFoundError('User', id));
+    }
+
+    return users[0];
+  });
+}
+
+// Order service with dependencies
+function createOrder(userId: string, items: OrderItem[]) {
+  return Effect.gen(function* () {
+    const db = yield* DatabaseService;
+
+    // Validate user exists
+    const user = yield* getUser(userId);
+
+    // Validate items
+    if (items.length === 0) {
+      return yield* Effect.fail(new ValidationError('items', 'Order must have at least one item'));
+    }
+
+    // Calculate total
+    const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+    // Create order
+    yield* db.execute(
+      'INSERT INTO orders (user_id, total, items) VALUES ($1, $2, $3)',
+      [userId, total, JSON.stringify(items)]
+    );
+
+    return { userId, total, itemCount: items.length };
+  });
+}
+
+// Run the application
+const program = createOrder('user-123', [
+  { productId: 'prod-1', quantity: 2, price: 29.99 },
+  { productId: 'prod-2', quantity: 1, price: 49.99 },
+]);
+
+// Provide dependencies and run
+Effect.runPromise(
+  program.pipe(Effect.provide(DatabaseLive))
+).then((order) => {
+  console.log('Order created:', order);
+}).catch((error) => {
+  console.error('Failed:', formatError(error));
+});
+```
+
+![Effect service layer architecture diagram](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: API Gateway Error Handling
+
+An API gateway handling 10 million requests per day replaced `try/catch` with Effect. Every API call now has typed errors — `NetworkError`, `RateLimitError`, `AuthenticationError`, `ValidationError`. The error type system caught 12 unhandled error paths during migration, and error response formatting became exhaustive (TypeScript ensures every error type is handled).
+
+### Use Case 2: Data Pipeline
+
+A data pipeline processing 100GB of CSV files daily uses Effect for composable error handling. Each pipeline stage (parse, validate, transform, load) returns an Effect with specific error types. Failed records are isolated and retried without stopping the pipeline. The type system ensures that every stage's error contract is honored by downstream stages.
+
+### Use Case 3: Microservice Communication
+
+A microservice architecture with 15 services uses Effect's service layer for dependency injection. Each service is defined as an Effect service with typed errors. In production, services are provided with real implementations; in tests, they're replaced with mock implementations. The type system ensures mocks match the real service contract.
+
+## Best Practices for Production
+
+1. **Define errors as classes with `_tag` discriminants**: Use `_tag` for exhaustive pattern matching in error handlers. This ensures every error type is handled — TypeScript will warn you about unhandled cases.
+
+2. **Use `Effect.gen` for readability**: The generator syntax (`yield*`) makes Effect code read like imperative code while maintaining full type safety. Avoid deeply nested `pipe` chains for complex logic.
+
+3. **Separate error types from business logic**: Define error types in a dedicated module. This makes them reusable across services and prevents circular dependencies.
+
+4. **Use service layers for dependency injection**: Define services with `Context.Tag`, implement them with `Layer.succeed`, and provide them with `Effect.provide`. This makes testing trivial — swap real implementations with mocks.
+
+5. **Use `Effect.catchTag` for specific error recovery**: Handle specific error types without losing type information. Use `Effect.catchAll` only when you want to handle all errors uniformly.
+
+6. **Leverage `Effect.retry` for transient failures**: Network calls, database queries, and external API calls should be retried with exponential backoff. Use `Schedule` for composable retry policies.
+
+7. **Run effects with `Effect.runPromise` or `Effect.runFork`**: Use `runPromise` when you need the result as a Promise (e.g., in Express handlers). Use `runFork` for fire-and-forget operations.
+
+8. **Use `Effect.tap` for logging side effects**: Log errors and successes without modifying the effect's value or type: `effect.pipe(Effect.tap((result) => log(result)))`.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Throwing exceptions inside Effects | Unhandled errors, type unsafety | Use `Effect.fail` to return errors as values |
+| Using `any` for error types | Loses type safety | Define specific error types with `_tag` |
+| Not providing service dependencies | Runtime errors | Use `Effect.provide` to supply all dependencies |
+| Deeply nested `pipe` chains | Unreadable code | Use `Effect.gen` with `yield*` for readability |
+| Ignoring error types in composition | Missing error handling | Let TypeScript infer error unions; handle all cases |
+| Not using `Effect.tap` for logging | Side effects in effect chain | Use `Effect.tap` for logging without modifying values |
+
+## Performance Optimization
+
+Effect is designed for performance. Here's how to leverage its built-in optimizations:
+
+```typescript
+// Parallel execution with Effect
+const users = yield* Effect.forEach(
+  userIds,
+  (id) => getUser(id),
+  { concurrency: 10 } // Run 10 at a time
+);
+
+// Race multiple sources — use first response
+const data = yield* Effect.race(
+  fetchFromPrimary(url),
+  fetchFromBackup(url)
+);
+
+// Timeout protection
+const result = yield* fetchUser(id).pipe(
+  Effect.timeout('5 seconds'),
+  Effect.catchTag('TimeoutException', () =>
+    Effect.succeed(getDefaultUser())
+  )
+);
+```
+
+## Comparison with Alternatives
+
+| Feature | Effect | neverthrow | fp-ts | try/catch |
+|---------|--------|-----------|-------|-----------|
+| Typed Errors | Yes (full inference) | Yes (Result type) | Yes (Either) | No (unknown) |
+| Service Layers | Yes (Context.Tag) | No | Manual | No |
+| Concurrency | Built-in (fibers) | No | No | No |
+| Retry Logic | Built-in (Schedule) | No | No | No |
+| Learning Curve | Steep | Moderate | Steep | Low |
+| Bundle Size | ~50KB | ~5KB | ~30KB | 0 |
+| TypeScript Integration | Excellent | Good | Good | Native |
+| Ecosystem | Growing | Small | Mature | Universal |
+
+## Advanced Patterns
+
+### Effect with HTTP Server
+
+```typescript
+import { Effect } from 'effect';
+import express from 'express';
+
+const app = express();
+
+// Express handler using Effect
+app.get('/api/users/:id', async (req, res) => {
+  const program = getUser(req.params.id).pipe(
+    Effect.provide(DatabaseLive),
+    Effect.match({
+      onSuccess: (user) => res.json(user),
+      onFailure: (error) => {
+        switch (error._tag) {
+          case 'NotFoundError':
+            return res.status(404).json({ error: error.message });
+          case 'ValidationError':
+            return res.status(400).json({ error: error.message });
+          default:
+            return res.status(500).json({ error: 'Internal server error' });
+        }
+      },
+    })
+  );
+
+  await Effect.runPromise(program);
+});
+```
+
+### Schema Validation with Effect
+
+```typescript
+import { Schema } from 'effect';
+
+// Define schema with validation
+const UserSchema = Schema.Struct({
+  id: Schema.String.pipe(Schema.nonEmpty()),
+  email: Schema.String.pipe(Schema.pattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)),
+  age: Schema.Number.pipe(Schema.between(0, 150)),
+});
+
+type User = Schema.Schema.Type<typeof UserSchema>;
+
+// Validate with full error reporting
+function validateUser(data: unknown) {
+  return Schema.decodeUnknown(UserSchema)(data).pipe(
+    Effect.mapError((error) =>
+      new ValidationError('user', error.message)
+    )
+  );
+}
+```
+
+## Testing Strategies
+
+```typescript
+import { Effect, Layer } from 'effect';
+import { describe, it, expect } from 'vitest';
+
+// Mock database service
+const DatabaseTest = Layer.succeed(DatabaseService, {
+  query: (sql, params) =>
+    Effect.succeed([{ id: '1', name: 'Test User', email: 'test@example.com' }]),
+  execute: () => Effect.succeed(undefined),
+});
+
+describe('getUser', () => {
+  it('returns user when found', async () => {
+    const program = getUser('1').pipe(Effect.provide(DatabaseTest));
+    const user = await Effect.runPromise(program);
+
+    expect(user.id).toBe('1');
+    expect(user.name).toBe('Test User');
+  });
+
+  it('fails with NotFoundError when user does not exist', async () => {
+    const DatabaseEmpty = Layer.succeed(DatabaseService, {
+      query: () => Effect.succeed([]),
+      execute: () => Effect.succeed(undefined),
+    });
+
+    const program = getUser('999').pipe(
+      Effect.provide(DatabaseEmpty),
+      Effect.flip // Convert failure to success for assertion
+    );
+
+    const error = await Effect.runPromise(program);
+    expect(error._tag).toBe('NotFoundError');
+  });
+});
+```
+
+## Future Outlook
+
+Effect is rapidly maturing. The Effect ecosystem now includes Schema (validation), Platform (HTTP server/client), RPC (type-safe remote calls), and Cluster (distributed systems). Major companies are adopting Effect for production TypeScript applications.
+
+The TypeScript team is exploring features that would benefit Effect: `do` expressions, pipe operator, and pattern matching. These language features would make Effect code even more ergonomic. Meanwhile, Effect's own API is becoming more approachable with better documentation and tooling.
 
 ## Conclusion
 
-Effect-TS: Type-Safe Error Handling in TypeScript is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Effect-TS transforms TypeScript error handling from a runtime guessing game into a compile-time guarantee. By making errors part of the type system, Effect catches error handling bugs before they reach production. By providing service layers and composability, Effect makes complex applications maintainable.
+
+Key takeaways:
+1. Define errors as classes with `_tag` discriminants for exhaustive pattern matching
+2. Use `Effect.gen` with `yield*` for readable, imperative-style code
+3. Define services with `Context.Tag` for dependency injection
+4. Use `Effect.catchTag` for specific error recovery, `Effect.catchAll` for general handling
+5. Leverage `Effect.retry` with `Schedule` for transient failure handling
+6. Run effects with `Effect.runPromise` for Express/Next.js integration
+
+The learning curve is steep, but the payoff is substantial: type-safe, composable, testable business logic with no unhandled errors. Start with a single service, migrate one error path at a time, and let the type system guide you toward correctness.

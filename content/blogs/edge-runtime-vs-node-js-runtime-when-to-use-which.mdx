@@ -9,54 +9,594 @@ author: "MinhVo"
 
 ## Introduction
 
-Edge Runtime vs Node.js Runtime: When to Use Which is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Choosing between the Edge Runtime and the Node.js Runtime is one of the most consequential architectural decisions in modern web development. The Edge Runtime promises global low latency, instant cold starts, and automatic scaling across 300+ locations. The Node.js Runtime offers the full power of Node.js — filesystem access, native modules, unlimited execution time, and a decade of ecosystem maturity.
 
-## Key Concepts
+The choice is not always obvious. A Next.js developer might assume that Edge Runtime is always better because it's faster, but the Edge Runtime lacks Node.js APIs like `fs`, `child_process`, and `crypto` (the Node.js module). A developer building a file processing service might assume Node.js is always necessary, but edge caching and request transformation can handle most of the work.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide provides a clear framework for choosing between Edge and Node.js runtimes. We'll compare them across API surface, performance characteristics, limitations, and real-world use cases. By the end, you'll know exactly which runtime to use for each part of your application.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Server architecture comparison diagram](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding the Runtimes: Core Concepts
 
-Let's look at a practical example:
+### What is the Edge Runtime
+
+The Edge Runtime is a lightweight JavaScript runtime based on Web Standard APIs. It was popularized by Cloudflare Workers and is now supported by Vercel Edge Functions, Deno Deploy, and other platforms. The Edge Runtime is designed for speed — it starts in under 5ms, executes in under 50ms, and runs at 300+ locations worldwide.
+
+The Edge Runtime provides these Web Standard APIs:
+- `fetch` — HTTP requests
+- `Request` / `Response` — HTTP primitives
+- `URL` / `URLSearchParams` — URL parsing
+- `Headers` — HTTP headers
+- `TextEncoder` / `TextDecoder` — Text encoding
+- `crypto.subtle` — Cryptographic operations
+- `ReadableStream` / `WritableStream` — Streaming
+- `console` — Logging
+- `setTimeout` / `clearTimeout` — Timers (limited)
+
+The Edge Runtime does NOT provide:
+- `fs` — Filesystem access
+- `child_process` — Process spawning
+- `net` / `dgram` — Network sockets
+- `crypto` (Node.js) — Use `crypto.subtle` instead
+- `Buffer` — Use `Uint8Array` instead
+- `process` (limited) — No `process.env` in some runtimes
+
+### What is the Node.js Runtime
+
+The Node.js Runtime is the standard server-side JavaScript runtime. It provides the full Node.js API surface, including filesystem access, native modules, networking, and process management. In serverless platforms like Vercel, AWS Lambda, and Google Cloud Functions, the Node.js Runtime runs your code in a managed environment with automatic scaling.
+
+The Node.js Runtime provides everything Edge doesn't:
+- `fs` — Read/write files
+- `child_process` — Spawn processes
+- `net` / `dgram` / `http` — Low-level networking
+- `crypto` — Full cryptographic API
+- `Buffer` — Binary data handling
+- `process` — Full process API including `process.env`
+- Native modules (C/C++ addons)
+- Unlimited execution time (within reason)
+
+### The API Surface Gap
+
+The fundamental difference between the two runtimes is the API surface. The Edge Runtime provides only Web Standard APIs — the same APIs available in browsers. The Node.js Runtime provides both Web Standard APIs and Node.js-specific APIs.
+
+This means code that uses only Web Standard APIs (fetch, Request, Response, URL, crypto.subtle) works in both runtimes. Code that uses Node.js-specific APIs (fs, child_process, crypto, Buffer) only works in the Node.js Runtime.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Works in BOTH runtimes (Web Standard APIs)
+const response = await fetch('https://api.example.com/data');
+const data = await response.json();
+const url = new URL('https://example.com/path?query=value');
+const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('data'));
+
+// Works ONLY in Node.js Runtime
+import fs from 'fs';
+import { execSync } from 'child_process';
+import crypto from 'crypto';
+const buffer = Buffer.from('data');
+const file = fs.readFileSync('/path/to/file');
+```
+
+![Runtime comparison architecture diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### The Hybrid Architecture Pattern
+
+The most effective architecture uses both runtimes — Edge for latency-sensitive operations and Node.js for heavy computation:
+
+```typescript
+// Next.js: Choose runtime per route
+// app/api/auth/route.ts — Edge Runtime for fast auth
+export const runtime = 'edge';
+
+export async function POST(request: Request) {
+  const token = request.headers.get('Authorization')?.slice(7);
+  if (!token) {
+    return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  // JWT verification with Web Crypto (edge-compatible)
+  const payload = await verifyJWT(token, process.env.JWT_SECRET!);
+  return Response.json({ user: payload });
+}
+
+// app/api/upload/route.ts — Node.js Runtime for file processing
+export const runtime = 'nodejs';
+
+import { writeFile } from 'fs/promises';
+import { join } from 'path';
+
+export async function POST(request: Request) {
+  const formData = await request.formData();
+  const file = formData.get('file') as File;
+
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const path = join(process.cwd(), 'uploads', file.name);
+  await writeFile(path, buffer);
+
+  return Response.json({ path });
 }
 ```
 
-This pattern demonstrates the core approach to implementing Edge solutions in production environments.
+### The Edge-First with Node.js Fallback Pattern
 
-## Best Practices
+Design for the edge by default, but fall back to Node.js when edge limitations are hit:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// Determine runtime based on requirements
+function getRuntime(requirements: {
+  needsFileSystem?: boolean;
+  needsNativeModules?: boolean;
+  needsLongExecution?: boolean;
+  needsEdgeLatency?: boolean;
+}): 'edge' | 'nodejs' {
+  // These requirements force Node.js
+  if (requirements.needsFileSystem) return 'nodejs';
+  if (requirements.needsNativeModules) return 'nodejs';
+  if (requirements.needsLongExecution) return 'nodejs';
 
-## Common Pitfalls
+  // Default to edge for latency benefits
+  return 'edge';
+}
+
+// Route configuration
+const routes = [
+  { path: '/api/auth/*', runtime: 'edge' },           // Auth: fast
+  { path: '/api/products/*', runtime: 'edge' },       // Reads: fast
+  { path: '/api/upload/*', runtime: 'nodejs' },        // Upload: needs fs
+  { path: '/api/export/*', runtime: 'nodejs' },        // Export: needs time
+  { path: '/api/analytics/*', runtime: 'nodejs' },     // Analytics: needs compute
+  { path: '/api/search/*', runtime: 'edge' },          // Search: fast
+];
+```
+
+### The Runtime-Agnostic Library Pattern
+
+Write libraries that work in both runtimes by using Web Standard APIs:
+
+```typescript
+// Runtime-agnostic HTTP client
+export class HttpClient {
+  private baseUrl: string;
+  private headers: Record<string, string>;
+
+  constructor(baseUrl: string, headers: Record<string, string> = {}) {
+    this.baseUrl = baseUrl;
+    this.headers = headers;
+  }
+
+  async get<T>(path: string): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      headers: this.headers,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  async post<T>(path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { ...this.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+}
+
+// Works in BOTH edge and Node.js runtimes
+const api = new HttpClient('https://api.example.com', {
+  Authorization: `Bearer ${token}`,
+});
+const users = await api.get<User[]>('/users');
+```
+
+## Step-by-Step Implementation
+
+Let's build a Next.js application that uses both runtimes optimally.
+
+### Setting Up the Hybrid Application
+
+```bash
+npx create-next-app@latest hybrid-app --typescript
+cd hybrid-app
+```
+
+### Edge Routes — Authentication and API Gateway
+
+```typescript
+// middleware.ts — Edge Runtime (runs on every request)
+import { NextRequest, NextResponse } from 'next/server';
+
+export const config = {
+  matcher: ['/api/:path*', '/dashboard/:path*'],
+};
+
+export async function middleware(request: NextRequest) {
+  const start = Date.now();
+
+  // Authentication check at the edge
+  const token = request.cookies.get('auth-token')?.value;
+
+  if (!token && isProtectedRoute(request.nextUrl.pathname)) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  // Rate limiting at the edge
+  const ip = request.ip || request.headers.get('x-forwarded-for') || 'unknown';
+  const rateLimitKey = `rate:${ip}`;
+
+  // Check rate limit (using edge KV or in-memory)
+  const isRateLimited = await checkRateLimit(rateLimitKey);
+  if (isRateLimited) {
+    return NextResponse.json(
+      { error: 'Rate limit exceeded' },
+      { status: 429 }
+    );
+  }
+
+  // Geo-based routing
+  const country = request.geo?.country || 'US';
+  const response = NextResponse.next();
+
+  response.headers.set('X-Edge-Time', `${Date.now() - start}ms`);
+  response.headers.set('X-User-Country', country);
+
+  return response;
+}
+
+function isProtectedRoute(path: string): boolean {
+  return path.startsWith('/dashboard') || path.startsWith('/api/account');
+}
+```
+
+```typescript
+// app/api/auth/login/route.ts — Edge Runtime
+export const runtime = 'edge';
+
+export async function POST(request: Request) {
+  const { email, password } = await request.json();
+
+  // Verify credentials (edge-compatible: use Web Crypto)
+  const hashedPassword = await hashPassword(password);
+  const user = await verifyCredentials(email, hashedPassword);
+
+  if (!user) {
+    return Response.json({ error: 'Invalid credentials' }, { status: 401 });
+  }
+
+  // Create JWT at the edge
+  const token = await createJWT({ sub: user.id, email: user.email });
+
+  return Response.json(
+    { user, token },
+    {
+      headers: {
+        'Set-Cookie': `auth-token=${token}; HttpOnly; Secure; SameSite=Strict; Path=/`,
+      },
+    }
+  );
+}
+```
+
+### Node.js Routes — File Processing and Heavy Computation
+
+```typescript
+// app/api/export/route.ts — Node.js Runtime
+export const runtime = 'nodejs';
+
+import { NextRequest } from 'next/server';
+import { Parser } from 'json2csv';
+import { createReadStream } from 'fs';
+import { pipeline } from 'stream/promises';
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const format = searchParams.get('format') || 'csv';
+
+  // Fetch data from database
+  const data = await fetchAnalyticsData();
+
+  if (format === 'csv') {
+    const parser = new Parser();
+    const csv = parser.parse(data);
+
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': 'attachment; filename=export.csv',
+      },
+    });
+  }
+
+  return Response.json(data);
+}
+```
+
+```typescript
+// app/api/images/process/route.ts — Node.js Runtime
+export const runtime = 'nodejs';
+
+import sharp from 'sharp';
+import { writeFile, readFile } from 'fs/promises';
+import { join } from 'path';
+
+export async function POST(request: Request) {
+  const formData = await request.formData();
+  const file = formData.get('image') as File;
+  const width = parseInt(formData.get('width') as string) || 800;
+  const height = parseInt(formData.get('height') as string) || 600;
+
+  const buffer = Buffer.from(await file.arrayBuffer());
+
+  // Image processing with sharp (native module — Node.js only)
+  const processed = await sharp(buffer)
+    .resize(width, height, { fit: 'cover' })
+    .webp({ quality: 80 })
+    .toBuffer();
+
+  const filename = `${Date.now()}-${file.name.replace(/\.[^.]+$/, '.webp')}`;
+  const filepath = join(process.cwd(), 'public', 'uploads', filename);
+
+  await writeFile(filepath, processed);
+
+  return Response.json({ path: `/uploads/${filename}` });
+}
+```
+
+### Runtime-Agnostic Service Layer
+
+```typescript
+// lib/services/product.ts — Works in both runtimes
+export class ProductService {
+  private dbUrl: string;
+  private authToken: string;
+
+  constructor(dbUrl: string, authToken: string) {
+    this.dbUrl = dbUrl;
+    this.authToken = authToken;
+  }
+
+  async getById(id: string): Promise<Product | null> {
+    // Uses fetch (Web Standard) — works in both runtimes
+    const response = await fetch(`${this.dbUrl}/products/${id}`, {
+      headers: { Authorization: `Bearer ${this.authToken}` },
+    });
+
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`Failed to fetch product: ${response.status}`);
+
+    return response.json();
+  }
+
+  async list(category: string, page: number): Promise<Product[]> {
+    const response = await fetch(
+      `${this.dbUrl}/products?category=${category}&page=${page}`,
+      { headers: { Authorization: `Bearer ${this.authToken}` } }
+    );
+
+    return response.json();
+  }
+}
+
+// Usage in edge route
+export const runtime = 'edge';
+export async function GET(request: Request) {
+  const service = new ProductService(env.DB_URL, env.DB_TOKEN);
+  const products = await service.list('electronics', 1);
+  return Response.json(products);
+}
+
+// Usage in Node.js route
+export const runtime = 'nodejs';
+export async function GET(request: Request) {
+  const service = new ProductService(process.env.DB_URL!, process.env.DB_TOKEN!);
+  const products = await service.list('electronics', 1);
+  return Response.json(products);
+}
+```
+
+![Performance comparison chart between edge and Node.js](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: Authentication at the Edge, Business Logic in Node.js
+
+A SaaS platform uses Edge Runtime for JWT verification, rate limiting, and geo-routing. All business logic (database queries, payment processing, email sending) runs in Node.js. The edge layer reduces auth latency from 150ms to 5ms, while the Node.js layer handles complex operations that require filesystem access and native modules.
+
+### Use Case 2: API Gateway at the Edge, Microservices in Node.js
+
+An API gateway running at the edge handles authentication, request routing, caching, and response transformation. Individual microservices run in Node.js with full access to databases, message queues, and native modules. The edge gateway reduces latency by 80ms on average because requests are authenticated and routed before reaching the origin.
+
+### Use Case 3: Content Rendering at the Edge, Data Processing in Node.js
+
+A content platform renders article pages at the edge using server-side rendering. Data processing (image optimization, content indexing, analytics aggregation) runs in Node.js. Users get sub-20ms page loads from the edge, while background processing happens asynchronously in Node.js.
+
+## Best Practices for Production
+
+1. **Default to Edge for latency-sensitive routes**: Authentication, API routing, caching, and geo-routing belong at the edge. Use Edge Runtime for these by default.
+
+2. **Use Node.js for file operations**: Any route that reads/writes files, processes images, or handles uploads must use Node.js Runtime. The edge has no filesystem.
+
+3. **Use Node.js for native modules**: Libraries like `sharp`, `prisma`, `bcrypt`, and `canvas` require native binaries that don't work at the edge. Use Node.js Runtime for these.
+
+4. **Write runtime-agnostic services**: Use `fetch` instead of `axios`, `Uint8Array` instead of `Buffer`, `crypto.subtle` instead of `crypto`. This allows services to work in both runtimes.
+
+5. **Monitor runtime-specific performance**: Track cold start times, execution duration, and memory usage separately for edge and Node.js routes. Edge routes should have <5ms cold starts; Node.js routes may have 100-500ms cold starts.
+
+6. **Use middleware for cross-cutting concerns**: Next.js middleware runs at the edge by default. Use it for authentication, rate limiting, and geo-routing. Don't duplicate this logic in Node.js routes.
+
+7. **Test both runtimes**: Some bugs only manifest in one runtime. A library that works in Node.js may fail at the edge due to missing APIs. Test routes in both environments.
+
+8. **Plan for edge limitations**: The edge has execution time limits (50ms typical), bundle size limits (1MB), and no persistent state. Design edge routes to work within these constraints.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using Node.js APIs in edge routes | Runtime errors at edge | Use Web Standard APIs or switch to Node.js Runtime |
+| Large bundles at edge | Slow cold starts, size limit errors | Tree-shake, use dynamic imports, keep under 1MB |
+| File operations in edge routes | Crashes | Move file routes to Node.js Runtime |
+| Native modules in edge | Import errors | Use pure JavaScript alternatives or Node.js Runtime |
+| Assuming Buffer available | ReferenceError at edge | Use Uint8Array and TextEncoder/TextDecoder |
+| Long-running tasks at edge | Execution timeout | Move to Node.js Runtime or use background tasks |
+
+## Performance Optimization
+
+```typescript
+// Benchmark: Edge vs Node.js cold start times
+async function benchmarkColdStarts() {
+  // Edge cold start measurement
+  const edgeStart = performance.now();
+  await fetch('https://edge-app.workers.dev/api/health');
+  const edgeCold = performance.now() - edgeStart;
+
+  // Node.js cold start measurement
+  const nodeStart = performance.now();
+  await fetch('https://node-app.vercel.app/api/health');
+  const nodeCold = performance.now() - nodeStart;
+
+  console.log(`Edge cold start: ${edgeCold.toFixed(1)}ms`);
+  console.log(`Node.js cold start: ${nodeCold.toFixed(1)}ms`);
+  console.log(`Edge is ${(nodeCold / edgeCold).toFixed(1)}x faster`);
+}
+
+// Typical results:
+// Edge cold start: 5-20ms
+// Node.js cold start: 100-500ms
+// Edge is 10-25x faster
+```
+
+## Comparison with Alternatives
+
+| Feature | Edge Runtime | Node.js Runtime | Cloudflare Workers | Deno |
+|---------|-------------|----------------|-------------------|------|
+| Cold Start | 5-20ms | 100-500ms | 5-15ms | 10-30ms |
+| Execution Limit | 50ms typical | 15 min (Lambda) | 30s (free), 15min (paid) | 50ms (Deploy) |
+| File System | No | Yes | No | Yes (Deno) |
+| Native Modules | No | Yes | No | Limited |
+| Node.js APIs | No | Yes | Partial | Partial |
+| Web Standard APIs | Yes | Yes | Yes | Yes |
+| Bundle Size Limit | 1MB | 250MB (Lambda) | 10MB (paid) | 10MB |
+| Global Distribution | Yes (300+) | Single region | Yes (300+) | Yes (35) |
+| npm Compatibility | Limited | Full | Partial | Growing |
+
+## Advanced Patterns
+
+### Runtime Detection and Dynamic Import
+
+```typescript
+// Detect runtime and load appropriate module
+async function getDatabaseClient() {
+  // Check if we're in the edge runtime
+  const isEdge = typeof globalThis.EdgeRuntime !== 'undefined' ||
+                 typeof process === 'undefined';
+
+  if (isEdge) {
+    // Use edge-compatible HTTP-based client
+    const { createClient } = await import('@libsql/client');
+    return createClient({
+      url: process.env.TURSO_URL!,
+      authToken: process.env.TURSO_AUTH_TOKEN!,
+    });
+  } else {
+    // Use traditional Node.js database client
+    const { Pool } = await import('pg');
+    return new Pool({ connectionString: process.env.DATABASE_URL });
+  }
+}
+```
+
+### Edge Proxy with Node.js Processing
+
+```typescript
+// Edge middleware that proxies to Node.js for heavy processing
+export const config = { runtime: 'edge' };
+
+export async function middleware(request: NextRequest) {
+  const url = request.nextUrl.pathname;
+
+  // Only proxy specific routes to Node.js
+  if (url.startsWith('/api/process/')) {
+    // Rewrite to a Node.js API route
+    return NextResponse.rewrite(new URL(`/api/node-process${url}`, request.url));
+  }
+
+  return NextResponse.next();
+}
+```
+
+## Testing Strategies
+
+```typescript
+// Test edge routes with Cloudflare's local dev server
+import { unstable_dev } from 'wrangler';
+
+describe('Edge Routes', () => {
+  let edgeWorker: any;
+
+  beforeAll(async () => {
+    edgeWorker = await unstable_dev('src/edge-handler.ts');
+  });
+
+  afterAll(async () => {
+    await edgeWorker.stop();
+  });
+
+  test('edge auth returns fast', async () => {
+    const start = performance.now();
+    const resp = await edgeWorker.fetch('/api/auth/me');
+    const latency = performance.now() - start;
+
+    expect(latency).toBeLessThan(50);
+  });
+});
+
+// Test Node.js routes with standard test runner
+describe('Node.js Routes', () => {
+  test('file upload processes correctly', async () => {
+    const formData = new FormData();
+    formData.append('image', new File(['test'], 'test.jpg'));
+
+    const resp = await fetch('http://localhost:3000/api/images/process', {
+      method: 'POST',
+      body: formData,
+    });
+
+    expect(resp.status).toBe(200);
+    const data = await resp.json();
+    expect(data.path).toMatch(/\.webp$/);
+  });
+});
+```
+
+## Future Outlook
+
+The gap between Edge and Node.js runtimes is narrowing. WebAssembly enables running native modules at the edge. The WebAssembly System Interface (WASI) provides filesystem-like abstractions for edge environments. Projects like WinterCG are standardizing edge runtime APIs across platforms.
+
+Node.js is also adopting Web Standard APIs. The `fetch` API, `crypto.subtle`, and `ReadableStream` are now available in Node.js. As both runtimes converge on Web Standard APIs, code will become increasingly portable between them.
+
+The future is not edge vs Node.js — it's edge AND Node.js, used together in a hybrid architecture that leverages the strengths of each.
 
 ## Conclusion
 
-Edge Runtime vs Node.js Runtime: When to Use Which is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+The Edge Runtime and Node.js Runtime are complementary, not competing. The Edge Runtime excels at latency-sensitive operations that use Web Standard APIs. The Node.js Runtime excels at heavy computation that requires filesystem access and native modules.
+
+Key takeaways:
+1. Use Edge Runtime for auth, routing, caching, and geo-personalization
+2. Use Node.js Runtime for file operations, image processing, and native modules
+3. Write runtime-agnostic code using Web Standard APIs (fetch, crypto.subtle, URL)
+4. Default to Edge for latency-sensitive routes; Node.js for everything else
+5. Monitor both runtimes separately — they have different performance characteristics
+6. Test in both environments to catch runtime-specific bugs
+
+The best architecture uses both runtimes: Edge for the first mile (authentication, routing, caching) and Node.js for the last mile (business logic, data processing, file operations). This hybrid approach gives you the latency benefits of edge computing without sacrificing the power of Node.js.

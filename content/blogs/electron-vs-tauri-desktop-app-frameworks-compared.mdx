@@ -9,54 +9,660 @@ author: "MinhVo"
 
 ## Introduction
 
-Electron vs Tauri: Desktop App Frameworks Compared is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+The desktop application landscape is undergoing a renaissance. For years, Electron dominated cross-platform desktop development, powering iconic applications like Visual Studio Code, Slack, Discord, and Figma. But Electron's approach—bundling an entire Chromium browser engine with each application—has drawn criticism for its memory consumption, bundle size, and security surface area.
 
-## Key Concepts
+Enter Tauri, a framework that takes a fundamentally different architectural approach. Instead of shipping Chromium, Tauri uses the operating system's native webview: WebKit on macOS, WebView2 on Windows, and WebKitGTK on Linux. Combined with a Rust backend that compiles to a tiny native binary, Tauri promises desktop applications that are 90% smaller, use a fraction of the memory, and have a significantly stronger security model.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide provides an in-depth architectural comparison of both frameworks, covering performance benchmarks, security models, developer experience, ecosystem maturity, and practical migration strategies for teams considering the switch.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Desktop application development concept](https://images.unsplash.com/photo-1517694712202-14dd9538aa97?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding the Frameworks: Core Architectural Differences
 
-Let's look at a practical example:
+### Electron's Architecture
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+Electron bundles a complete Chromium rendering engine and Node.js runtime with each application. When a user launches an Electron app, they're essentially starting a Chrome browser that renders a local web application, with full access to Node.js APIs for system-level operations.
+
+```
+┌─────────────────────────────────────┐
+│           Electron Application      │
+│  ┌───────────────┐ ┌─────────────┐  │
+│  │   Main Process │ │   Renderer  │  │
+│  │   (Node.js)    │ │  (Chromium) │  │
+│  │   - File I/O   │ │   - DOM     │  │
+│  │   - IPC        │ │   - CSS     │  │
+│  │   - Native API │ │   - JS      │  │
+│  └───────┬───────┘ └──────┬──────┘  │
+│          │    IPC Bridge   │         │
+│          └────────────────┘         │
+│  ┌─────────────────────────────┐    │
+│  │   Chromium Engine (~150MB)  │    │
+│  │   Node.js Runtime (~40MB)   │    │
+│  └─────────────────────────────┘    │
+└─────────────────────────────────────┘
+```
+
+Every Electron application ships its own copy of Chromium and Node.js. This means if a user has 5 Electron apps installed, they have 5 copies of Chromium consuming disk space and memory. The minimum bundle size for a "hello world" Electron app is approximately 150MB.
+
+### Tauri's Architecture
+
+Tauri takes the opposite approach. Instead of bundling a browser engine, it leverages the webview provided by the operating system. macOS ships with WebKit (Safari's engine), Windows 10/11 includes WebView2 (Edge's Chromium-based engine), and most Linux distributions include WebKitGTK. Tauri's backend is written in Rust, which compiles to a native binary typically under 10MB.
+
+```
+┌─────────────────────────────────────┐
+│           Tauri Application         │
+│  ┌───────────────┐ ┌─────────────┐  │
+│  │   Rust Core   │ │   Frontend  │  │
+│  │   - Commands  │ │   (WebView) │  │
+│  │   - File I/O  │ │   - DOM     │  │
+│  │   - State     │ │   - CSS     │  │
+│  │   - Events    │ │   - JS      │  │
+│  └───────┬───────┘ └──────┬──────┘  │
+│          │  Tauri Bridge   │         │
+│          └────────────────┘         │
+│  ┌─────────────────────────────┐    │
+│  │   OS Native WebView (~0MB)  │    │
+│  │   Rust Binary (~3-8MB)      │    │
+│  └─────────────────────────────┘    │
+└─────────────────────────────────────┘
+```
+
+The Rust backend handles all system-level operations: file I/O, network requests, database access, and native API interactions. The frontend communicates with Rust through an IPC bridge using a command-based pattern similar to HTTP request/response.
+
+### Bundle Size Comparison
+
+| Metric | Electron | Tauri | Difference |
+|--------|----------|-------|------------|
+| Empty app size | ~150MB | ~3-8MB | 95% smaller |
+| Medium app (with deps) | ~200MB | ~10-15MB | 92% smaller |
+| Memory usage (idle) | ~150-300MB | ~30-60MB | 75% less |
+| Memory usage (active) | ~300-500MB | ~50-100MB | 80% less |
+| Startup time | ~2-5s | ~0.5-1s | 75% faster |
+
+![Performance comparison concept](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Electron's Multi-Process Model
+
+Electron uses a multi-process architecture inherited from Chromium. The main process runs Node.js and manages the application lifecycle, window creation, and system tray. Each window runs in its own renderer process with a separate JavaScript context. Communication between processes happens through Electron's IPC (Inter-Process Communication) module.
+
+```javascript
+// main.js (Main Process)
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  win.loadFile('index.html');
+}
+
+ipcMain.handle('read-file', async (event, filePath) => {
+  const fs = require('fs').promises;
+  return fs.readFile(filePath, 'utf-8');
+});
+
+app.whenReady().then(createWindow);
+```
+
+```javascript
+// preload.js (Bridge between main and renderer)
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('electronAPI', {
+  readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
+  onSave: (callback) => ipcRenderer.on('save', callback),
+});
+```
+
+```javascript
+// renderer.js (Frontend)
+async function loadDocument(path) {
+  const content = await window.electronAPI.readFile(path);
+  document.getElementById('editor').value = content;
 }
 ```
 
-This pattern demonstrates the core approach to implementing Electron solutions in production environments.
+### Tauri's Command-Based IPC
 
-## Best Practices
+Tauri uses a command-based IPC model where the frontend invokes Rust functions through a typed bridge. Commands are defined in Rust and automatically generate TypeScript bindings.
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```rust
+// src-tauri/src/main.rs
+use tauri::Manager;
+use serde::{Deserialize, Serialize};
 
-## Common Pitfalls
+#[derive(Serialize, Deserialize)]
+struct Document {
+    title: String,
+    content: String,
+    modified: bool,
+}
+
+#[tauri::command]
+async fn read_file(path: String) -> Result<String, String> {
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_file(path: String, content: String) -> Result<(), String> {
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_system_info() -> SystemInfo {
+    SystemInfo {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        hostname: hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn main() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            read_file,
+            save_file,
+            get_system_info,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+```typescript
+// Frontend (TypeScript)
+import { invoke } from '@tauri-apps/api/core';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
+
+async function openDocument() {
+  const filePath = await open({
+    filters: [{ name: 'Text', extensions: ['txt', 'md'] }],
+  });
+  if (filePath) {
+    const content = await readTextFile(filePath as string);
+    editor.setValue(content);
+  }
+}
+
+async function saveDocument() {
+  const path = await save({
+    filters: [{ name: 'Text', extensions: ['txt', 'md'] }],
+  });
+  if (path) {
+    await writeTextFile(path, editor.getValue());
+  }
+}
+
+// Invoke custom Rust commands with type safety
+const info = await invoke<SystemInfo>('get_system_info');
+console.log(`Running on ${info.os} (${info.arch})`);
+```
+
+### Security Model Comparison
+
+Tauri's security model is fundamentally more restrictive than Electron's by default:
+
+```json
+// Tauri's tauri.conf.json - Capability-based security
+{
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'",
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "windows": ["main"],
+          "permissions": [
+            "core:default",
+            "dialog:default",
+            "fs:allow-read",
+            "fs:allow-write-text-file",
+            "shell:default"
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+In Tauri, the frontend cannot access any system API unless explicitly granted through capabilities. In Electron, the preload script has full Node.js access unless explicitly restricted through `contextIsolation` and careful `contextBridge` design.
+
+| Security Feature | Electron | Tauri |
+|-----------------|----------|-------|
+| Default Node.js access in renderer | Disabled (since v12) | N/A (no Node.js) |
+| CSP support | Manual configuration | Built-in, strict by default |
+| Permission model | Manual IPC filtering | Capability-based, declarative |
+| Remote code execution risk | Higher (Node.js + Chromium) | Lower (Rust + native WebView) |
+| Attack surface | Large (Chromium + Node.js) | Smaller (native WebView + Rust) |
+| Sandbox for renderer | opt-in | Default |
+
+## Step-by-Step Implementation
+
+### Building an Electron App
+
+```bash
+# Create project
+mkdir electron-app && cd electron-app
+npm init -y
+npm install electron --save-dev
+```
+
+```json
+// package.json
+{
+  "name": "my-electron-app",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.example.myapp",
+    "productName": "My App",
+    "mac": { "target": "dmg" },
+    "win": { "target": "nsis" },
+    "linux": { "target": "AppImage" }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}
+```
+
+### Building a Tauri App
+
+```bash
+# Prerequisites: Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Create project with any frontend framework
+npm create tauri-app@latest my-tauri-app
+cd my-tauri-app
+
+# Development
+npm run tauri dev
+
+# Production build
+npm run tauri build
+```
+
+```toml
+# src-tauri/Cargo.toml
+[package]
+name = "my-tauri-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+```
+
+```json
+// src-tauri/tauri.conf.json
+{
+  "$schema": "https://raw.githubusercontent.com/nickel-org/nickel.rs/main/examples/example_assets/schema.json",
+  "productName": "My Tauri App",
+  "version": "0.1.0",
+  "identifier": "com.example.myapp",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "My Tauri App",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'"
+    }
+  }
+}
+```
+
+### Cross-Platform Build Configuration
+
+```yaml
+# .github/workflows/release.yml (Tauri)
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          target: ${{ matrix.target }}
+```
+
+![Cross-platform development](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Use Case 1: Code Editor (VS Code Approach)
+
+Visual Studio Code chose Electron because it needed deep integration with Chromium's DevTools protocol for its extension host, and its extension ecosystem relied on Node.js APIs. The team accepted the bundle size trade-off in exchange for maximum compatibility and the ability to embed web technologies directly. For applications where the extension ecosystem is the primary value proposition, Electron's model is hard to beat.
+
+### Use Case 2: Note-Taking Application
+
+A note-taking app like Obsidian or Notion benefits from Tauri's small footprint. Users install the app once and expect it to launch instantly, consume minimal resources, and run alongside other applications without degrading system performance. Tauri's 5MB binary versus Electron's 200MB makes a significant difference for user perception, especially on lower-end hardware.
+
+### Use Case 3: System Utility Tool
+
+A file management or system monitoring tool needs extensive native API access. Tauri's Rust backend provides direct access to system APIs without the overhead of Node.js native modules. The Rust type system catches many categories of bugs at compile time that JavaScript would surface as runtime crashes. For tools that prioritize reliability and performance, Tauri's architecture provides a stronger foundation.
+
+### Use Case 4: Team Chat Application
+
+Slack and Discord chose Electron when Tauri didn't exist. These applications embed complex web content (rich text editors, video players, web views for integrations) that require consistent rendering across platforms. While Tauri's native webviews are largely compatible, subtle rendering differences between WebKit and Chromium can affect pixel-perfect UI consistency. Applications requiring absolute cross-platform rendering consistency may still favor Electron.
+
+## Best Practices for Production
+
+1. **Choose Electron when you need Chromium consistency**: If your application relies on specific Chromium APIs, DevTools protocol, or needs pixel-identical rendering across platforms, Electron's bundled Chromium eliminates webview compatibility concerns.
+
+2. **Choose Tauri for new greenfield projects**: Unless you have a specific dependency on Chromium or Node.js, Tauri's smaller footprint, stronger security model, and better performance make it the default choice for new desktop applications.
+
+3. **Use `contextIsolation: true` in Electron**: Never disable context isolation. Use `contextBridge` to expose only the specific IPC methods your renderer needs. This prevents renderer processes from accessing Node.js APIs directly.
+
+4. **Define granular capabilities in Tauri**: Don't grant broad permissions. Use Tauri's capability system to restrict each window to only the APIs it needs. Review the security audit checklist before releases.
+
+5. **Implement auto-updates early**: Both frameworks support auto-updates. Set up the update infrastructure before your first release to avoid distribution problems.
+
+6. **Test on all target platforms continuously**: Both frameworks have platform-specific behaviors. Use CI/CD pipelines that build and test on macOS, Windows, and Linux for every commit.
+
+7. **Profile memory usage during development**: Electron apps can easily leak memory through renderer processes. Tauri apps are generally more efficient but can still accumulate state in the Rust backend. Profile early and often.
+
+8. **Use native menus and dialogs**: Both frameworks support system-native menus and file dialogs. Using native UI elements reduces bundle size and provides a platform-native feel.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Electron: disabling contextIsolation | Security vulnerability, renderer can access Node.js | Always use `contextIsolation: true` with `contextBridge` |
+| Electron: bundling unused Chromium features | Bloated bundle size | Use `electron-builder` with targeted platform builds |
+| Tauri: webview rendering differences | Inconsistent UI across platforms | Test on all platforms, use CSS feature detection |
+| Tauri: blocking the Rust event loop | UI freezes | Use async commands with `tokio::spawn` for blocking work |
+| Both: not implementing auto-updates | Users stuck on old versions | Set up update infrastructure before first release |
+| Both: not handling platform differences | Broken features on some OS | Test platform-specific code paths on all targets |
+| Electron: Node.js native module compatibility | Build failures, runtime crashes | Use `electron-rebuild` or prebuilt binaries |
+| Tauri: missing capability permissions | Silent failures, empty responses | Log permission denials, test capability grants |
+
+## Performance Optimization
+
+### Electron Performance
+
+```javascript
+// Use BrowserWindow with optimized settings
+const win = new BrowserWindow({
+  webPreferences: {
+    offscreen: false,
+    contextIsolation: true,
+    nodeIntegration: false,
+    // Reduce renderer memory usage
+    v8CacheOptions: 'code',
+    spellcheck: false,
+  },
+});
+
+// Lazy-load heavy modules
+let heavyModule;
+async function getHeavyModule() {
+  if (!heavyModule) {
+    heavyModule = await import('./heavy-module.js');
+  }
+  return heavyModule;
+}
+
+// Use web workers for CPU-intensive tasks
+const worker = new Worker('compute.js');
+worker.postMessage({ data: largeDataset });
+worker.onmessage = (e) => updateUI(e.data);
+```
+
+### Tauri Performance
+
+```rust
+// Use async commands to avoid blocking the UI thread
+#[tauri::command]
+async fn process_large_file(path: String) -> Result<ProcessResult, String> {
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Process in a background thread
+    let result = tokio::task::spawn_blocking(move || {
+        expensive_computation(&content)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+// Use state management for shared resources
+use tauri::State;
+use std::sync::Mutex;
+
+struct AppState {
+    db: Mutex<Database>,
+}
+
+#[tauri::command]
+fn query_data(state: State<AppState>, query: String) -> Result<Vec<Row>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute(&query).map_err(|e| e.to_string())
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Electron | Tauri | Flutter Desktop | .NET MAUI | Neutralinojs |
+|---------|----------|-------|-----------------|-----------|--------------|
+| Frontend tech | HTML/CSS/JS | HTML/CSS/JS or Rust | Dart | C#/XAML | HTML/CSS/JS |
+| Bundle size | ~150MB | ~3-8MB | ~20-30MB | ~50-80MB | ~2-5MB |
+| Memory (idle) | ~150MB | ~30MB | ~80MB | ~100MB | ~20MB |
+| Backend runtime | Node.js | Rust | Dart | .NET | Node.js |
+| WebView strategy | Bundled Chromium | OS native | Own renderer | OS native | OS native |
+| Mobile support | No (use Capacitor) | Tauri Mobile | Yes | Yes | No |
+| Ecosystem maturity | Very mature | Growing fast | Mature | Mature | Niche |
+| Security model | Manual | Capability-based | Moderate | Moderate | Manual |
+| Learning curve | Low (web devs) | Medium (Rust) | Medium (Dart) | High (C#/XAML) | Low |
+| Native API access | Node.js native modules | Rust + plugins | Platform channels | .NET bindings | Extensions |
+
+## Advanced Patterns
+
+### Electron: Shared Worker for Multi-Window State
+
+```javascript
+// shared-worker.js
+const state = { documents: new Map() };
+
+self.onconnect = (e) => {
+  const port = e.ports[0];
+  port.onmessage = (event) => {
+    const { type, payload } = event.data;
+    switch (type) {
+      case 'GET_STATE':
+        port.postMessage({ type: 'STATE', payload: Object.fromEntries(state.documents) });
+        break;
+      case 'UPDATE_DOC':
+        state.documents.set(payload.id, payload);
+        broadcastToAll({ type: 'DOC_UPDATED', payload });
+        break;
+    }
+  };
+};
+```
+
+### Tauri: Plugin Architecture
+
+```rust
+// Custom Tauri plugin for database access
+use tauri::plugin::{Builder, TauriPlugin};
+use tauri::Runtime;
+
+pub fn init<R: Runtime>() -> TauriPlugin<R> {
+    Builder::new("database")
+        .invoke_handler(tauri::generate_handler![
+            db_query,
+            db_execute,
+            db_migrate,
+        ])
+        .setup(|app, _api| {
+            let db_path = app.path().app_data_dir().unwrap().join("app.db");
+            let conn = Connection::open(db_path)?;
+            // Run migrations
+            conn.execute_batch(include_str!("migrations.sql"))?;
+            app.manage(Mutex::new(conn));
+            Ok(())
+        })
+        .build()
+}
+```
+
+## Testing Strategies
+
+### Electron Testing
+
+```javascript
+// test/app.spec.js
+const { _electron: electron } = require('playwright');
+
+describe('Electron App', () => {
+  let electronApp;
+
+  beforeAll(async () => {
+    electronApp = await electron.launch({ args: ['main.js'] });
+  });
+
+  afterAll(async () => {
+    await electronApp.close();
+  });
+
+  it('should create a window', async () => {
+    const window = await electronApp.firstWindow();
+    const title = await window.title();
+    expect(title).toBe('My App');
+  });
+
+  it('should handle IPC communication', async () => {
+    const window = await electronApp.firstWindow();
+    const result = await window.evaluate(() => window.electronAPI.readFile('/etc/hostname'));
+    expect(result).toBeTruthy();
+  });
+});
+```
+
+### Tauri Testing
+
+```rust
+// src-tauri/tests/commands.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_system_info() {
+        let info = get_system_info();
+        assert!(!info.os.is_empty());
+        assert!(!info.arch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_file() {
+        let result = read_file("/etc/hostname".to_string()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_read_nonexistent_file() {
+        let result = read_file("/nonexistent/path".to_string()).await;
+        assert!(result.is_err());
+    }
+}
+```
+
+## Future Outlook
+
+Electron continues to evolve with each Chromium release, gaining access to the latest web APIs and performance improvements. The Electron team has made significant strides in reducing memory consumption through utility process isolation and improved garbage collection. However, the fundamental architecture—bundling Chromium—remains unchanged.
+
+Tauri's roadmap is ambitious. Tauri 2.0 added mobile support (iOS and Android), making it possible to share frontend code across desktop and mobile from a single codebase. The plugin ecosystem is growing rapidly, with community plugins for database access, system tray management, notification handling, and deep OS integration. As WebView2 becomes ubiquitous on Windows, Tauri's cross-platform consistency improves with each release.
+
+The choice between Electron and Tauri increasingly depends on team expertise and project requirements rather than framework capability gaps. Both can build production-quality desktop applications; they simply optimize for different trade-offs.
 
 ## Conclusion
 
-Electron vs Tauri: Desktop App Frameworks Compared is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Electron and Tauri represent two philosophies of cross-platform desktop development. Electron bundles everything you need, guaranteeing consistency at the cost of size and resources. Tauri leverages what the OS provides, optimizing for efficiency at the cost of occasional webview inconsistencies.
+
+Key takeaways:
+1. Tauri produces 90-95% smaller binaries and uses 75% less memory than Electron
+2. Electron guarantees consistent rendering across platforms; Tauri relies on native webviews with minor differences
+3. Tauri's capability-based security model is more restrictive by default than Electron's manual IPC filtering
+4. Electron's ecosystem is more mature with wider community library support
+5. Tauri 2.0 supports mobile platforms, enabling true cross-platform code sharing
+6. Both frameworks require platform-specific testing for production applications
+7. Choose Electron when you need Chromium consistency or deep Node.js integration
+8. Choose Tauri for new projects prioritizing performance, security, and small bundle sizes
+
+For most new desktop applications in 2024, Tauri offers a compelling default. Its Rust backend provides memory safety guarantees, its native webview eliminates redundant browser engines, and its capability system enforces security from the start. Electron remains the right choice for applications that depend on Chromium-specific features or have an established Node.js codebase, but the balance has shifted decisively in Tauri's favor for greenfield development.

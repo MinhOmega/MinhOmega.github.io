@@ -1,7 +1,7 @@
 ---
 title: "Building AI Agents with Function Calling"
-date: "2024-10-05"
-description: "Build AI agents using function calling: tool definitions, orchestration, and error handling."
+date: "2024-08-20"
+description: "Build AI agents that call external tools: function calling, tool orchestration, and autonomous workflows."
 tags: ["AI", "Agents", "Function Calling", "LLM"]
 published: true
 author: "MinhVo"
@@ -9,54 +9,606 @@ author: "MinhVo"
 
 ## Introduction
 
-Building AI Agents with Function Calling is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+The leap from chatbots to AI agents happened when large language models gained the ability to call external functions. Instead of just generating text, an LLM can now decide which tool to use, construct the right arguments, execute the tool, and incorporate the results into its response. This capability—called function calling or tool use—transforms LLMs from passive text generators into active participants in software systems.
 
-## Key Concepts
+Building AI agents with function calling is fundamentally different from traditional API integration. The agent doesn't follow a predetermined script; it reasons about which tools to use based on the user's request. This introduces challenges around tool selection, error handling, multi-step reasoning, and safety. This guide covers the architecture, implementation patterns, and production considerations for building reliable AI agents.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![AI agent architecture](https://images.unsplash.com/photo-1677442136019-21780ecad995?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Function Calling: Core Concepts
 
-## Practical Implementation
+### How Function Calling Works
 
-Let's look at a practical example:
+Function calling follows a three-step cycle:
+
+1. **Tool definition**: You describe available tools to the LLM using a schema (name, description, parameters with types and constraints).
+
+2. **Tool selection**: The LLM analyzes the user's request and decides whether to call a tool. If it does, it returns a structured tool call with the tool name and arguments.
+
+3. **Tool execution**: Your application executes the tool, captures the result, and sends it back to the LLM. The LLM then incorporates the result into its response.
+
+This cycle can repeat multiple times in a single conversation—the LLM might call several tools sequentially or in parallel to fulfill a complex request.
+
+### Tool Schemas
+
+Tools are described using JSON Schema. A well-written tool schema is critical—the LLM uses the description and parameter descriptions to decide when and how to call the tool:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "Get current weather for a location. Use this when the user asks about weather conditions, temperature, or forecast.",
+      parameters: {
+        type: "object",
+        properties: {
+          location: {
+            type: "string",
+            description: "City name, e.g., 'San Francisco, CA' or 'Tokyo, Japan'",
+          },
+          units: {
+            type: "string",
+            enum: ["celsius", "fahrenheit"],
+            description: "Temperature units. Defaults to celsius.",
+          },
+        },
+        required: ["location"],
+      },
+    },
+  },
+];
+```
+
+### Multi-Step Reasoning
+
+Complex tasks require multiple tool calls. For example, "What's the weather in Paris and convert 100 EUR to USD?" requires two independent tool calls. The LLM can issue both calls in a single response (parallel tool calls), or chain them sequentially if one depends on another.
+
+### The Agent Loop
+
+An agent operates in a loop:
+
+```
+User message → LLM decides action → Execute tool(s) → Feed results to LLM →
+LLM decides next action → ... → LLM generates final response
+```
+
+The loop terminates when the LLM generates a response without any tool calls, indicating it has enough information to answer.
+
+![Agent loop diagram](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Tool Registry Pattern
+
+Centralize tool definitions in a registry that maps tool names to their implementations:
+
+```typescript
+interface Tool {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
+  execute: (args: Record<string, any>) => Promise<string>;
+}
+
+class ToolRegistry {
+  private tools = new Map<string, Tool>();
+
+  register(tool: Tool) {
+    this.tools.set(tool.name, tool);
+  }
+
+  getSchema() {
+    return Array.from(this.tools.values()).map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }));
+  }
+
+  async execute(name: string, args: Record<string, any>): Promise<string> {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Unknown tool: ${name}`);
+    return tool.execute(args);
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing AI solutions in production environments.
+### Guardrails Pattern
 
-## Best Practices
+Always validate tool arguments before execution. The LLM might generate malformed arguments, and malicious inputs could attempt prompt injection:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+function withGuardrails(tool: Tool): Tool {
+  return {
+    ...tool,
+    async execute(args) {
+      // Validate required fields
+      for (const [key, schema] of Object.entries(tool.parameters.properties)) {
+        if (schema.required && !(key in args)) {
+          return JSON.stringify({ error: `Missing required parameter: ${key}` });
+        }
+      }
 
-## Common Pitfalls
+      // Sanitize string inputs
+      for (const [key, value] of Object.entries(args)) {
+        if (typeof value === "string") {
+          args[key] = value.replace(/[<>]/g, ""); // Basic XSS prevention
+        }
+      }
+
+      try {
+        return await tool.execute(args);
+      } catch (error) {
+        return JSON.stringify({ error: `Tool execution failed: ${error.message}` });
+      }
+    },
+  };
+}
+```
+
+### Conversation Context Management
+
+Agents need to manage conversation history to maintain context across multiple turns. This includes system prompts, user messages, assistant responses, and tool call results:
+
+```typescript
+interface ConversationState {
+  messages: Message[];
+  toolCalls: ToolCall[];
+  totalTokens: number;
+}
+
+class ConversationManager {
+  private state: ConversationState;
+  private maxTokens: number;
+
+  constructor(maxTokens: number = 8000) {
+    this.state = { messages: [], toolCalls: [], totalTokens: 0 };
+    this.maxTokens = maxTokens;
+  }
+
+  addMessage(message: Message) {
+    this.state.messages.push(message);
+    this.state.totalTokens += this.estimateTokens(message);
+
+    // Trim old messages if context is too large
+    while (this.state.totalTokens > this.maxTokens && this.state.messages.length > 2) {
+      const removed = this.state.messages.splice(1, 1)[0]; // Keep system message
+      this.state.totalTokens -= this.estimateTokens(removed);
+    }
+  }
+
+  private estimateTokens(message: Message): number {
+    return Math.ceil(JSON.stringify(message).length / 4);
+  }
+}
+```
+
+## Step-by-Step Implementation
+
+### Basic Agent with OpenAI
+
+```typescript
+// agent.ts
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+interface AgentConfig {
+  model: string;
+  systemPrompt: string;
+  maxIterations: number;
+  tools: Tool[];
+}
+
+class Agent {
+  private config: AgentConfig;
+  private registry: ToolRegistry;
+  private messages: any[] = [];
+
+  constructor(config: AgentConfig) {
+    this.config = config;
+    this.registry = new ToolRegistry();
+    config.tools.forEach((tool) => this.registry.register(withGuardrails(tool)));
+
+    this.messages.push({
+      role: "system",
+      content: config.systemPrompt,
+    });
+  }
+
+  async run(userMessage: string): Promise<string> {
+    this.messages.push({ role: "user", content: userMessage });
+
+    for (let i = 0; i < this.config.maxIterations; i++) {
+      const response = await openai.chat.completions.create({
+        model: this.config.model,
+        messages: this.messages,
+        tools: this.registry.getSchema(),
+        tool_choice: "auto",
+      });
+
+      const choice = response.choices[0];
+      this.messages.push(choice.message);
+
+      // If no tool calls, return the text response
+      if (!choice.message.tool_calls || choice.message.tool_calls.length === 0) {
+        return choice.message.content || "";
+      }
+
+      // Execute all tool calls
+      for (const toolCall of choice.message.tool_calls) {
+        const args = JSON.parse(toolCall.function.arguments);
+        const result = await this.registry.execute(toolCall.function.name, args);
+
+        this.messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result,
+        });
+      }
+    }
+
+    return "I've reached the maximum number of steps for this task.";
+  }
+}
+```
+
+### Building Real Tools
+
+```typescript
+// tools/weather.ts
+const weatherTool: Tool = {
+  name: "get_weather",
+  description: "Get current weather for a location",
+  parameters: {
+    type: "object",
+    properties: {
+      location: { type: "string", description: "City name" },
+      units: { type: "string", enum: ["celsius", "fahrenheit"] },
+    },
+    required: ["location"],
+  },
+  async execute(args) {
+    const { location, units = "celsius" } = args;
+    const response = await fetch(
+      `https://api.weatherapi.com/v1/current.json?key=${process.env.WEATHER_API_KEY}&q=${encodeURIComponent(location)}`
+    );
+    const data = await response.json();
+    return JSON.stringify({
+      location: data.location.name,
+      temperature: units === "fahrenheit" ? data.current.temp_f : data.current.temp_c,
+      condition: data.current.condition.text,
+      humidity: data.current.humidity,
+      wind: data.current.wind_kph,
+    });
+  },
+};
+
+// tools/database.ts
+const databaseTool: Tool = {
+  name: "query_database",
+  description: "Query the product database. Use for product searches, inventory checks, and pricing.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Natural language query about products" },
+      limit: { type: "number", description: "Max results to return (default 10)" },
+    },
+    required: ["query"],
+  },
+  async execute(args) {
+    const { query, limit = 10 } = args;
+    // Convert natural language to SQL using another LLM call
+    const sql = await naturalLanguageToSQL(query);
+    const results = await db.query(sql, { limit });
+    return JSON.stringify(results);
+  },
+};
+
+// tools/code_execution.ts
+const codeExecutionTool: Tool = {
+  name: "execute_code",
+  description: "Execute JavaScript code in a sandboxed environment. Use for calculations, data transformations, and prototyping.",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "JavaScript code to execute" },
+    },
+    required: ["code"],
+  },
+  async execute(args) {
+    const { code } = args;
+    // Use a sandboxed execution environment
+    const result = await runInSandbox(code, { timeout: 5000 });
+    return JSON.stringify({ output: result.stdout, error: result.stderr });
+  },
+};
+```
+
+### Multi-Agent Orchestration
+
+```typescript
+// orchestrator.ts
+class AgentOrchestrator {
+  private agents: Map<string, Agent>;
+
+  constructor() {
+    this.agents = new Map();
+  }
+
+  registerAgent(name: string, agent: Agent) {
+    this.agents.set(name, agent);
+  }
+
+  async run(task: string): Promise<string> {
+    // Use a planner agent to determine which specialized agents to invoke
+    const planner = this.agents.get("planner")!;
+    const plan = await planner.run(`Analyze this task and create an execution plan: ${task}`);
+
+    // Parse the plan and invoke agents
+    const steps = JSON.parse(plan);
+    let context = task;
+
+    for (const step of steps) {
+      const agent = this.agents.get(step.agent);
+      if (!agent) throw new Error(`Unknown agent: ${step.agent}`);
+      context = await agent.run(`${context}\n\nPrevious result: ${context}`);
+    }
+
+    return context;
+  }
+}
+
+// Usage
+const orchestrator = new AgentOrchestrator();
+orchestrator.registerAgent("researcher", researchAgent);
+orchestrator.registerAgent("writer", writerAgent);
+orchestrator.registerAgent("reviewer", reviewerAgent);
+
+const result = await orchestrator.run("Write a technical blog post about WebAssembly");
+```
+
+![Multi-agent system](https://images.unsplash.com/photo-1485827404703-89b55fcc595e?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Customer Support Agent
+
+A SaaS company built a support agent that can look up account details, check subscription status, reset passwords, and escalate to human agents. The agent has 8 tools and handles 70% of support tickets autonomously. It uses guardrails to prevent the agent from modifying billing information without human approval.
+
+### Code Review Agent
+
+A development team built a code review agent that reads pull requests, analyzes code quality, checks for security vulnerabilities, and posts review comments. The agent uses tools to read files, run linters, search the codebase for patterns, and post GitHub comments.
+
+### Data Analysis Agent
+
+A data team built an agent that converts natural language questions into SQL queries, executes them, and generates visualizations. The agent has tools for querying databases, generating charts, and exporting reports. It includes guardrails that prevent destructive SQL operations (DROP, DELETE without WHERE).
+
+### Research Agent
+
+A research team built an agent that searches the web, reads articles, extracts key information, and synthesizes findings into structured reports. The agent uses a planning step to break complex research questions into sub-questions, then dispatches them to specialized sub-agents.
+
+## Best Practices for Production
+
+1. **Write clear, specific tool descriptions** — The LLM uses descriptions to decide when to call a tool. Vague descriptions lead to incorrect tool selection. Include examples of when to use and when not to use each tool.
+
+2. **Validate all tool arguments** — Never trust LLM-generated arguments. Validate types, ranges, and formats before execution. Use JSON Schema validation libraries.
+
+3. **Implement timeout and retry logic** — Tool calls can hang or fail. Set timeouts (5-10 seconds for API calls) and implement exponential backoff for transient failures.
+
+4. **Log every tool call** — Record the tool name, arguments, result, and execution time. This is essential for debugging and auditing agent behavior.
+
+5. **Set iteration limits** — Agents can get stuck in loops. Set a maximum number of tool call iterations per request and return a graceful fallback.
+
+6. **Use structured outputs** — When the agent needs to return structured data, use JSON mode or function calling to enforce the schema, rather than parsing free-form text.
+
+7. **Implement human-in-the-loop for high-stakes actions** — For actions that modify data, send money, or affect users, require human approval before execution.
+
+8. **Cache tool results** — If a tool is called with the same arguments within a short time window, return the cached result instead of re-executing.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Vague tool descriptions | Wrong tool selected | Write specific descriptions with examples and anti-examples |
+| No argument validation | Injection attacks, errors | Validate all arguments with JSON Schema before execution |
+| Infinite agent loops | Cost explosion, timeouts | Set max iterations and implement loop detection |
+| Unbounded context | Token limit exceeded | Implement conversation trimming with sliding window |
+| Tool execution errors crash agent | Poor user experience | Catch errors in tools and return structured error messages |
+| No cost tracking | Budget overrun | Track token usage per request and set spending limits |
+
+## Performance Optimization
+
+### Parallel Tool Calls
+
+When the LLM issues multiple independent tool calls, execute them in parallel:
+
+```typescript
+// Execute tool calls in parallel
+const toolResults = await Promise.all(
+  toolCalls.map(async (toolCall) => {
+    const args = JSON.parse(toolCall.function.arguments);
+    const result = await this.registry.execute(toolCall.function.name, args);
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: result,
+    };
+  })
+);
+```
+
+### Tool Result Caching
+
+```typescript
+const toolCache = new Map<string, { result: string; expiry: number }>();
+
+async function executeWithCache(tool: Tool, args: Record<string, any>): Promise<string> {
+  const cacheKey = `${tool.name}:${JSON.stringify(args)}`;
+  const cached = toolCache.get(cacheKey);
+
+  if (cached && cached.expiry > Date.now()) {
+    return cached.result;
+  }
+
+  const result = await tool.execute(args);
+  toolCache.set(cacheKey, { result, expiry: Date.now() + 60000 }); // 1 min cache
+  return result;
+}
+```
+
+### Streaming Responses
+
+Stream tool call results to the user for better perceived performance:
+
+```typescript
+const stream = await openai.chat.completions.create({
+  model: "gpt-4",
+  messages,
+  tools: registry.getSchema(),
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta;
+  if (delta?.content) {
+    process.stdout.write(delta.content);
+  }
+}
+```
+
+## Comparison with Alternatives
+
+| Approach | Flexibility | Reliability | Cost | Complexity |
+|----------|-------------|-------------|------|------------|
+| Function calling | High | Medium | Medium | Medium |
+| ReAct framework | Very high | Medium | High | High |
+| Fixed workflow | Low | High | Low | Low |
+| Hybrid (workflow + agent) | High | High | Medium | High |
+
+## Advanced Patterns
+
+### Self-Correction
+
+When a tool call fails, the agent can retry with corrected arguments:
+
+```typescript
+async function executeWithRetry(tool: Tool, args: any, maxRetries: number = 2): Promise<string> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await tool.execute(args);
+    } catch (error) {
+      if (attempt === maxRetries) {
+        return JSON.stringify({ error: `Failed after ${maxRetries} attempts: ${error.message}` });
+      }
+      // The LLM will see the error and can adjust its approach
+      continue;
+    }
+  }
+  return JSON.stringify({ error: "Unexpected error" });
+}
+```
+
+### Tool Composition
+
+Build complex tools by composing simple ones:
+
+```typescript
+const searchAndSummarizeTool: Tool = {
+  name: "search_and_summarize",
+  description: "Search for information and provide a summary",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      maxSources: { type: "number" },
+    },
+    required: ["query"],
+  },
+  async execute(args) {
+    const results = await searchTool.execute({ query: args.query, limit: args.maxSources || 3 });
+    const summaries = await Promise.all(
+      JSON.parse(results).map((r: any) => summarizeTool.execute({ url: r.url }))
+    );
+    return JSON.stringify(summaries);
+  },
+};
+```
+
+## Testing Strategies
+
+```typescript
+import { Agent } from "../agent";
+import { MockToolRegistry } from "./mocks";
+
+describe("Agent", () => {
+  it("calls the correct tool based on user input", async () => {
+    const registry = new MockToolRegistry();
+    const mockWeather = jest.fn().mockResolvedValue(JSON.stringify({ temp: 22 }));
+    registry.register({
+      name: "get_weather",
+      description: "Get weather",
+      parameters: { type: "object", properties: { location: { type: "string" } }, required: ["location"] },
+      execute: mockWeather,
+    });
+
+    const agent = new Agent({ model: "gpt-4", systemPrompt: "You are helpful.", maxIterations: 3, tools: registry.getAll() });
+    await agent.run("What's the weather in Tokyo?");
+
+    expect(mockWeather).toHaveBeenCalledWith(expect.objectContaining({ location: expect.stringContaining("Tokyo") }));
+  });
+
+  it("handles tool execution errors gracefully", async () => {
+    const registry = new MockToolRegistry();
+    registry.register({
+      name: "failing_tool",
+      description: "Always fails",
+      parameters: { type: "object", properties: {} },
+      execute: () => { throw new Error("Tool failed"); },
+    });
+
+    const agent = new Agent({ model: "gpt-4", systemPrompt: "You are helpful.", maxIterations: 3, tools: registry.getAll() });
+    const result = await agent.run("Use the failing tool");
+
+    // Agent should still return a response
+    expect(result).toBeTruthy();
+    expect(result).not.toContain("error"); // Should handle gracefully
+  });
+
+  it("respects iteration limits", async () => {
+    const agent = new Agent({
+      model: "gpt-4",
+      systemPrompt: "Keep calling tools forever.",
+      maxIterations: 3,
+      tools: [{ name: "noop", description: "Does nothing", parameters: { type: "object", properties: {} }, execute: async () => "ok" }],
+    });
+
+    const result = await agent.run("Call noop 100 times");
+    expect(result).toContain("maximum");
+  });
+});
+```
+
+## Future Outlook
+
+Function calling is evolving rapidly. OpenAI, Anthropic, and Google are all expanding their tool use APIs with features like parallel tool calls, streaming tool results, and structured outputs. The pattern is becoming standardized across providers, making it easier to build provider-agnostic agents.
+
+Multi-agent frameworks (AutoGen, CrewAI, LangGraph) are maturing, providing orchestration patterns for complex workflows. These frameworks handle agent communication, state management, and error recovery, reducing the boilerplate needed for multi-agent systems.
+
+The safety landscape is also evolving. As agents gain access to more powerful tools (code execution, file systems, external APIs), the need for robust guardrails, human oversight, and audit trails becomes critical. Expect standardized safety frameworks to emerge alongside the agent capabilities.
 
 ## Conclusion
 
-Building AI Agents with Function Calling is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Building AI agents with function calling is one of the most impactful applications of LLMs. The key takeaways:
+
+1. **Tool design is everything** — Clear descriptions, proper parameter schemas, and robust error handling determine agent reliability
+2. **The agent loop is simple but powerful** — LLM decides → tool executes → result feeds back → repeat until done
+3. **Guardrails are non-negotiable** — Validate inputs, sanitize outputs, set iteration limits, and log everything
+4. **Start with a single tool** — Build one reliable tool, test it thoroughly, then expand the toolset
+5. **Human-in-the-loop for high stakes** — Require approval for actions that affect real systems or users
+
+Begin by building an agent with one tool (e.g., a calculator or web search). Get the tool schema right, handle errors gracefully, and test with diverse inputs. Once that loop works reliably, adding more tools is straightforward. The hard part is never the code—it's designing tools that the LLM can use correctly and safely.
