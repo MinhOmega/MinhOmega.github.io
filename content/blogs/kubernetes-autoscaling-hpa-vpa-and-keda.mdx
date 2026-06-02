@@ -418,6 +418,48 @@ The recommended production workflow for VPA is:
 2. **Week 3-4**: Review recommendations. Adjust min/max constraints based on observed patterns.
 3. **Week 5+**: Enable `Auto` mode with conservative constraints. Monitor closely for eviction storms.
 
+### VPA for Stateful Workloads
+
+VPA is particularly valuable for stateful workloads like databases where horizontal scaling is complex:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: redis-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: redis
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: redis
+      minAllowed:
+        cpu: "100m"
+        memory: "256Mi"
+      maxAllowed:
+        cpu: "4"
+        memory: "8Gi"
+      controlledResources: ["cpu", "memory"]
+```
+
+For databases, VPA can reduce costs by 20-40% by right-sizing requests that were initially over-provisioned based on guesswork. The key is running in recommendation mode long enough to capture all workload patterns (peak hours, batch jobs, backups).
+
+### VPA vs HPA: When to Use Which
+
+| Workload Type | Recommended | Reason |
+|---------------|-------------|--------|
+| Stateless web servers | HPA | Easy to add/remove replicas |
+| Batch processing | KEDA | Event-driven, can scale to zero |
+| Databases | VPA | Horizontal scaling is complex |
+| Message consumers | KEDA | Scale based on queue depth |
+| CPU-bound services | HPA | Scale based on CPU utilization |
+| Memory-bound services | VPA | Adjust memory requests |
+| Mixed workloads | HPA + VPA | HPA on custom metrics, VPA on resources |
+
 ```yaml
 # Production VPA with conservative constraints
 apiVersion: autoscaling.k8s.io/v1
@@ -582,6 +624,49 @@ KEDA supports 50+ scalers out of the box. Here are the most commonly used:
 | Datadog | `datadog` | Datadog metric-based scaling |
 | Elasticsearch | `elasticsearch` | Scale based on search queue |
 | MongoDB | `mongodb` | Scale based on query results |
+| NATS | `nats` | NATS message processing |
+| Apache Pulsar | `pulsar` | Pulsar message processing |
+| Huawei Cloud SMN | `huawei-cloudeye` | Huawei Cloud metrics |
+| Liiklus | `liiklus` | Reactive streams |
+| OpenStack Metrics | `openstack` | OpenStack metrics |
+
+### KEDA with ScaledJob
+
+For batch workloads that run to completion, use ScaledJob instead of ScaledObject:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: data-migration-job
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        containers:
+        - name: migration
+          image: data-migrator:latest
+          command: ["./migrate"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+        restartPolicy: Never
+  pollingInterval: 30
+  maxReplicaCount: 20
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: amqp://user:password@rabbitmq.rabbitmq.svc:5672
+      queueName: migration-tasks
+      queueLength: "1"
+    authenticationRef:
+      name: rabbitmq-auth
+```
+
+ScaledJob creates a new Job for each message in the queue, up to maxReplicaCount. When the queue empties, no new Jobs are created and completed Jobs are cleaned up based on history limits.
 
 ### Cron-Based Scaling
 
@@ -1062,6 +1147,121 @@ spec:
 ```
 
 ![DevOps workflow](https://images.unsplash.com/photo-1667372393119-3d4c48d07fc9?w=800&h=400&fit=crop)
+
+## Autoscaling Anti-Patterns
+
+### Anti-Pattern 1: Scaling Without Resource Requests
+
+HPA requires resource requests to calculate utilization. Without them, the Metrics Server can't provide data and HPA shows `<unknown>`:
+
+```yaml
+# Wrong: No resource requests
+containers:
+- name: api
+  image: api:latest
+  # No resources section
+
+# Correct: Resource requests defined
+containers:
+- name: api
+  image: api:latest
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+```
+
+### Anti-Pattern 2: Overly Aggressive Scale-Down
+
+Setting scale-down policies too aggressively causes thrashing during traffic fluctuations:
+
+```yaml
+# Wrong: Removes 100% of pods immediately
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 0
+    policies:
+    - type: Percent
+      value: 100
+      periodSeconds: 60
+
+# Correct: Conservative scale-down
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300
+    policies:
+    - type: Percent
+      value: 10
+      periodSeconds: 120
+```
+
+### Anti-Pattern 3: Using VPA with HPA on Same Metric
+
+The classic feedback loop problem:
+
+```yaml
+# Wrong: Both scale on CPU
+# VPA increases CPU requests → utilization drops → HPA scales down
+---
+# Correct: HPA on custom metrics, VPA on resources
+# Or HPA on CPU, VPA on memory only
+```
+
+### Anti-Pattern 4: Ignoring Pod Disruption Budgets
+
+Without PDBs, autoscalers can evict all pods simultaneously during scaling events:
+
+```yaml
+# Always define PDBs for critical workloads
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: critical-app-pdb
+spec:
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      app: critical-app
+```
+
+### Anti-Pattern 5: Not Testing Scaling Behavior
+
+Deploying autoscaling to production without testing is risky. Use load testing tools:
+
+```bash
+# Install k6 for load testing
+brew install k6
+
+# Run load test
+k6 run --vus 100 --duration 5m load-test.js
+
+# Monitor HPA during test
+watch kubectl get hpa
+```
+
+```javascript
+// load-test.js
+import http from 'k6/http';
+import { sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 50 },   // Ramp up
+    { duration: '5m', target: 50 },   // Stay at 50 users
+    { duration: '2m', target: 200 },  // Spike to 200 users
+    { duration: '5m', target: 200 },  // Stay at 200 users
+    { duration: '2m', target: 0 },    // Ramp down
+  ],
+};
+
+export default function () {
+  http.get('https://api.example.com/health');
+  sleep(1);
+}
+```
 
 ## Monitoring and Debugging Autoscaling
 

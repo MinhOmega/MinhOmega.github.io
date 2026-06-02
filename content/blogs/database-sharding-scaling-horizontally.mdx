@@ -9,626 +9,433 @@ author: "MinhVo"
 
 ## Introduction
 
-Your database is the bottleneck. Write throughput is maxed out, read replicas can't keep up, and vertical scaling has hit its ceiling. Database sharding—the practice of splitting data across multiple database instances—is the path forward for applications that need to scale beyond what a single machine can handle.
+Every growing application eventually hits the same wall: the database can't keep up. Queries slow down, write throughput plateaus, and adding more CPU or memory to a single server (vertical scaling) becomes prohibitively expensive. This is the moment when database sharding moves from an academic concept to a production necessity.
 
-But sharding introduces distributed systems complexity that most teams underestimate. A 2023 survey by CockroachDB found that 67% of teams attempting sharding for the first time experienced production incidents within the first month. The difference between a smooth sharding rollout and a catastrophic one comes down to three decisions: shard key selection, routing architecture, and consistency strategy.
+Database sharding—the practice of splitting a single database into multiple smaller databases distributed across servers—is one of the most powerful and most dangerous scaling techniques available. Done right, it enables applications to handle millions of users and petabytes of data. Done wrong, it creates a distributed nightmare of data inconsistencies, cross-shard queries, and operational complexity that can take months to unwind.
 
-This guide provides a battle-tested approach to sharding, drawn from production systems serving billions of rows across hundreds of shards.
+This guide covers everything you need to know about database sharding: when to shard, how to choose shard keys, the different sharding strategies, and the operational challenges you'll face in production.
 
-![Horizontal database scaling](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
+![Database scaling](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Understanding Sharding Strategies
+## When to Shard (and When Not To)
 
-### The Three Fundamental Approaches
+### Signs You Need Sharding
 
-**Directory-based sharding** maintains a lookup table mapping each key to its shard. This offers maximum flexibility—keys can be moved between shards by updating the directory—but adds a lookup to every query.
+Sharding is a last resort, not a first optimization. Before considering sharding, exhaust these alternatives:
 
-**Hash-based sharding** applies a hash function to the key to deterministically select a shard. It's simple and distributes data evenly, but range queries become expensive since consecutive keys may hash to different shards.
+1. **Query optimization**: Add indexes, rewrite slow queries, use EXPLAIN to understand query plans
+2. **Read replicas**: Offload read traffic to replica databases
+3. **Caching**: Add Redis or Memcached for frequently accessed data
+4. **Vertical scaling**: Upgrade to a more powerful server (this can get you surprisingly far)
+5. **Table partitioning**: Split large tables within a single database
 
-**Range-based sharding** assigns contiguous key ranges to each shard. This preserves locality for range queries but can create hot spots if the key space has natural clustering (timestamps, for example).
+If you've done all of the above and still can't meet performance requirements, sharding may be necessary. Common triggers include:
+
+- **Write throughput**: A single primary can't handle the write volume (typically >10,000 writes/second)
+- **Data size**: The dataset exceeds what a single server can store efficiently (>1-10TB)
+- **Query latency**: Indexes no longer fit in memory, causing slow queries
+- **Availability requirements**: A single database is a single point of failure
+
+### The Cost of Sharding
+
+Sharding introduces significant complexity:
+
+- **Cross-shard queries**: Queries that span multiple shards are slow and complex
+- **Distributed transactions**: ACID transactions across shards require 2PC or Saga patterns
+- **Schema changes**: ALTER TABLE must be applied to every shard
+- **Rebalancing**: Adding or removing shards requires data migration
+- **Operational overhead**: Monitoring, backups, and troubleshooting become more complex
+- **Application complexity**: The application must be shard-aware or use a routing layer
+
+## Sharding Strategies
+
+### Hash-Based Sharding
+
+Hash-based sharding distributes data evenly across shards using a hash function:
+
+```text
+shard_id = hash(shard_key) % number_of_shards
+
+Example:
+User ID: 12345
+Hash: hash(12345) = 7823
+Shards: 4
+Shard assignment: 7823 % 4 = 3 → Shard 3
+```
+
+**Advantages**:
+- Even data distribution (no hotspots)
+- Simple to implement
+- Works well with auto-incrementing IDs
+
+**Disadvantages**:
+- Range queries require scanning all shards
+- Adding/removing shards requires rehashing most data
+- No locality—related data may end up on different shards
+
+**Implementation with consistent hashing**:
+
+```python
+import hashlib
+import bisect
+
+class ConsistentHash:
+    def __init__(self, nodes, replicas=150):
+        self.replicas = replicas
+        self.ring = {}
+        self.sorted_keys = []
+        for node in nodes:
+            self.add_node(node)
+    
+    def add_node(self, node):
+        for i in range(self.replicas):
+            key = self._hash(f"{node}:{i}")
+            self.ring[key] = node
+            bisect.insort(self.sorted_keys, key)
+    
+    def get_node(self, data_key):
+        if not self.ring:
+            return None
+        key = self._hash(data_key)
+        idx = bisect.bisect(self.sorted_keys, key) % len(self.sorted_keys)
+        return self.ring[self.sorted_keys[idx]]
+    
+    def _hash(self, key):
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+```
+
+Consistent hashing minimizes data movement when adding or removing shards—only approximately `1/n` of keys need to move.
+
+### Range-Based Sharding
+
+Range-based sharding groups data by value ranges:
+
+```text
+Shard 0: users with ID 0-999,999
+Shard 1: users with ID 1,000,000-1,999,999
+Shard 2: users with ID 2,000,000-2,999,999
+Shard 3: users with ID 3,000,000+
+```
+
+**Advantages**:
+- Range queries are efficient (hit only one shard)
+- Easy to understand and debug
+- Natural ordering within shards
+
+**Disadvantages**:
+- Prone to hotspots (new users all go to the last shard)
+- Uneven data distribution over time
+- Manual rebalancing required
+
+**Better approach: time-based sharding for time-series data**:
+
+```text
+Shard 2023-Q1: data from Jan-Mar 2023
+Shard 2023-Q2: data from Apr-Jun 2023
+Shard 2023-Q3: data from Jul-Sep 2023
+```
+
+### Directory-Based Sharding
+
+A lookup table maps each key to its shard:
+
+```text
+Directory Table:
+┌─────────────┬──────────┐
+│ User ID     │ Shard    │
+├─────────────┼──────────┤
+│ 12345       │ Shard 2  │
+│ 67890       │ Shard 0  │
+│ 11111       │ Shard 3  │
+└─────────────┴──────────┘
+```
+
+**Advantages**:
+- Maximum flexibility—data can be moved by updating the directory
+- Supports custom sharding logic
+- Easy rebalancing
+
+**Disadvantages**:
+- Single point of failure (the directory)
+- Extra lookup adds latency
+- Directory can become a bottleneck
+
+### Geographic Sharding
+
+Data is sharded by user location:
+
+```text
+US users → US shard (us-east-1)
+EU users → EU shard (eu-west-1)
+Asia users → Asia shard (ap-southeast-1)
+```
+
+**Advantages**:
+- Low latency for users (data is close to them)
+- Natural data locality
+- Compliance with data residency regulations (GDPR)
+
+**Disadvantages**:
+- Users who travel may access data from the wrong region
+- Cross-region queries are complex
+- Requires handling data migration for users who move
+
+## Choosing a Shard Key
+
+The shard key is the most critical decision in sharding. It determines data distribution, query routing, and the ability to scale.
+
+### Good Shard Key Properties
+
+1. **High cardinality**: The key should have many distinct values to ensure even distribution
+2. **Even distribution**: Values should be uniformly distributed, not skewed
+3. **Query alignment**: Most queries should include the shard key, so they hit a single shard
+4. **Immutable**: The shard key should never change (changing it requires data migration)
+5. **Low frequency**: The key shouldn't be so frequently accessed that it creates hotspots
+
+### Common Shard Keys
+
+**User ID**: Best for user-centric applications where each user's data is independent. Most queries include `WHERE user_id = ?`, which routes to a single shard.
+
+**Tenant ID**: Best for multi-tenant SaaS applications. Each tenant's data is isolated on a single shard.
+
+**Geographic region**: Best for applications with data residency requirements or where locality matters.
+
+**Time period**: Best for time-series data. New shards are created for each time period, and old shards can be archived.
+
+### Bad Shard Keys
+
+**Email address**: High cardinality but poor distribution (many emails share domains)
+**Status field**: Low cardinality (active/inactive) creates massive hotspots
+**Created date**: New data all goes to the same shard (hotspot)
+**Auto-incrementing ID without hashing**: Sequential IDs create write hotspots on the last shard
+
+## Shard Routing
+
+### Application-Level Routing
+
+The application determines which shard to query:
+
+```python
+class ShardRouter:
+    def __init__(self, shards, num_shards):
+        self.shards = shards
+        self.num_shards = num_shards
+    
+    def get_shard(self, shard_key):
+        shard_id = hash(shard_key) % self.num_shards
+        return self.shards[shard_id]
+    
+    def query(self, shard_key, sql, params):
+        shard = self.get_shard(shard_key)
+        return shard.execute(sql, params)
+```
+
+### Proxy-Based Routing
+
+A proxy layer sits between the application and databases:
+
+```text
+Application → Proxy (Vitess, ProxySQL, Citus) → Shard 0
+                                              → Shard 1
+                                              → Shard 2
+                                              → Shard 3
+```
+
+**Vitess**: MySQL sharding proxy used by YouTube, Slack, and Square. Handles shard routing, query rewriting, and resharding.
+
+**Citus**: PostgreSQL extension that adds transparent sharding. Distributes tables across nodes and routes queries automatically.
+
+**ProxySQL**: MySQL proxy that can route queries based on rules. Supports read/write splitting and sharding.
+
+## Cross-Shard Operations
+
+### Cross-Shard Queries
+
+Queries that span multiple shards are expensive:
 
 ```sql
--- PostgreSQL native partitioning (range-based)
-CREATE TABLE events (
-  id BIGINT GENERATED ALWAYS AS IDENTITY,
-  user_id UUID NOT NULL,
-  event_type VARCHAR(50) NOT NULL,
-  payload JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-) PARTITION BY RANGE (created_at);
+-- This must query ALL shards and merge results
+SELECT * FROM orders WHERE total > 1000 ORDER BY created_at DESC LIMIT 10;
 
--- Monthly partitions
-CREATE TABLE events_2024_01 PARTITION OF events
-  FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE events_2024_02 PARTITION OF events
-  FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
--- ... automate with pg_partman
-
--- Hash partitioning for even distribution
-CREATE TABLE user_profiles (
-  id UUID PRIMARY KEY,
-  email VARCHAR(255) NOT NULL,
-  profile_data JSONB
-) PARTITION BY HASH (id);
-
-CREATE TABLE user_profiles_0 PARTITION OF user_profiles FOR VALUES WITH (MODULUS 8, REMAINDER 0);
-CREATE TABLE user_profiles_1 PARTITION OF user_profiles FOR VALUES WITH (MODULUS 8, REMAINDER 1);
--- ... up to user_profiles_7
+-- Scatters-gather pattern:
+-- 1. Send query to each shard
+-- 2. Each shard returns top 10 results
+-- 3. Proxy merges and returns global top 10
 ```
 
-### Shard Key Selection Matrix
+**Strategies for handling cross-shard queries**:
+- **Denormalization**: Copy data to avoid cross-shard joins
+- **Materialized views**: Pre-compute cross-shard aggregations
+- **Search index**: Use Elasticsearch for cross-shard full-text search
+- **Application-level joins**: Query each shard separately and join in application code
 
-| Key Property | Good Example | Bad Example | Why It Matters |
-|-------------|-------------|-------------|----------------|
-| High cardinality | user_id (millions) | country_code (~200) | Low cardinality creates hot shards |
-| Even distribution | UUID, hash of email | Auto-increment ID | Sequential IDs create write hot spots |
-| Query locality | tenant_id (multi-tenant) | created_at | Locality reduces cross-shard queries |
-| Immutability | user_id | email (can change) | Changing shard key requires data migration |
+### Distributed Transactions
 
-![Sharding architecture diagram](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+ACID transactions across shards require coordination:
 
-## Step-by-Step Implementation
+**Two-Phase Commit (2PC)**:
+```text
+Phase 1 (Prepare):
+  Coordinator → Shard A: "Can you commit transaction T?"
+  Coordinator → Shard B: "Can you commit transaction T?"
+  Shard A: "Yes" (locks resources)
+  Shard B: "Yes" (locks resources)
 
-### Building a Shard Router
-
-The shard router is the central component that maps shard keys to database connections.
-
-```typescript
-import { createHash } from 'crypto';
-import { Pool, PoolClient } from 'pg';
-
-interface ShardConfig {
-  id: number;
-  host: string;
-  port: number;
-  database: string;
-}
-
-class ShardRouter {
-  private shards: Map<number, Pool> = new Map();
-  private numShards: number;
-  private shardConfigs: ShardConfig[];
-
-  constructor(shardConfigs: ShardConfig[]) {
-    this.shardConfigs = shardConfigs;
-    this.numShards = shardConfigs.length;
-
-    for (const config of shardConfigs) {
-      this.shards.set(config.id, new Pool({
-        host: config.host,
-        port: config.port,
-        database: config.database,
-        max: 20,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000,
-      }));
-    }
-  }
-
-  getShardId(key: string): number {
-    const hash = createHash('md5').update(key).digest();
-    return hash.readUInt32BE(0) % this.numShards;
-  }
-
-  getPool(key: string): Pool {
-    return this.shards.get(this.getShardId(key))!;
-  }
-
-  async query(key: string, sql: string, params?: any[]): Promise<any[]> {
-    const pool = this.getPool(key);
-    const result = await pool.query(sql, params);
-    return result.rows;
-  }
-
-  async transaction<T>(key: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const pool = this.getPool(key);
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await fn(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-  }
-
-  // Scatter-gather across all shards
-  async scatterGather(sql: string, params?: any[]): Promise<any[]> {
-    const results = await Promise.all(
-      Array.from(this.shards.values()).map(pool => pool.query(sql, params))
-    );
-    return results.flatMap(r => r.rows).sort((a, b) => b.created_at - a.created_at);
-  }
-
-  async close(): Promise<void> {
-    await Promise.all(Array.from(this.shards.values()).map(pool => pool.end()));
-  }
-}
-
-// Initialize
-const router = new ShardRouter([
-  { id: 0, host: 'db-shard-0.internal', port: 5432, database: 'myapp' },
-  { id: 1, host: 'db-shard-1.internal', port: 5432, database: 'myapp' },
-  { id: 2, host: 'db-shard-2.internal', port: 5432, database: 'myapp' },
-  { id: 3, host: 'db-shard-3.internal', port: 5432, database: 'myapp' },
-]);
+Phase 2 (Commit):
+  Coordinator → Shard A: "Commit T"
+  Coordinator → Shard B: "Commit T"
 ```
 
-### Implementing Global Secondary Indexes
+2PC is slow and creates a single point of failure. Prefer the Saga pattern for cross-shard operations:
 
-When you need to query by a non-shard key (e.g., finding orders by email when sharded by user_id), you need a global secondary index.
-
-```typescript
-// Global index service
-class GlobalIndex {
-  constructor(
-    private indexPool: Pool,  // Separate database for the index
-    private router: ShardRouter
-  ) {}
-
-  async lookup(indexKey: string, entityType: string): Promise<{ shardId: number; entityId: string }[]> {
-    const result = await this.indexPool.query(
-      'SELECT shard_id, entity_id FROM global_index WHERE index_key = $1 AND entity_type = $2',
-      [indexKey, entityType]
-    );
-    return result.rows;
-  }
-
-  async insert(indexKey: string, entityType: string, shardId: number, entityId: string): Promise<void> {
-    await this.indexPool.query(
-      'INSERT INTO global_index (index_key, entity_type, shard_id, entity_id) VALUES ($1, $2, $3, $4)',
-      [indexKey, entityType, shardId, entityId]
-    );
-  }
-
-  // Async dual-write pattern: write to shard first, then index
-  async createWithIndex(shardKey: string, entity: any, indexKey: string): Promise<any> {
-    const result = await router.transaction(shardKey, async (client) => {
-      const inserted = await client.query(
-        'INSERT INTO orders (user_id, email, total) VALUES ($1, $2, $3) RETURNING *',
-        [entity.userId, entity.email, entity.total]
-      );
-      return inserted.rows[0];
-    });
-
-    // Index write can be async via message queue for reliability
-    await this.insert(indexKey, 'orders', router.getShardId(shardKey), result.id);
-
-    return result;
-  }
-}
+```text
+Saga Pattern:
+1. Create order on Shard A
+2. Reserve inventory on Shard B
+3. Process payment on Shard C
+If step 3 fails:
+  3a. Cancel inventory reservation on Shard B
+  2a. Cancel order on Shard A
 ```
 
-![Database routing and indexing](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+## Resharding
 
-## Real-World Use Cases
+### The Resharding Challenge
 
-### Use Case 1: Multi-Tenant SaaS Sharding
+Adding or removing shards requires moving data. This is the most operationally complex aspect of sharding.
 
-```typescript
-// Tenant-aware middleware
-import { Request, Response, NextFunction } from 'express';
-
-function tenantShardMiddleware(req: Request, res: Response, next: NextFunction) {
-  const tenantId = req.headers['x-tenant-id'] as string;
-  if (!tenantId) {
-    return res.status(400).json({ error: 'Missing tenant ID' });
-  }
-
-  // Attach shard-bound query function to request
-  (req as any).shardQuery = (sql: string, params?: any[]) =>
-    router.query(tenantId, sql, params);
-
-  (req as any).shardTransaction = <T>(fn: (client: PoolClient) => Promise<T>) =>
-    router.transaction(tenantId, fn);
-
-  next();
-}
-
-// Usage in route handler
-app.get('/api/orders', tenantShardMiddleware, async (req, res) => {
-  const orders = await (req as any).shardQuery(
-    'SELECT * FROM orders WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 50',
-    [req.headers['x-tenant-id']]
-  );
-  res.json(orders);
-});
+**Double-write migration**:
+```text
+Phase 1: Write to both old and new shards
+Phase 2: Backfill historical data to new shards
+Phase 3: Verify data consistency
+Phase 4: Switch reads to new shards
+Phase 5: Stop writes to old shards
+Phase 6: Decommission old shards
 ```
 
-### Use Case 2: High-Volume Event Ingestion
+**Online schema change tools**:
+- **gh-ost**: GitHub's online schema change tool for MySQL
+- **pt-online-schema-change**: Percona's tool for zero-downtime migrations
+- **pgroll**: Zero-downtime schema migrations for PostgreSQL
 
-```typescript
-// Batch insert with shard-aware buffering
-class EventBuffer {
-  private buffers: Map<number, any[]> = new Map();
-  private flushInterval: NodeJS.Timeout;
+### Sharding with Vitess
 
-  constructor(private router: ShardRouter, private batchSize: number = 1000) {
-    this.flushInterval = setInterval(() => this.flush(), 5000);
-  }
-
-  add(event: any): void {
-    const shardId = this.router.getShardId(event.user_id);
-    if (!this.buffers.has(shardId)) this.buffers.set(shardId, []);
-    const buffer = this.buffers.get(shardId)!;
-    buffer.push(event);
-
-    if (buffer.length >= this.batchSize) {
-      this.flushShard(shardId);
-    }
-  }
-
-  private async flushShard(shardId: number): Promise<void> {
-    const buffer = this.buffers.get(shardId);
-    if (!buffer || buffer.length === 0) return;
-    this.buffers.set(shardId, []);
-
-    const values = buffer.map((e, i) =>
-      `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`
-    ).join(', ');
-
-    const params = buffer.flatMap(e => [e.user_id, e.event_type, JSON.stringify(e.payload), e.created_at]);
-
-    const pool = this.router.getPool(buffer[0].user_id);
-    await pool.query(
-      `INSERT INTO events (user_id, event_type, payload, created_at) VALUES ${values}`,
-      params
-    );
-  }
-
-  async flush(): Promise<void> {
-    await Promise.all(
-      Array.from(this.buffers.keys()).map(shardId => this.flushShard(shardId))
-    );
-  }
-}
-```
-
-### Use Case 3: Cross-Shard Analytics with Materialized Views
-
-```typescript
-// Pre-aggregate shard data into a central analytics database
-async function aggregateShardMetrics(): Promise<void> {
-  const analyticsPool = new Pool({ host: 'analytics-db.internal' });
-
-  // Query each shard in parallel
-  const shardMetrics = await Promise.all(
-    Array.from(router['shards'].values()).map(async (pool) => {
-      const result = await pool.query(`
-        SELECT
-          DATE(created_at) as date,
-          event_type,
-          COUNT(*) as event_count,
-          COUNT(DISTINCT user_id) as unique_users
-        FROM events
-        WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
-        GROUP BY DATE(created_at), event_type
-      `);
-      return result.rows;
-    })
-  );
-
-  // Merge and insert into analytics DB
-  const merged = new Map<string, any>();
-  for (const metrics of shardMetrics) {
-    for (const row of metrics) {
-      const key = `${row.date}-${row.event_type}`;
-      const existing = merged.get(key);
-      if (existing) {
-        existing.event_count += row.event_count;
-        existing.unique_users += row.unique_users;
-      } else {
-        merged.set(key, { ...row });
-      }
-    }
-  }
-
-  for (const metric of merged.values()) {
-    await analyticsPool.query(
-      `INSERT INTO daily_metrics (date, event_type, event_count, unique_users)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (date, event_type) DO UPDATE
-       SET event_count = EXCLUDED.event_count, unique_users = EXCLUDED.unique_users`,
-      [metric.date, metric.event_type, metric.event_count, metric.unique_users]
-    );
-  }
-}
-```
-
-## Best Practices for Production
-
-1. **Start with more shards than you need**: It's cheaper to have 16 underutilized shards than to reshard from 4 to 16 under pressure. Empty shards cost almost nothing.
-2. **Automate shard provisioning**: New shards should be created by infrastructure-as-code, not manual scripts. Use Terraform or Pulumi.
-3. **Implement connection pooling per shard**: Use PgBouncer on each shard to manage connection overhead.
-4. **Monitor shard health independently**: Each shard needs its own alerting for disk space, replication lag, query latency, and connection count.
-5. **Use read replicas for heavy read shards**: Hot shards may need dedicated read replicas for analytics queries.
-6. **Implement graceful degradation**: If a shard is unreachable, serve partial results rather than failing entirely.
-7. **Version your shard routing**: When adding new shards, old and new routing logic must coexist during migration.
-8. **Test with production-like data volumes**: Sharding issues only surface at scale. Load test with realistic data before deploying.
-
-## Common Pitfalls and Solutions
-
-| Pitfall | Impact | Solution |
-|---------|--------|----------|
-| Choosing auto-increment as shard key | Write hot spot on latest shard | Use UUID or hash of natural key |
-| No cross-shard query strategy | Full scatter-gather for common queries | Maintain global secondary indexes |
-| Ignoring shard skew | One shard 10x larger than others | Monitor and rebalance proactively |
-| Hardcoding shard count | Can't scale without code changes | Use consistent hashing with virtual nodes |
-| Missing connection pool limits | Connection exhaustion with many shards | Set per-shard pool max and monitor total |
-
-## Performance Optimization
-
-```typescript
-// Connection pool sizing formula
-// max_connections = num_shards × pool_size_per_shard + overhead
-// PostgreSQL default max_connections = 100
-// With 16 shards and 5 connections each = 80 connections + 20 overhead = OK
-
-// Query routing optimization: prefer local shard for multi-key queries
-async function batchGetUsers(userIds: string[]): Promise<any[]> {
-  // Group by shard
-  const byShard = new Map<number, string[]>();
-  for (const id of userIds) {
-    const shardId = router.getShardId(id);
-    if (!byShard.has(shardId)) byShard.set(shardId, []);
-    byShard.get(shardId)!.push(id);
-  }
-
-  // Parallel query per shard
-  const results = await Promise.all(
-    Array.from(byShard.entries()).map(([shardId, ids]) => {
-      const pool = router['shards'].get(shardId)!;
-      return pool.query('SELECT * FROM users WHERE id = ANY($1)', [ids]);
-    })
-  );
-
-  return results.flatMap(r => r.rows);
-}
-```
-
-## Comparison with Alternatives
-
-| Feature | Manual Sharding | Citus (PG) | CockroachDB | Cassandra |
-|---------|----------------|------------|-------------|-----------|
-| SQL compatibility | Full | Full PostgreSQL | Full | CQL (limited) |
-| Cross-shard transactions | Manual (saga) | Built-in | Built-in | None |
-| Rebalancing | Manual | Automated | Automated | Automated |
-| Consistency model | Your choice | Strong | Strong | Tunable |
-| Operational overhead | High | Medium | Low | Low |
-
-## Resharding Strategies
-
-Resharding—moving data from existing shards to new ones—is the most dangerous operation in a sharded system. Plan for it from day one.
-
-### Consistent Hashing with Virtual Nodes
-
-Simple modulo hashing (`hash(key) % num_shards`) means adding or removing a shard redistributes nearly all data. Consistent hashing minimizes data movement: when you add a shard, only keys from its neighboring shard need to move.
-
-```typescript
-class ConsistentHashRouter {
-  private ring: { hash: number; shardId: number }[] = [];
-  private virtualNodes: number;
-
-  constructor(shardConfigs: ShardConfig[], virtualNodes: number = 150) {
-    this.virtualNodes = virtualNodes;
-
-    for (const shard of shardConfigs) {
-      for (let i = 0; i < virtualNodes; i++) {
-        const hash = this.hash(`${shard.id}-${i}`);
-        this.ring.push({ hash, shardId: shard.id });
-      }
-    }
-
-    this.ring.sort((a, b) => a.hash - b.hash);
-  }
-
-  getShardId(key: string): number {
-    const hash = this.hash(key);
-    // Find the first shard with hash >= key hash (clockwise)
-    for (const node of this.ring) {
-      if (node.hash >= hash) return node.shardId;
-    }
-    return this.ring[0].shardId; // Wrap around
-  }
-
-  private hash(key: string): number {
-    const buffer = createHash('md5').update(key).digest();
-    return buffer.readUInt32BE(0);
-  }
-}
-```
-
-With consistent hashing and 150 virtual nodes per shard, adding a 5th shard to a 4-shard cluster moves only ~20% of keys (instead of ~80% with modulo hashing).
-
-### Dual-Write Migration
-
-During resharding, run old and new routing in parallel to verify correctness before cutting over:
-
-```typescript
-async function migrateWithDualWrite(key: string, sql: string, params: any[]) {
-  // Write to both old and new shard
-  const oldShardId = oldRouter.getShardId(key);
-  const newShardId = newRouter.getShardId(key);
-
-  const [oldResult, newResult] = await Promise.all([
-    oldRouter.query(key, sql, params),
-    newRouter.query(key, sql, params),
-  ]);
-
-  // Verify consistency
-  if (JSON.stringify(oldResult) !== JSON.stringify(newResult)) {
-    logger.error('Shard migration mismatch', { key, oldShardId, newShardId });
-    await alertOps({ type: 'migration_inconsistency', key });
-  }
-
-  return oldResult; // Still read from old during migration
-}
-```
-
-### Backfill and Cutover
-
-For large datasets, the migration follows a three-phase approach: backfill historical data to new shards (while dual-writing new data), verify consistency with checksums, then cut over reads to the new routing. The backfill runs as a background job that processes keys in batches, respecting rate limits to avoid overwhelming the database.
-
-## Testing Strategies
-
-```typescript
-describe('Shard Router', () => {
-  test('consistent routing for same key', () => {
-    const key = 'user-12345';
-    const shard1 = router.getShardId(key);
-    const shard2 = router.getShardId(key);
-    expect(shard1).toBe(shard2);
-  });
-
-  test('even distribution across shards', () => {
-    const counts = new Array(16).fill(0);
-    for (let i = 0; i < 100000; i++) {
-      counts[router.getShardId(`user-${i}`)]++;
-    }
-    // Each shard should get ~6250 ± 10%
-    counts.forEach(count => {
-      expect(count).toBeGreaterThan(5600);
-      expect(count).toBeLessThan(6900);
-    });
-  });
-
-  test('transaction rolls back on error', async () => {
-    await expect(
-      router.transaction('user-1', async (client) => {
-        await client.query('INSERT INTO test (id) VALUES ($1)', ['ok']);
-        throw new Error('fail');
-      })
-    ).rejects.toThrow('fail');
-
-    const result = await router.query('user-1', 'SELECT * FROM test WHERE id = $1', ['ok']);
-    expect(result).toHaveLength(0);
-  });
-});
-```
-
-## Future Outlook
-
-PostgreSQL 17+ continues improving declarative partitioning with better partition pruning and automatic partition creation. Cloud-native databases like PlanetScale (Vitess-based), CockroachDB, and YugabyteDB are making sharding transparent to applications. The trend is clear: the future belongs to databases that shard automatically.
-
-
-## Database Performance Tuning
-
-Database performance tuning is an iterative process that requires understanding your query patterns, data distribution, and access frequencies. Small improvements in query performance can have outsized impacts on application responsiveness, especially for frequently executed queries.
-
-### Query Plan Analysis
-
-Always analyze query execution plans before optimizing. In PostgreSQL, use `EXPLAIN ANALYZE` to see both the planned and actual execution statistics:
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT u.name, COUNT(o.id) as order_count
-FROM users u
-LEFT JOIN orders o ON o.user_id = u.id
-WHERE u.created_at > '2024-01-01'
-GROUP BY u.id, u.name
-ORDER BY order_count DESC
-LIMIT 20;
-```
-
-Look for sequential scans on large tables (indicating missing indexes), high cost estimates for nested loops (suggesting join strategy issues), and excessive buffer reads (indicating insufficient memory allocation or poor data locality).
-
-### Index Optimization Strategy
-
-Creating the right indexes requires understanding your query patterns. Use `pg_stat_user_tables` and `pg_stat_user_indexes` to identify tables with high sequential scan ratios and unused indexes:
-
-```sql
--- Find tables with high sequential scan ratio
-SELECT schemaname, relname, seq_scan, idx_scan,
-       CASE WHEN seq_scan + idx_scan > 0
-            THEN round(100.0 * idx_scan / (seq_scan + idx_scan), 1)
-            ELSE 0 END as idx_usage_pct
-FROM pg_stat_user_tables
-WHERE seq_scan + idx_scan > 100
-ORDER BY idx_usage_pct ASC;
-
--- Find unused indexes consuming disk space
-SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
-FROM pg_stat_user_indexes
-WHERE idx_scan < 10 AND indexrelname NOT LIKE '%pkey%'
-ORDER BY pg_relation_size(indexrelid) DESC;
-```
-
-### Connection Pooling Best Practices
-
-Proper connection pooling prevents connection exhaustion under load. Configure your pool size based on your CPU core count and query characteristics:
-
-```
-Optimal pool size = (CPU cores * 2) + effective_spindle_count
-```
-
-For modern SSD-based systems, this typically means a pool size of `2 * CPU_cores + 1`. Setting the pool too large wastes memory and increases context switching overhead, while setting it too small causes query queuing under load.
-
-## Community Resources and Further Learning
-
-The technology landscape evolves rapidly, making continuous learning essential for maintaining expertise. Building a systematic approach to staying current with developments in your technology stack ensures you can leverage new features and avoid deprecated patterns.
-
-### Curated Learning Pathways
-
-Rather than consuming content randomly, create structured learning pathways aligned with your current projects and career goals. Start with official documentation and specification documents, which provide the most accurate and comprehensive information. Follow this with hands-on tutorials and workshops that reinforce concepts through practical application.
-
-Technical blogs from framework maintainers and core team members often provide deeper insights into design decisions and upcoming features. Subscribe to the official blogs of your primary frameworks and libraries to stay ahead of breaking changes and deprecation timelines.
-
-### Contributing to Open Source
-
-Contributing to open-source projects in your technology stack provides unparalleled learning opportunities. Start with documentation improvements and bug reports, then progress to fixing small issues tagged as "good first issue" in your favorite projects. This direct engagement with maintainers and the codebase accelerates your understanding far beyond what passive learning can achieve.
+Vitess handles resharding automatically:
 
 ```bash
-# Setting up for contribution
-git clone https://github.com/project/repository.git
-cd repository
-git checkout -b fix/issue-description
+# Split shard 0 into shards 0 and 1
+vtctlclient Reshard --source_shards "0" --target_shards "0,1" create
 
-# Run the project's contribution setup
-npm run setup:dev
-npm run test  # Ensure tests pass before making changes
-
-# Make your changes, then run the full test suite
-npm run test:full
-npm run lint
-npm run build
-
-# Submit your contribution
-git add -A
-git commit -m "fix: description of the fix
-
-Closes #1234"
-git push origin fix/issue-description
+# Vitess handles:
+# 1. Data migration
+# 2. Query routing during migration
+# 3. Consistency verification
+# 4. Cutover
 ```
 
-### Building a Technical Knowledge Base
+## Sharding in Practice
 
-Maintain a personal knowledge base that captures insights, solutions, and patterns you discover during your work. Tools like Obsidian, Notion, or even a simple Markdown repository can serve as an external memory that grows more valuable over time.
+### PostgreSQL with Citus
 
-Organize your notes by topic rather than chronologically, and include code examples, links to relevant documentation, and explanations of why certain approaches work better than others. When you encounter a particularly insightful article or conference talk, write a summary that captures the key takeaways and how they apply to your current projects.
+Citus adds transparent sharding to PostgreSQL:
 
-### Staying Current with Industry Trends
+```sql
+-- Create a distributed table
+SELECT create_distributed_table('orders', 'customer_id');
 
-Follow key conferences and their published talks to stay informed about emerging patterns and best practices. Many conferences publish recorded talks on YouTube within weeks of the event, making world-class technical content freely accessible.
+-- Citus automatically:
+-- 1. Distributes data across worker nodes
+-- 2. Routes queries to the correct shard
+-- 3. Handles cross-shard aggregations
 
-Join relevant Discord servers, Slack communities, and forums where practitioners discuss real-world challenges and solutions. These communities provide early warning about emerging issues and access to collective wisdom that isn't available through formal documentation.
+-- This query is automatically routed
+SELECT * FROM orders WHERE customer_id = 12345;
 
-### Mentorship and Knowledge Sharing
+-- This query is automatically distributed
+SELECT COUNT(*) FROM orders GROUP BY status;
+```
 
-Teaching others is one of the most effective ways to deepen your own understanding. Consider writing technical blog posts, giving talks at local meetups, or mentoring junior developers. The process of explaining concepts to others forces you to organize your knowledge and identify gaps in your understanding.
+### MongoDB Sharding
 
-Pair programming sessions with colleagues of different experience levels create mutual learning opportunities. Senior developers gain fresh perspectives on problems they've solved the same way for years, while junior developers benefit from exposure to production-grade thinking and decision-making processes.
+MongoDB has built-in sharding support:
+
+```javascript
+// Enable sharding on a database
+sh.enableSharding("mydb");
+
+// Shard a collection using hashed user_id
+sh.shardCollection("mydb.users", { user_id: "hashed" });
+
+// Shard with compound shard key (tenant + created date)
+sh.shardCollection("mydb.events", { tenant_id: 1, created_at: 1 });
+```
+
+### Vitess for MySQL
+
+Vitess is the production standard for MySQL sharding:
+
+```yaml
+# VSchema: defines how tables are sharded
+{
+  "sharded": true,
+  "vindexes": {
+    "hash_user_id": {
+      "type": "hash"
+    }
+  },
+  "tables": {
+    "users": {
+      "column_vindexes": [
+        { "column": "user_id", "name": "hash_user_id" }
+      ]
+    },
+    "orders": {
+      "column_vindexes": [
+        { "column": "user_id", "name": "hash_user_id" }
+      ]
+    }
+  }
+}
+```
+
+## Monitoring and Operations
+
+### Key Metrics to Monitor
+
+- **Shard skew**: Uneven data distribution across shards
+- **Query latency per shard**: Hot shards will have higher latency
+- **Cross-shard query ratio**: High ratios indicate poor shard key choice
+- **Replication lag**: Each shard's replicas should be in sync
+- **Connection pool utilization**: Each shard has its own connection pool
+
+### Operational Playbook
+
+**Adding a shard**:
+1. Provision new database server
+2. Configure replication
+3. Run resharding migration
+4. Verify data consistency
+5. Update routing configuration
+6. Monitor for issues
+
+**Handling a shard failure**:
+1. Promote replica to primary
+2. Update routing to point to new primary
+3. Investigate root cause
+4. Provision replacement replica
+5. Verify data integrity
 
 ## Conclusion
 
-Sharding is a powerful scaling strategy that requires careful planning. Key takeaways:
+Database sharding is a powerful scaling technique, but it comes with significant complexity. Before sharding, exhaust simpler alternatives: query optimization, read replicas, caching, and vertical scaling. When you do shard, choose your shard key carefully—it's the single most important decision and very difficult to change later.
 
-1. Shard key selection is the most consequential architectural decision—invest heavily in this choice
-2. Design for single-shard queries; maintain global indexes for cross-shard access
-3. Use consistent hashing to make future scaling non-disruptive
-4. Build operational tooling for monitoring, rebalancing, and graceful degradation
-5. Consider transparent sharding databases (CockroachDB, Citus) to reduce application complexity
+Key takeaways:
 
-Start by analyzing your query patterns. If most queries can be scoped to a single entity (tenant, user, account), sharding on that entity key will unlock massive scalability.
+1. **Shard key is everything** — Choose poorly and you'll fight hotspots, cross-shard queries, and resharding pain forever
+2. **Hash-based sharding for even distribution** — Use consistent hashing to minimize data movement during resharding
+3. **Range-based sharding for time-series** — Natural fit for data that's accessed by time ranges
+4. **Avoid cross-shard operations** — Design your schema so most queries hit a single shard
+5. **Use established tools** — Vitess, Citus, and MongoDB's built-in sharding handle the hard parts for you
+
+Sharding is a journey, not a destination. Start with a clear understanding of your data access patterns, choose a shard key that aligns with your most common queries, and build the operational tooling you'll need to manage a distributed database. The complexity is real, but so is the scale it enables.
