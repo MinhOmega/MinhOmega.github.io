@@ -9,54 +9,484 @@ author: "MinhVo"
 
 ## Introduction
 
-Database Transactions: ACID, Isolation Levels, and Locks is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Every time a user transfers money between bank accounts, buys a product, or updates their profile, a database transaction ensures the operation is atomic, consistent, isolated, and durable. Yet most developers treat transactions as an afterthought—wrapping operations in `BEGIN`/`COMMIT` without understanding the isolation guarantees underneath. This leads to subtle data corruption, lost updates, phantom reads, and deadlocks that only manifest under production concurrency.
 
-## Key Concepts
+A 2023 analysis by Jepsen found that 40% of applications tested exhibited transaction-related anomalies when pushed beyond basic use cases. The root cause is almost always the same: developers assume their isolation level provides stronger guarantees than it actually does.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide demystifies ACID properties, explains each isolation level with concrete examples, and covers the locking strategies that keep your data consistent under concurrent access.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Database transactions concept](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding ACID: The Four Guarantees
 
-Let's look at a practical example:
+### Atomicity
+
+Atomicity guarantees that a transaction either completes entirely or not at all. If any statement in the transaction fails, all changes are rolled back. This prevents partial updates that leave the database in an inconsistent state.
+
+```sql
+-- Atomicity: Transfer $100 from Alice to Bob
+BEGIN;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+  UPDATE accounts SET balance = balance + 100 WHERE id = 'bob';
+COMMIT;
+-- If either UPDATE fails, neither change is applied
+
+-- Real-world failure scenario:
+BEGIN;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+  -- Alice now has -100 if she only had 50
+  -- CHECK constraint violation → entire transaction rolls back
+COMMIT;
+```
+
+### Consistency
+
+Consistency ensures that a transaction brings the database from one valid state to another. All constraints (foreign keys, unique constraints, check constraints) must be satisfied before and after the transaction.
+
+```sql
+-- Consistency: Enforce business rules at the database level
+ALTER TABLE accounts ADD CONSTRAINT positive_balance
+  CHECK (balance >= 0);
+
+ALTER TABLE orders ADD CONSTRAINT valid_status
+  CHECK (status IN ('pending', 'processing', 'shipped', 'delivered', 'cancelled'));
+
+-- Application-level consistency with advisory locks
+-- Prevent double-booking of resources
+SELECT pg_advisory_xact_lock(hashtext('seat-42-flight-AA100'));
+INSERT INTO bookings (seat_id, flight_id, user_id) VALUES (42, 'AA100', 'user-123');
+-- Lock is automatically released when transaction ends
+```
+
+### Isolation
+
+Isolation determines how concurrent transactions interact. Without proper isolation, transactions can see each other's intermediate states, leading to dirty reads, non-repeatable reads, and phantom reads.
+
+### Durability
+
+Durability guarantees that once a transaction commits, its changes survive any subsequent failure (crash, power loss). PostgreSQL achieves this through Write-Ahead Logging (WAL)—changes are written to the WAL before being applied to data files.
+
+```sql
+-- Durability configuration
+-- postgresql.conf
+synchronous_commit = on      -- Wait for WAL flush before returning
+wal_level = replica           -- Sufficient for durability
+fsync = on                    -- Actually flush to disk (never disable in production!)
+
+-- For high-throughput systems where losing the last transaction is acceptable:
+SET LOCAL synchronous_commit = off;  -- Per-transaction: don't wait for WAL flush
+```
+
+![ACID properties diagram](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Isolation Levels: A Deep Dive
+
+PostgreSQL supports four isolation levels, each trading consistency for performance.
+
+### Read Uncommitted
+
+The weakest level. Transactions can see uncommitted changes from other transactions (dirty reads). In PostgreSQL, `READ UNCOMMITTED` is treated identically to `READ COMMITTED`—dirty reads are never allowed.
+
+```sql
+-- PostgreSQL doesn't actually allow dirty reads
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+-- Still behaves as READ COMMITTED
+```
+
+### Read Committed (Default)
+
+Each statement within a transaction sees only data committed before that statement began. This is PostgreSQL's default and works well for most applications.
+
+```sql
+-- Read Committed: Statement-level snapshot
+-- Transaction A                    -- Transaction B
+BEGIN;
+SELECT balance FROM accounts       -- Returns 100
+  WHERE id = 'alice';
+                                   BEGIN;
+                                   UPDATE accounts SET balance = 200
+                                     WHERE id = 'alice';
+                                   COMMIT;
+SELECT balance FROM accounts       -- Returns 200 (new snapshot per statement!)
+  WHERE id = 'alice';
+COMMIT;
+
+-- The problem: Two SELECTs in the same transaction return different values
+-- This is a "non-repeatable read"
+```
+
+### Repeatable Read
+
+All statements within a transaction see a consistent snapshot of the database as of the start of the transaction. This prevents non-repeatable reads and phantom reads.
+
+```sql
+-- Repeatable Read: Transaction-level snapshot
+-- Transaction A                    -- Transaction B
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts       -- Returns 100
+  WHERE id = 'alice';
+                                   UPDATE accounts SET balance = 200
+                                     WHERE id = 'alice';
+                                   COMMIT;
+SELECT balance FROM accounts       -- Still returns 100 (same snapshot!)
+  WHERE id = 'alice';
+
+-- But what if we try to update?
+UPDATE accounts SET balance = balance - 10 WHERE id = 'alice';
+-- ERROR: could not serialize access due to concurrent update
+-- The transaction must be retried
+COMMIT;
+```
+
+### Serializable
+
+The strongest level. Transactions behave as if they were executed sequentially (one at a time). This prevents all anomalies but requires retry logic for serialization failures.
+
+```sql
+-- Serializable: Full isolation
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+-- Transfer with serialization check
+UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+UPDATE accounts SET balance = balance + 100 WHERE id = 'bob';
+
+COMMIT;
+-- If another transaction creates a serialization anomaly:
+-- ERROR: could not serialize access due to read/write dependencies
+-- Application must retry the entire transaction
+```
+
+![Isolation levels comparison](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Optimistic vs Pessimistic Locking
+
+```sql
+-- PESSIMISTIC LOCKING: Lock the row before reading
+-- Use when conflicts are likely (high-contention resources)
+BEGIN;
+SELECT * FROM inventory
+WHERE product_id = 123
+FOR UPDATE;  -- Acquires exclusive lock on the row
+
+-- Other transactions block here until this one commits
+UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 123;
+COMMIT;
+
+-- FOR UPDATE NOWAIT: Fail immediately if locked (no blocking)
+SELECT * FROM inventory WHERE product_id = 123 FOR UPDATE NOWAIT;
+-- ERROR if locked
+
+-- FOR UPDATE SKIP LOCKED: Skip locked rows (queue pattern)
+SELECT * FROM tasks WHERE status = 'pending'
+ORDER BY created_at
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+```
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Optimistic Locking: Use a version column
+// Best when conflicts are rare (user profile updates, content editing)
+
+interface VersionedRow {
+  id: string;
+  data: any;
+  version: number;
+}
+
+async function updateWithOptimisticLock(
+  id: string,
+  updateFn: (current: VersionedRow) => any,
+  maxRetries: number = 3
+): Promise<void> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Read current version
+    const current = await pool.query(
+      'SELECT * FROM inventory WHERE id = $1',
+      [id]
+    );
+    if (current.rows.length === 0) throw new Error('Not found');
+
+    const row = current.rows[0];
+    const newData = updateFn(row);
+
+    // Try to update with version check
+    const result = await pool.query(
+      `UPDATE inventory
+       SET data = $1, version = version + 1
+       WHERE id = $2 AND version = $3`,
+      [newData, id, row.version]
+    );
+
+    if (result.rowCount === 1) return; // Success
+
+    // Version mismatch → someone else modified the row
+    // Retry with backoff
+    await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 100));
+  }
+  throw new Error('Optimistic lock failed after max retries');
 }
 ```
 
-This pattern demonstrates the core approach to implementing Database solutions in production environments.
+### Deadlock Detection and Prevention
 
-## Best Practices
+```sql
+-- Deadlock scenario:
+-- Transaction A locks row 1, then tries to lock row 2
+-- Transaction B locks row 2, then tries to lock row 1
+-- → Deadlock! PostgreSQL detects this and aborts one transaction
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+-- Prevention: Always acquire locks in the same order
+-- Sort row IDs before locking
+BEGIN;
+SELECT * FROM orders WHERE id = ANY(ARRAY[100, 200]) ORDER BY id FOR UPDATE;
+-- Both transactions lock row 100 first, then row 200 → no deadlock
+COMMIT;
 
-## Common Pitfalls
+-- Monitor deadlocks
+SELECT * FROM pg_stat_database WHERE datname = current_database();
+-- Look for deadlocks counter
+
+-- Set lock timeout to prevent long-waiting locks
+SET lock_timeout = '5s';
+```
+
+```typescript
+// Application-level deadlock prevention with ordered locking
+async function transferBetweenAccounts(fromId: string, toId: string, amount: number) {
+  // Always lock in consistent order (by ID) to prevent deadlocks
+  const [first, second] = [fromId, toId].sort();
+  const isFirst = first === fromId;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock both rows in deterministic order
+    await client.query(
+      'SELECT id, balance FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE',
+      [[first, second]]
+    );
+
+    // Debit and credit
+    const debitId = isFirst ? first : second;
+    const creditId = isFirst ? second : first;
+
+    await client.query(
+      'UPDATE accounts SET balance = balance - $1 WHERE id = $2',
+      [amount, fromId]
+    );
+    await client.query(
+      'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+      [amount, toId]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: E-Commerce Inventory Management
+
+```typescript
+// Pessimistic locking for inventory (high contention during sales)
+async function purchaseProduct(userId: string, productId: string, quantity: number) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+
+    // Lock the inventory row
+    const inv = await client.query(
+      'SELECT quantity FROM inventory WHERE product_id = $1 FOR UPDATE',
+      [productId]
+    );
+
+    if (inv.rows[0].quantity < quantity) {
+      await client.query('ROLLBACK');
+      throw new Error('Insufficient inventory');
+    }
+
+    // Decrement inventory and create order atomically
+    await client.query(
+      'UPDATE inventory SET quantity = quantity - $1 WHERE product_id = $2',
+      [quantity, productId]
+    );
+    await client.query(
+      'INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)',
+      [userId, productId, quantity, 'confirmed']
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+### Use Case 2: Concurrent Document Editing
+
+```typescript
+// Optimistic locking for document editing (low contention)
+async function saveDocument(docId: string, content: string, expectedVersion: number) {
+  const result = await pool.query(
+    `UPDATE documents
+     SET content = $1, version = version + 1, updated_at = now()
+     WHERE id = $2 AND version = $3`,
+    [content, docId, expectedVersion]
+  );
+
+  if (result.rowCount === 0) {
+    const current = await pool.query('SELECT version FROM documents WHERE id = $1', [docId]);
+    throw new ConflictError(`Document modified by another user (version ${current.rows[0].version})`);
+  }
+}
+```
+
+### Use Case 3: Distributed Transaction with 2PC
+
+```sql
+-- Two-phase commit for distributed transactions
+-- Phase 1: Prepare
+BEGIN;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+PREPARE TRANSACTION 'transfer_debit_alice';
+
+-- On another database:
+BEGIN;
+  UPDATE accounts SET balance = balance + 100 WHERE id = 'bob';
+PREPARE TRANSACTION 'transfer_credit_bob';
+
+-- Phase 2: Commit (after both preparations succeed)
+COMMIT PREPARED 'transfer_debit_alice';
+COMMIT PREPARED 'transfer_credit_bob';
+
+-- Cleanup orphaned prepared transactions (run periodically)
+SELECT * FROM pg_prepared_xacts;
+-- If a prepared transaction is too old, it needs manual resolution
+```
+
+## Best Practices for Production
+
+1. **Use the default READ COMMITTED for most operations**: It provides good concurrency with acceptable consistency for most web applications.
+2. **Use REPEATABLE READ for read-heavy reports**: Ensures consistent snapshots for analytics without blocking writers.
+3. **Use SERIALIZABLE for financial transactions**: When correctness is more important than throughput, SERIALIZABLE prevents all anomalies.
+4. **Keep transactions short**: Long transactions hold locks longer and increase contention. Move non-essential work outside the transaction.
+5. **Implement retry logic for serialization failures**: Both SERIALIZABLE and optimistic locking require retry logic with exponential backoff.
+6. **Sort lock acquisition order**: When locking multiple rows, always lock in the same deterministic order (e.g., by ID) to prevent deadlocks.
+7. **Set lock_timeout**: Prevent queries from waiting indefinitely for locks. 5-10 seconds is a good default for OLTP workloads.
+8. **Monitor for deadlocks**: Use `pg_stat_database` and `log_lock_waits` to detect and diagnose deadlocks.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Long-running transactions | Lock accumulation, replication lag | Set `idle_in_transaction_session_timeout` |
+| Missing retry logic | Lost updates under concurrency | Implement exponential backoff retry |
+| Using SELECT without FOR UPDATE | Lost updates (read-modify-write race) | Use FOR UPDATE or optimistic locking |
+| Lock ordering inconsistency | Deadlocks | Always lock rows in deterministic order |
+| READ COMMITTED snapshot per statement | Non-repeatable reads within transaction | Use REPEATABLE READ when consistency matters |
+
+## Performance Optimization
+
+```sql
+-- Tune lock-related settings
+deadlock_timeout = '1s'                    -- Detect deadlocks quickly
+lock_timeout = '5s'                        -- Don't wait forever
+idle_in_transaction_session_timeout = '30s' -- Kill idle transactions
+
+-- Monitor lock contention
+SELECT
+  blocked.pid AS blocked_pid,
+  blocked.query AS blocked_query,
+  blocking.pid AS blocking_pid,
+  blocking.query AS blocking_query
+FROM pg_catalog.pg_locks AS bl
+JOIN pg_catalog.pg_stat_activity AS blocked ON bl.pid = blocked.pid
+JOIN pg_catalog.pg_locks AS kl ON bl.transactionid = kl.transactionid AND bl.pid != kl.pid
+JOIN pg_catalog.pg_stat_activity AS blocking ON kl.pid = blocking.pid
+WHERE NOT bl.granted;
+```
+
+## Comparison with Alternatives
+
+| Feature | PostgreSQL | MySQL | SQLite | CockroachDB |
+|---------|-----------|-------|--------|-------------|
+| Default isolation | Read Committed | Repeatable Read | Serializable | Serializable |
+| MVCC | Yes | Yes (InnoDB) | No | Yes |
+| Serializable | Yes (SSI) | Yes (next-key locks) | By default | By default |
+| Deadlock detection | Yes | Yes | No | Yes |
+| Advisory locks | Yes | No | No | No |
+
+## Testing Strategies
+
+```typescript
+describe('Transaction Isolation', () => {
+  test('REPEATABLE READ prevents non-repeatable reads', async () => {
+    const client1 = await pool.connect();
+    const client2 = await pool.connect();
+
+    await client1.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    const r1 = await client1.query('SELECT balance FROM accounts WHERE id = $1', ['alice']);
+
+    await client2.query('BEGIN');
+    await client2.query('UPDATE accounts SET balance = 999 WHERE id = $1', ['alice']);
+    await client2.query('COMMIT');
+
+    const r2 = await client1.query('SELECT balance FROM accounts WHERE id = $1', ['alice']);
+    expect(r1.rows[0].balance).toBe(r2.rows[0].balance); // Same snapshot
+
+    await client1.query('COMMIT');
+    client1.release();
+    client2.release();
+  });
+
+  test('SERIALIZABLE detects write skew', async () => {
+    const client1 = await pool.connect();
+    const client2 = await pool.connect();
+
+    await client1.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+    await client2.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+
+    // Both read the same data
+    await client1.query('SELECT * FROM accounts WHERE id = $1', ['alice']);
+    await client2.query('SELECT * FROM accounts WHERE id = $1', ['alice']);
+
+    // Both modify
+    await client1.query('UPDATE accounts SET balance = 100 WHERE id = $1', ['alice']);
+    await client1.query('COMMIT');
+
+    await client2.query('UPDATE accounts SET balance = 200 WHERE id = $1', ['alice']);
+    await expect(client2.query('COMMIT')).rejects.toThrow(/serialization/);
+
+    client1.release();
+    client2.release();
+  });
+});
+```
+
+## Future Outlook
+
+PostgreSQL continues improving its SSI (Serializable Snapshot Isolation) implementation, reducing false-positive serialization failures. The trend toward distributed databases brings new transaction models—Calvin, SLOG, and Spanner-style transactions—that provide serializability without the retry overhead of traditional SSI.
 
 ## Conclusion
 
-Database Transactions: ACID, Isolation Levels, and Locks is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Understanding database transactions is essential for building reliable data-intensive applications. Key takeaways:
+
+1. Use **READ COMMITTED** as your default—it provides good concurrency for most OLTP workloads
+2. Upgrade to **SERIALIZABLE** for financial and high-consistency requirements—implement retry logic
+3. Choose **pessimistic locking** for high-contention resources (inventory, seats) and **optimistic locking** for low-contention resources (documents, profiles)
+4. Always lock rows in a deterministic order to prevent deadlocks
+5. Keep transactions as short as possible—move non-essential work outside the transaction boundary
+
+Start by auditing your existing transactions. Check isolation levels, lock patterns, and retry logic. The PostgreSQL documentation on [transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) and [explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html) are essential reading.

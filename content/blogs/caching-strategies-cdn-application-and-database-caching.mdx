@@ -1,62 +1,674 @@
 ---
 title: "Caching Strategies: CDN, Application, and Database Caching"
 date: "2020-09-10"
-description: "Multi-layer caching: CDN edge caching, application caching, and database query caching."
-tags: ["Caching", "CDN", "Performance", "Architecture"]
+description: "Master caching at every layer: CDN edge caching, application-level caching with Redis, and database query caching."
+tags: ["Caching", "Performance", "CDN", "Redis", "Database"]
 published: true
 author: "MinhVo"
 ---
 
 ## Introduction
 
-Caching Strategies: CDN, Application, and Database Caching is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Caching is one of the most impactful performance optimizations available to software engineers, yet it remains one of the most misunderstood. A well-designed caching strategy can reduce response times from hundreds of milliseconds to single-digit milliseconds, decrease infrastructure costs by orders of magnitude, and enable applications to handle traffic spikes that would otherwise overwhelm backend systems. A poorly designed caching strategy, however, can serve stale data, cause subtle bugs that only appear under load, and create operational complexity that outweighs its benefits.
 
-## Key Concepts
+The challenge is not whether to cache — every production system caches at some layer — but how to cache effectively across multiple layers simultaneously. Modern applications typically cache at three distinct layers: the CDN edge (closest to the user), the application layer (in-memory or distributed cache), and the database layer (query result caching). Each layer has different characteristics, different invalidation strategies, and different failure modes.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Caching Architecture](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+This article provides a comprehensive guide to caching strategies across all three layers, with practical implementation patterns, real-world examples, and the trade-offs that inform architectural decisions.
 
-## Practical Implementation
+## Understanding Caching: Core Concepts
 
-Let's look at a practical example:
+### Cache Hierarchy
+
+A typical web request passes through multiple caching layers before reaching the origin server:
+
+1. **Browser cache**: The user's browser caches responses based on HTTP headers (`Cache-Control`, `ETag`, `Last-Modified`). This is the fastest cache — no network request is made.
+
+2. **CDN edge cache**: Content Delivery Networks cache responses at edge locations worldwide. Requests are served from the nearest edge node, reducing latency and origin load.
+
+3. **Application cache**: In-memory caches (like Redis or Memcached) store frequently accessed data. This eliminates database queries and expensive computations.
+
+4. **Database cache**: Database systems maintain internal caches (buffer pools, query caches) that store frequently accessed data pages and query results.
+
+Each layer serves a different purpose and has different characteristics. Browser caches are per-user and limited in size. CDN caches are shared across users but limited to static content. Application caches are fast but require explicit management. Database caches are automatic but limited to the database server's memory.
+
+### Cache Invalidation
+
+The hardest problem in computer science, as Phil Karlton famously said, is cache invalidation. When the underlying data changes, cached copies must be updated or removed. There are three primary strategies:
+
+1. **Time-based expiration (TTL)**: Cached entries expire after a fixed duration. Simple to implement but may serve stale data until expiration.
+
+2. **Event-based invalidation**: Cached entries are invalidated when specific events occur (e.g., a database update). Requires a pub/sub mechanism or direct cache access from the data modification code.
+
+3. **Version-based invalidation**: Cached entries include a version identifier. When the data changes, the version is incremented, causing cache misses for stale entries.
+
+Each strategy has trade-offs. TTL is simple but imprecise. Event-based invalidation is precise but adds complexity. Version-based invalidation is scalable but requires careful key design.
+
+### Cache Aside vs Read Through vs Write Through
+
+The interaction pattern between the application and cache determines how data flows:
+
+**Cache Aside** (most common): The application checks the cache first. On a cache miss, it reads from the database, stores the result in the cache, and returns it. On a write, the application updates the database and invalidates the cache entry.
+
+**Read Through**: The cache itself is responsible for loading data from the database on a cache miss. The application only interacts with the cache.
+
+**Write Through**: Every write goes to both the cache and the database simultaneously. This ensures consistency but adds write latency.
+
+**Write Behind**: Writes go to the cache immediately and are asynchronously propagated to the database. This improves write performance but risks data loss if the cache fails before propagation.
+
+![Cache Flow Diagram](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### CDN Edge Caching
+
+CDN caching works by storing copies of your content at edge servers distributed globally. When a user requests content, the CDN serves it from the nearest edge location. If the content is not cached (a "cache miss"), the CDN fetches it from the origin server, caches it, and serves it to the user.
+
+**HTTP Cache Headers**: CDN caching is controlled by HTTP headers. The most important header is `Cache-Control`, which specifies caching directives:
+
+```http
+# Cache for 1 hour, allow CDN caching
+Cache-Control: public, max-age=3600
+
+# Cache for 1 hour, only browser caching (no CDN)
+Cache-Control: private, max-age=3600
+
+# No caching
+Cache-Control: no-store
+
+# Cache but revalidate with origin
+Cache-Control: no-cache
+```
+
+**Vary Header**: The `Vary` header tells the CDN that different versions of the content should be cached based on request headers:
+
+```http
+# Cache different versions based on Accept-Encoding
+Vary: Accept-Encoding
+
+# Cache different versions based on language
+Vary: Accept-Language
+```
+
+**Cache Key Design**: The cache key determines what makes a request unique. By default, CDN caches use the URL as the cache key. You can customize this to include query parameters, headers, or cookies.
+
+### Application-Level Caching with Redis
+
+Redis is the most popular choice for application-level caching due to its speed, data structures, and pub/sub capabilities. Here is a comprehensive caching layer implementation:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import Redis from "ioredis";
+
+const redis = new Redis({
+  host: process.env.REDIS_HOST ?? "localhost",
+  port: parseInt(process.env.REDIS_PORT ?? "6379"),
+  maxRetriesPerRequest: 3,
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+});
+
+interface CacheOptions {
+  ttl?: number;           // Time to live in seconds
+  prefix?: string;        // Key prefix for namespacing
+  serialize?: boolean;    // Whether to JSON serialize
+}
+
+class CacheManager {
+  private redis: Redis;
+  private defaultTTL: number;
+  private defaultPrefix: string;
+
+  constructor(redis: Redis, options: { defaultTTL?: number; defaultPrefix?: string } = {}) {
+    this.redis = redis;
+    this.defaultTTL = options.defaultTTL ?? 300; // 5 minutes
+    this.defaultPrefix = options.defaultPrefix ?? "app";
+  }
+
+  private buildKey(key: string, prefix?: string): string {
+    return `${prefix ?? this.defaultPrefix}:${key}`;
+  }
+
+  async get<T>(key: string, options: CacheOptions = {}): Promise<T | null> {
+    const fullKey = this.buildKey(key, options.prefix);
+    const value = await this.redis.get(fullKey);
+
+    if (value === null) return null;
+
+    return options.serialize === false ? value as T : JSON.parse(value);
+  }
+
+  async set<T>(key: string, value: T, options: CacheOptions = {}): Promise<void> {
+    const fullKey = this.buildKey(key, options.prefix);
+    const ttl = options.ttl ?? this.defaultTTL;
+    const serialized = options.serialize === false ? String(value) : JSON.stringify(value);
+
+    if (ttl > 0) {
+      await this.redis.setex(fullKey, ttl, serialized);
+    } else {
+      await this.redis.set(fullKey, serialized);
+    }
+  }
+
+  async delete(key: string, options: CacheOptions = {}): Promise<boolean> {
+    const fullKey = this.buildKey(key, options.prefix);
+    const result = await this.redis.del(fullKey);
+    return result > 0;
+  }
+
+  async invalidatePattern(pattern: string): Promise<number> {
+    const keys = await this.redis.keys(`${this.defaultPrefix}:${pattern}`);
+    if (keys.length === 0) return 0;
+    return this.redis.del(...keys);
+  }
+
+  async getOrSet<T>(
+    key: string,
+    factory: () => Promise<T>,
+    options: CacheOptions = {}
+  ): Promise<T> {
+    const cached = await this.get<T>(key, options);
+    if (cached !== null) return cached;
+
+    const value = await factory();
+    await this.set(key, value, options);
+    return value;
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing Caching solutions in production environments.
+### Database Query Caching
 
-## Best Practices
+Database query caching stores the results of expensive queries. This is particularly useful for read-heavy applications where the same queries are executed frequently:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+class QueryCache {
+  private cache: CacheManager;
+  private db: any;
 
-## Common Pitfalls
+  constructor(cache: CacheManager, db: any) {
+    this.cache = cache;
+    this.db = db;
+  }
+
+  async cachedQuery<T>(
+    queryKey: string,
+    queryFn: () => Promise<T>,
+    ttl = 300
+  ): Promise<T> {
+    return this.cache.getOrSet(`query:${queryKey}`, queryFn, { ttl });
+  }
+
+  async invalidateQueries(pattern: string): Promise<void> {
+    await this.cache.invalidatePattern(`query:${pattern}`);
+  }
+}
+
+// Usage
+const cache = new CacheManager(redis);
+const queryCache = new QueryCache(cache, db);
+
+// Cached query
+const users = await queryCache.cachedQuery(
+  "active-users:page:1",
+  () => db`SELECT * FROM users WHERE status = 'active' ORDER BY created_at DESC LIMIT 20`,
+  600 // 10 minutes TTL
+);
+
+// Invalidate when users are modified
+await queryCache.invalidateQueries("active-users:*");
+```
+
+## Step-by-Step Implementation
+
+### Multi-Layer Caching Middleware
+
+```typescript
+import { Context } from "hono";
+
+interface CacheLayer {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, ttl: number): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+class BrowserCacheLayer implements CacheLayer {
+  async get(): Promise<string | null> { return null; }
+  async set(key: string, value: string, ttl: number): Promise<void> {}
+  async delete(): Promise<void> {}
+}
+
+class CDNCacheLayer implements CacheLayer {
+  async get(): Promise<string | null> { return null; }
+  async set(key: string, value: string, ttl: number): Promise<void> {}
+  async delete(): Promise<void> {}
+}
+
+class RedisCacheLayer implements CacheLayer {
+  private redis: Redis;
+
+  constructor(redis: Redis) {
+    this.redis = redis;
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.redis.get(key);
+  }
+
+  async set(key: string, value: string, ttl: number): Promise<void> {
+    await this.redis.setex(key, ttl, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.redis.del(key);
+  }
+}
+
+class MultiLayerCache {
+  private layers: CacheLayer[];
+
+  constructor(...layers: CacheLayer[]) {
+    this.layers = layers;
+  }
+
+  async get(key: string): Promise<{ value: string | null; layer: number }> {
+    for (let i = 0; i < this.layers.length; i++) {
+      const value = await this.layers[i].get(key);
+      if (value !== null) {
+        // Backfill higher layers
+        for (let j = 0; j < i; j++) {
+          await this.layers[j].set(key, value, 300);
+        }
+        return { value, layer: i };
+      }
+    }
+    return { value: null, layer: -1 };
+  }
+
+  async set(key: string, value: string, ttl: number): Promise<void> {
+    await Promise.all(
+      this.layers.map((layer) => layer.set(key, value, ttl))
+    );
+  }
+
+  async delete(key: string): Promise<void> {
+    await Promise.all(
+      this.layers.map((layer) => layer.delete(key))
+    );
+  }
+}
+```
+
+### HTTP Caching Middleware
+
+```typescript
+import { Context, Next } from "hono";
+
+function httpCache(options: { maxAge?: number; sMaxAge?: number; staleWhileRevalidate?: number } = {}) {
+  const { maxAge = 60, sMaxAge = 300, staleWhileRevalidate = 60 } = options;
+
+  return async (c: Context, next: Next) => {
+    // Check for conditional request
+    const ifNoneMatch = c.req.header("If-None-Match");
+    const ifModifiedSince = c.req.header("If-Modified-Since");
+
+    await next();
+
+    // Set cache headers
+    const cacheControl = [
+      `public`,
+      `max-age=${maxAge}`,
+      `s-maxage=${sMaxAge}`,
+      `stale-while-revalidate=${staleWhileRevalidate}`,
+    ].join(", ");
+
+    c.header("Cache-Control", cacheControl);
+    c.header("Vary", "Accept-Encoding, Accept-Language");
+
+    // Set ETag based on response body
+    const body = await c.res.clone().text();
+    const hash = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+    const etag = `"${hash}"`;
+    c.header("ETag", etag);
+
+    // Return 304 if ETag matches
+    if (ifNoneMatch === etag) {
+      return c.body(null, 304);
+    }
+  };
+}
+
+// Usage
+app.get("/api/products", httpCache({ maxAge: 60, sMaxAge: 300 }), async (c) => {
+  const products = await getProducts();
+  return c.json(products);
+});
+```
+
+### Cache Warming Strategy
+
+```typescript
+class CacheWarmer {
+  private cache: CacheManager;
+  private tasks: Array<{ key: string; factory: () => Promise<any>; ttl: number }> = [];
+
+  constructor(cache: CacheManager) {
+    this.cache = cache;
+  }
+
+  register(key: string, factory: () => Promise<any>, ttl: number): void {
+    this.tasks.push({ key, factory, ttl });
+  }
+
+  async warm(): Promise<void> {
+    console.log(`Warming ${this.tasks.length} cache entries...`);
+    const start = Date.now();
+
+    await Promise.all(
+      this.tasks.map(async ({ key, factory, ttl }) => {
+        try {
+          const value = await factory();
+          await this.cache.set(key, value, { ttl });
+          console.log(`Warmed: ${key}`);
+        } catch (error) {
+          console.error(`Failed to warm ${key}:`, error);
+        }
+      })
+    );
+
+    console.log(`Cache warming completed in ${Date.now() - start}ms`);
+  }
+
+  async startPeriodic(intervalMs: number): Promise<void> {
+    await this.warm();
+    setInterval(() => this.warm(), intervalMs);
+  }
+}
+
+// Usage
+const warmer = new CacheWarmer(cache);
+warmer.register("popular-products", () => getPopularProducts(), 3600);
+warmer.register("categories", () => getCategories(), 7200);
+warmer.register("homepage-content", () => getHomepageContent(), 1800);
+warmer.startPeriodic(30 * 60 * 1000); // Refresh every 30 minutes
+```
+
+![Performance Monitoring](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### E-Commerce Product Catalog
+
+Product catalogs are read-heavy workloads that benefit from aggressive caching. Cache product details at the CDN edge with a 5-minute TTL, cache search results in Redis with a 2-minute TTL, and cache individual product pages in the browser for 1 hour. When a product is updated, invalidate the Redis cache and purge the CDN cache for that product's URL.
+
+### Social Media Feed
+
+Social media feeds are personalized and frequently updated. Cache the feed in Redis with a 1-minute TTL, and use event-based invalidation when new posts are created. For the CDN layer, cache static assets (images, videos) aggressively but use `no-cache` for the feed API.
+
+### Dashboard Analytics
+
+Dashboard data changes infrequently but is expensive to compute. Cache aggregated metrics in Redis with a 5-minute TTL, and use cache warming to pre-compute common queries. When new data arrives, invalidate affected cache entries and recompute in the background.
+
+### API Rate Limiting
+
+Use Redis to implement rate limiting with sliding window counters. Cache the counter in Redis with a 1-minute TTL, and increment it on each request. This provides both rate limiting and request counting without hitting the database.
+
+## Best Practices for Production
+
+1. **Cache at the right layer**: Static assets belong at the CDN edge. Frequently accessed data belongs in the application cache. Database query results belong in the database cache. Don't cache everything everywhere — each layer adds complexity.
+
+2. **Use appropriate TTLs**: Short TTLs (seconds to minutes) for frequently changing data. Medium TTLs (minutes to hours) for moderately changing data. Long TTLs (hours to days) for rarely changing data. Never cache indefinitely without a refresh mechanism.
+
+3. **Implement cache stampede protection**: When a popular cache entry expires, multiple requests may simultaneously try to regenerate it (a "stampede"). Use locks or probabilistic early expiration to prevent this.
+
+4. **Monitor cache hit rates**: Track cache hit/miss ratios for each layer. A low hit rate indicates poor key design or inappropriate TTLs. A high hit rate indicates effective caching.
+
+5. **Handle cache failures gracefully**: If the cache is unavailable, fall back to the database. Don't let cache failures cascade into application failures. Implement circuit breakers for cache connections.
+
+6. **Use cache warming for critical paths**: Pre-populate caches for data that must be available immediately (homepage content, popular products, configuration). Don't rely on the first request to warm the cache.
+
+7. **Invalidate proactively**: Don't rely solely on TTL expiration. When data changes, invalidate affected cache entries immediately. This reduces the window for stale data.
+
+8. **Test cache behavior**: Write tests that verify cache hit/miss behavior, invalidation logic, and fallback mechanisms. Cache bugs are often only visible under production load.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Caching everything | Memory waste, stale data | Cache strategically based on access patterns |
+| Wrong TTL | Stale data or excessive cache misses | Profile data change frequency and set TTLs accordingly |
+| Cache stampede | Database overload on expiration | Use locks or probabilistic early expiration |
+| No cache invalidation | Serving stale data | Implement event-based invalidation for critical data |
+| Ignoring cache failures | Application crashes | Implement fallback to database when cache fails |
+| Poor key design | Cache collisions or misses | Use hierarchical keys with clear namespacing |
+
+### Debugging Cache Issues
+
+```typescript
+class CacheDebugger {
+  private cache: CacheManager;
+  private hits = 0;
+  private misses = 0;
+
+  constructor(cache: CacheManager) {
+    this.cache = cache;
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    const value = await this.cache.get<T>(key);
+    if (value !== null) {
+      this.hits++;
+      console.log(`[CACHE HIT] ${key} (${this.hitRate}%)`);
+    } else {
+      this.misses++;
+      console.log(`[CACHE MISS] ${key} (${this.hitRate}%)`);
+    }
+    return value;
+  }
+
+  get hitRate(): string {
+    const total = this.hits + this.misses;
+    return total === 0 ? "0" : ((this.hits / total) * 100).toFixed(1);
+  }
+
+  get stats() {
+    return { hits: this.hits, misses: this.misses, hitRate: this.hitRate };
+  }
+}
+```
+
+## Performance Optimization
+
+### Cache Aside with Distributed Lock
+
+```typescript
+async function getWithLock<T>(
+  cache: CacheManager,
+  redis: Redis,
+  key: string,
+  factory: () => Promise<T>,
+  ttl: number
+): Promise<T> {
+  // Try cache first
+  const cached = await cache.get<T>(key);
+  if (cached !== null) return cached;
+
+  // Acquire lock to prevent stampede
+  const lockKey = `lock:${key}`;
+  const acquired = await redis.set(lockKey, "1", "EX", 10, "NX");
+
+  if (!acquired) {
+    // Another process is generating the value
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return getWithLock(cache, redis, key, factory, ttl);
+  }
+
+  try {
+    // Double-check cache (another process may have populated it)
+    const cachedAfterLock = await cache.get<T>(key);
+    if (cachedAfterLock !== null) return cachedAfterLock;
+
+    // Generate value
+    const value = await factory();
+    await cache.set(key, value, { ttl });
+    return value;
+  } finally {
+    await redis.del(lockKey);
+  }
+}
+```
+
+## Comparison with Alternatives
+
+| Strategy | Consistency | Complexity | Performance | Use Case |
+|----------|-------------|------------|-------------|----------|
+| TTL-only | Eventually consistent | Low | High | Static content, non-critical data |
+| Event-based invalidation | Strongly consistent | High | High | Critical data, real-time updates |
+| Write-through | Strongly consistent | Medium | Medium | Financial data, inventory |
+| Write-behind | Eventually consistent | High | Very high | Analytics, logging, non-critical writes |
+| Cache-aside | Eventually consistent | Low | High | General-purpose, most applications |
+
+## Advanced Patterns
+
+### Probabilistic Early Expiration
+
+Prevent cache stampedes by probabilistically expiring entries before their TTL:
+
+```typescript
+function shouldExpireEarly(ttl: number, beta = 1.0): boolean {
+  const jitter = Math.random() * ttl * beta;
+  return jitter < ttl * 0.1; // 10% chance of early expiration
+}
+
+async function getWithEarlyExpiration<T>(
+  cache: CacheManager,
+  key: string,
+  factory: () => Promise<T>,
+  ttl: number
+): Promise<T> {
+  const cached = await cache.get<{ value: T; expiration: number }>(key);
+
+  if (cached) {
+    const timeUntilExpiration = cached.expiration - Date.now();
+    if (timeUntilExpiration > 0 && !shouldExpireEarly(ttl)) {
+      return cached.value;
+    }
+  }
+
+  const value = await factory();
+  await cache.set(key, {
+    value,
+    expiration: Date.now() + ttl * 1000,
+  }, { ttl: ttl + 60 }); // Store slightly longer than TTL
+
+  return value;
+}
+```
+
+### Multi-Region Cache Invalidation
+
+For applications deployed across multiple regions, use a pub/sub system to propagate cache invalidations:
+
+```typescript
+import { Redis } from "ioredis";
+
+class MultiRegionCacheInvalidator {
+  private publisher: Redis;
+  private subscriber: Redis;
+  private cache: CacheManager;
+
+  constructor(cache: Redis, pubsub: Redis, cacheManager: CacheManager) {
+    this.publisher = pubsub;
+    this.subscriber = pubsub.duplicate();
+    this.cache = cacheManager;
+
+    this.subscriber.subscribe("cache:invalidate");
+    this.subscriber.on("message", async (channel, message) => {
+      if (channel === "cache:invalidate") {
+        const { key, pattern } = JSON.parse(message);
+        if (pattern) {
+          await this.cache.invalidatePattern(pattern);
+        } else if (key) {
+          await this.cache.delete(key);
+        }
+      }
+    });
+  }
+
+  async invalidate(key: string): Promise<void> {
+    await this.cache.delete(key);
+    await this.publisher.publish("cache:invalidate", JSON.stringify({ key }));
+  }
+
+  async invalidatePattern(pattern: string): Promise<void> {
+    await this.cache.invalidatePattern(pattern);
+    await this.publisher.publish("cache:invalidate", JSON.stringify({ pattern }));
+  }
+}
+```
+
+## Testing Strategies
+
+### Cache Integration Tests
+
+```typescript
+import { test, expect, beforeEach, afterEach } from "bun:test";
+import Redis from "ioredis";
+
+let redis: Redis;
+let cache: CacheManager;
+
+beforeEach(async () => {
+  redis = new Redis();
+  cache = new CacheManager(redis, { defaultPrefix: "test" });
+  await redis.flushdb();
+});
+
+afterEach(async () => {
+  await redis.flushdb();
+  redis.disconnect();
+});
+
+test("cache miss returns null and populates on set", async () => {
+  const value = await cache.get("nonexistent");
+  expect(value).toBeNull();
+
+  await cache.set("key", { data: "test" });
+  const cached = await cache.get("key");
+  expect(cached).toEqual({ data: "test" });
+});
+
+test("getOrSet caches factory result", async () => {
+  let callCount = 0;
+  const factory = async () => {
+    callCount++;
+    return { computed: true };
+  };
+
+  const result1 = await cache.getOrSet("computed", factory);
+  const result2 = await cache.getOrSet("computed", factory);
+
+  expect(result1).toEqual({ computed: true });
+  expect(result2).toEqual({ computed: true });
+  expect(callCount).toBe(1); // Factory called only once
+});
+```
+
+## Future Outlook
+
+Caching strategies are evolving with the rise of edge computing and serverless architectures. Edge functions (Cloudflare Workers, Vercel Edge Functions) enable caching at the network edge without traditional CDN infrastructure. In-memory databases like DragonflyDB are challenging Redis's dominance with better memory efficiency and multi-threaded performance.
+
+The trend toward real-time applications is pushing caching toward event-driven invalidation. Instead of relying on TTLs, caches are invalidated by database change streams, message queues, and event buses. This provides stronger consistency guarantees while maintaining the performance benefits of caching.
 
 ## Conclusion
 
-Caching Strategies: CDN, Application, and Database Caching is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Effective caching requires understanding the characteristics of each layer and designing strategies that balance consistency, performance, and complexity. The key is to cache at the right layer with the right TTL and the right invalidation strategy for each type of data.
+
+Key takeaways:
+
+1. **Cache at multiple layers**: Browser, CDN, application, and database caches each serve different purposes. Use them together for maximum impact.
+2. **Design for invalidation**: Plan how cached data will be updated before you start caching. Invalidation is the hardest part of caching.
+3. **Monitor cache effectiveness**: Track hit rates, latency, and memory usage. A cache that isn't being hit is wasted resources.
+4. **Handle failures gracefully**: Caches are auxiliary systems. When they fail, fall back to the source of truth. Don't let cache failures cascade.
+5. **Test cache behavior**: Cache bugs are often invisible under low traffic. Test cache hit/miss behavior, invalidation logic, and concurrent access patterns.
+
+Start with cache-aside for your most frequently accessed data, add CDN caching for static assets, and iterate from there. The performance benefits are immediate and measurable.

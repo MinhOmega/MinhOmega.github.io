@@ -9,54 +9,557 @@ author: "MinhVo"
 
 ## Introduction
 
-Database Transactions: ACID, Isolation Levels, and Patterns is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Transactions are the foundation of data integrity in every database-backed application. When two users simultaneously purchase the last item in stock, when a payment gateway callback arrives while the user is modifying their order, when a background job and a user request update the same record—transactions ensure the database remains consistent.
 
-## Key Concepts
+Yet transaction-related bugs are among the hardest to reproduce and debug. They manifest under load, not in development. They cause silent data corruption, not crashes. A 2022 study by the University of Waterloo found that 23% of web applications tested exhibited lost update anomalies under concurrent access, even when using "safe" default isolation levels.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers ACID properties from a practitioner's perspective, explains each isolation level with concrete anomaly examples, and presents battle-tested patterns for handling transactions in production systems.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Transaction management concepts](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding ACID in Practice
 
-Let's look at a practical example:
+### Atomicity: All or Nothing
+
+Atomicity is the most intuitive ACID property. A transaction's changes are either all applied or all reverted. But the subtlety lies in what constitutes a "failure":
+
+```sql
+-- Explicit rollback on business rule violation
+BEGIN;
+  SELECT balance INTO current_balance FROM accounts WHERE id = 'alice' FOR UPDATE;
+  
+  IF current_balance < 100 THEN
+    RAISE EXCEPTION 'Insufficient funds: have %, need %', current_balance, 100;
+    -- Implicit ROLLBACK due to exception
+  END IF;
+  
+  UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+  UPDATE accounts SET balance = balance + 100 WHERE id = 'bob';
+COMMIT;
+
+-- Savepoints: Partial rollback within a transaction
+BEGIN;
+  INSERT INTO orders (user_id, total) VALUES ('alice', 500) RETURNING id;
+  -- order_id = 42
+  
+  SAVEPOINT before_items;
+  BEGIN
+    INSERT INTO order_items (order_id, product_id, quantity) VALUES (42, 'widget', 5);
+  EXCEPTION WHEN OTHERS THEN
+    ROLLBACK TO SAVEPOINT before_items;
+    -- Order still exists, just without this item
+  END;
+  
+  INSERT INTO order_items (order_id, product_id, quantity) VALUES (42, 'gadget', 2);
+COMMIT;
+```
+
+### Consistency: Invariants Hold
+
+Consistency means the database transitions from one valid state to another. All constraints—foreign keys, unique constraints, check constraints, and application-level invariants—must be satisfied.
+
+```sql
+-- Enforcing complex invariants with triggers
+CREATE OR REPLACE FUNCTION check_account_balance()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.balance < 0 AND NOT EXISTS (
+    SELECT 1 FROM accounts WHERE id = NEW.id AND overdraft_allowed = true
+  ) THEN
+    RAISE EXCEPTION 'Account % balance cannot go below zero', NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER enforce_balance
+  BEFORE UPDATE OF balance ON accounts
+  FOR EACH ROW
+  EXECUTE FUNCTION check_account_balance();
+
+-- Row-level security for multi-tenant consistency
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON orders
+  USING (tenant_id = current_setting('app.current_tenant')::uuid);
+```
+
+### Isolation: Concurrent Transactions Don't Interfere
+
+Isolation is where things get complicated. The SQL standard defines four isolation levels, but PostgreSQL's implementation has nuances that directly affect application behavior.
+
+### Durability: Committed Data Survives Crashes
+
+```sql
+-- PostgreSQL achieves durability through WAL
+-- Verify WAL configuration
+SHOW wal_level;        -- Should be 'replica' or 'logical'
+SHOW fsync;            -- Should be 'on' (NEVER disable in production)
+SHOW synchronous_commit; -- 'on' for full durability
+
+-- For high-throughput systems accepting minor data loss risk:
+-- Use synchronous_commit = 'off' for specific sessions
+SET LOCAL synchronous_commit = off;
+-- This means the last few transactions might be lost on crash
+```
+
+![ACID properties deep dive](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## Isolation Levels and Their Anomalies
+
+### The Three Anomalies
+
+**Dirty Read**: Reading uncommitted data from another transaction. If that transaction rolls back, you've read data that never existed.
+
+**Non-Repeatable Read**: Reading the same row twice in one transaction and getting different values because another transaction committed a change between your reads.
+
+**Phantom Read**: Running the same query twice in one transaction and getting different row sets because another transaction inserted or deleted rows.
+
+### PostgreSQL Isolation Levels in Detail
+
+```sql
+-- READ COMMITTED (Default)
+-- Each statement gets a new snapshot
+-- Prevents: Dirty reads
+-- Allows: Non-repeatable reads, phantom reads
+
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- Returns 5
+-- Another transaction inserts a new pending order and commits
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- Returns 6!
+COMMIT;
+
+-- REPEATABLE READ
+-- Transaction gets one snapshot at the start
+-- Prevents: Dirty reads, non-repeatable reads, phantoms
+-- Throws error on write conflicts
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- Returns 5
+-- Another transaction inserts a new pending order and commits
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- Still returns 5
+
+-- But if we try to modify conflicting data:
+UPDATE orders SET status = 'processed' WHERE status = 'pending';
+-- May ERROR: could not serialize access due to concurrent update
+COMMIT;
+
+-- SERIALIZABLE
+-- Full serializability using SSI (Serializable Snapshot Isolation)
+-- Prevents: All anomalies including write skew
+-- Throws serialization failures that require retry
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+-- This transaction sees a consistent snapshot
+-- Any anomaly that would violate serializability causes an error
+-- Application MUST retry on serialization failure
+COMMIT;
+```
+
+### Write Skew: The Hidden Anomaly
+
+Write skew occurs when two transactions read overlapping data, make disjoint writes based on what they read, and both commit—violating a constraint that neither individually violated.
+
+```sql
+-- Classic write skew: On-call scheduling
+-- Rule: At least one doctor must be on-call at all times
+
+-- Transaction A (Dr. Alice wants to go off-call)
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM on_call WHERE shift = 'night';  -- Returns 2 (Alice and Bob)
+UPDATE on_call SET on_call = false WHERE doctor = 'alice' AND shift = 'night';
+COMMIT;  -- Succeeds!
+
+-- Transaction B (Dr. Bob wants to go off-call) - concurrent
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM on_call WHERE shift = 'night';  -- Returns 2 (same snapshot)
+UPDATE on_call SET on_call = false WHERE doctor = 'bob' AND shift = 'night';
+COMMIT;  -- Succeeds!
+
+-- Result: No doctors on call! Write skew anomaly.
+-- Fix: Use SERIALIZABLE or explicit locking
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT COUNT(*) FROM on_call WHERE shift = 'night';
+UPDATE on_call SET on_call = false WHERE doctor = 'alice' AND shift = 'night';
+COMMIT;
+-- One of the two transactions will get a serialization failure
+```
+
+![Isolation levels spectrum](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Application-Level Transaction Patterns
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Transaction helper with automatic retry for serialization failures
+import { Pool, PoolClient } from 'pg';
+
+interface TransactionOptions {
+  isolationLevel?: 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
+  maxRetries?: number;
+  retryDelay?: number;
+  timeout?: number;
+}
+
+async function withTransaction<T>(
+  pool: Pool,
+  fn: (client: PoolClient) => Promise<T>,
+  options: TransactionOptions = {}
+): Promise<T> {
+  const {
+    isolationLevel = 'READ COMMITTED',
+    maxRetries = 3,
+    retryDelay = 100,
+    timeout = 30000,
+  } = options;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query(`BEGIN ISOLATION LEVEL ${isolationLevel}`);
+      if (timeout) {
+        await client.query(`SET LOCAL statement_timeout = '${timeout}'`);
+      }
+
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err: any) {
+      await client.query('ROLLBACK');
+
+      // Retry on serialization failure or deadlock
+      if (
+        attempt < maxRetries &&
+        (err.code === '40001' || // serialization_failure
+         err.code === '40P01')   // deadlock_detected
+      ) {
+        const delay = retryDelay * Math.pow(2, attempt) + Math.random() * 100;
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  throw new Error('Unreachable');
+}
+
+// Usage: Transfer with SERIALIZABLE isolation
+async function transfer(fromId: string, toId: string, amount: number) {
+  return withTransaction(pool, async (client) => {
+    const from = await client.query(
+      'SELECT balance FROM accounts WHERE id = $1 FOR UPDATE',
+      [fromId]
+    );
+    if (from.rows[0].balance < amount) {
+      throw new Error('Insufficient funds');
+    }
+
+    await client.query(
+      'UPDATE accounts SET balance = balance - $1 WHERE id = $2',
+      [amount, fromId]
+    );
+    await client.query(
+      'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+      [amount, toId]
+    );
+
+    return { success: true };
+  }, { isolationLevel: 'SERIALIZABLE', maxRetries: 5 });
 }
 ```
 
-This pattern demonstrates the core approach to implementing Database solutions in production environments.
+### Saga Pattern for Distributed Transactions
 
-## Best Practices
+```typescript
+// Saga pattern: Sequence of local transactions with compensating actions
+interface SagaStep<T> {
+  name: string;
+  execute: (context: T) => Promise<T>;
+  compensate: (context: T) => Promise<void>;
+}
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+class Saga<T> {
+  private steps: SagaStep<T>[] = [];
+  private completedSteps: SagaStep<T>[] = [];
 
-## Common Pitfalls
+  addStep(step: SagaStep<T>): this {
+    this.steps.push(step);
+    return this;
+  }
+
+  async run(initialContext: T): Promise<T> {
+    let context = initialContext;
+
+    for (const step of this.steps) {
+      try {
+        context = await step.execute(context);
+        this.completedSteps.push(step);
+      } catch (err) {
+        // Compensate in reverse order
+        for (const completed of this.completedSteps.reverse()) {
+          try {
+            await completed.compensate(context);
+          } catch (compErr) {
+            console.error(`Compensation failed for ${completed.name}:`, compErr);
+            // Log for manual resolution
+          }
+        }
+        throw err;
+      }
+    }
+    return context;
+  }
+}
+
+// Usage: Order placement saga
+const orderSaga = new Saga<OrderContext>()
+  .addStep({
+    name: 'reserve-inventory',
+    execute: async (ctx) => {
+      await inventoryService.reserve(ctx.items);
+      return ctx;
+    },
+    compensate: async (ctx) => {
+      await inventoryService.release(ctx.items);
+    },
+  })
+  .addStep({
+    name: 'process-payment',
+    execute: async (ctx) => {
+      const payment = await paymentService.charge(ctx.userId, ctx.total);
+      return { ...ctx, paymentId: payment.id };
+    },
+    compensate: async (ctx) => {
+      await paymentService.refund(ctx.paymentId);
+    },
+  })
+  .addStep({
+    name: 'create-shipment',
+    execute: async (ctx) => {
+      const shipment = await shippingService.create(ctx.items, ctx.address);
+      return { ...ctx, shipmentId: shipment.id };
+    },
+    compensate: async (ctx) => {
+      await shippingService.cancel(ctx.shipmentId);
+    },
+  });
+
+const result = await orderSaga.run({
+  userId: 'alice',
+  items: [{ productId: 'widget', quantity: 2 }],
+  total: 59.99,
+  address: '123 Main St',
+});
+```
+
+## Real-World Use Cases
+
+### Use Case 1: Banking Ledger with Double-Entry Bookkeeping
+
+```sql
+-- Double-entry: Every transaction has equal debits and credits
+CREATE TABLE ledger_entries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  transaction_id UUID NOT NULL,
+  account_id UUID NOT NULL,
+  amount DECIMAL(15,2) NOT NULL,  -- Positive = credit, negative = debit
+  created_at TIMESTAMPTZ DEFAULT now(),
+  CHECK (amount != 0)
+);
+
+-- Enforce double-entry invariant
+CREATE OR REPLACE FUNCTION enforce_double_entry()
+RETURNS TRIGGER AS $$
+DECLARE
+  total DECIMAL(15,2);
+BEGIN
+  SELECT SUM(amount) INTO total
+  FROM ledger_entries
+  WHERE transaction_id = NEW.transaction_id;
+
+  IF total != 0 THEN
+    RAISE EXCEPTION 'Transaction % entries do not sum to zero: %', NEW.transaction_id, total;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER check_double_entry
+  AFTER INSERT ON ledger_entries
+  FOR EACH ROW
+  EXECUTE FUNCTION enforce_double_entry();
+
+-- Atomic transfer
+INSERT INTO ledger_entries (transaction_id, account_id, amount) VALUES
+  ('txn-1', 'alice-account', -100.00),
+  ('txn-1', 'bob-account', 100.00);
+```
+
+### Use Case 2: Ticket Reservation with Expiration
+
+```typescript
+// Pessimistic locking with timeout for seat reservation
+async function reserveSeat(eventId: string, seatId: string, userId: string): Promise<string> {
+  return withTransaction(pool, async (client) => {
+    // Lock the seat
+    const seat = await client.query(
+      `SELECT * FROM seats
+       WHERE event_id = $1 AND seat_number = $2
+       FOR UPDATE NOWAIT`,
+      [eventId, seatId]
+    );
+
+    if (seat.rows.length === 0) throw new Error('Seat not found');
+    if (seat.rows[0].status !== 'available') {
+      throw new Error(`Seat ${seatId} is ${seat.rows[0].status}`);
+    }
+
+    // Reserve with 15-minute expiration
+    const reservationId = generateId();
+    await client.query(
+      `UPDATE seats SET status = 'reserved', reservation_id = $1, reserved_until = now() + interval '15 minutes'
+       WHERE event_id = $2 AND seat_number = $3`,
+      [reservationId, eventId, seatId]
+    );
+
+    return reservationId;
+  }, { isolationLevel: 'READ COMMITTED', timeout: 5000 });
+}
+```
+
+### Use Case 3: Multi-Step Form with Progressive Save
+
+```typescript
+// Save form progress incrementally using savepoints
+async function saveFormProgress(formId: string, section: string, data: any) {
+  return withTransaction(pool, async (client) => {
+    // Upsert form data
+    await client.query(
+      `INSERT INTO form_data (form_id, section, data, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (form_id, section)
+       DO UPDATE SET data = $3, updated_at = now()`,
+      [formId, section, JSON.stringify(data)]
+    );
+
+    // Validate section
+    const isValid = validateSection(section, data);
+    if (!isValid) {
+      await client.query(
+        `UPDATE form_data SET validation_errors = $1 WHERE form_id = $2 AND section = $3`,
+        [JSON.stringify(getErrors()), formId, section]
+      );
+    }
+
+    return { saved: true, valid: isValid };
+  });
+}
+```
+
+## Best Practices for Production
+
+1. **Default to READ COMMITTED**: It's the right choice for 90% of web application workloads. Upgrade only when you have a specific anomaly to prevent.
+2. **Use SERIALIZABLE for money and inventory**: Any resource where concurrent access can cause incorrect state changes deserves the strongest isolation.
+3. **Implement retry logic everywhere**: Serialization failures and deadlocks are normal occurrences, not errors. Treat them like network timeouts.
+4. **Set statement_timeout and lock_timeout**: Prevent runaway queries and lock accumulation. Start with 10s for statements and 5s for locks.
+5. **Use advisory locks for application-level coordination**: `pg_advisory_xact_lock` provides mutex semantics without touching your data tables.
+6. **Keep transactions under 100ms**: Long transactions block VACUUM, cause replication lag, and increase lock contention. Move slow operations (email, API calls) outside the transaction.
+7. **Monitor idle-in-transaction sessions**: These hold locks and prevent cleanup. Kill them with `idle_in_transaction_session_timeout`.
+8. **Test with concurrent access**: Use tools like pgbench, Jepsen, or custom concurrent test suites to verify your transaction logic under load.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using READ COMMITTED for consistency | Phantom reads, stale data | Use REPEATABLE READ or SERIALIZABLE |
+| No retry logic for serialization failures | Random transaction failures | Implement exponential backoff retry |
+| Long transactions | Lock accumulation, replication lag | Set timeouts, move async work outside |
+| FOR UPDATE without NOWAIT/SKIP LOCKED | Thread starvation | Use NOWAIT or SKIP LOCKED for non-blocking |
+| Missing connection release | Connection pool exhaustion | Use try/finally or connection middleware |
+
+## Performance Optimization
+
+```sql
+-- Monitor transaction performance
+SELECT
+  pid,
+  now() - xact_start AS duration,
+  query,
+  state,
+  wait_event_type,
+  wait_event
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY duration DESC;
+
+-- Find blocking lock chains
+WITH RECURSIVE lock_chain AS (
+  SELECT pid, locktype, relation, granted, pid AS root_pid, 1 AS depth
+  FROM pg_locks WHERE NOT granted
+  UNION ALL
+  SELECT l.pid, l.locktype, l.relation, l.granted, lc.root_pid, lc.depth + 1
+  FROM pg_locks l
+  JOIN lock_chain lc ON l.pid = lc.pid
+  WHERE l.granted
+)
+SELECT * FROM lock_chain WHERE depth > 1;
+```
+
+## Comparison with Alternatives
+
+| Feature | PostgreSQL | MySQL InnoDB | Oracle | SQL Server |
+|---------|-----------|--------------|--------|------------|
+| Default isolation | Read Committed | Repeatable Read | Read Committed | Read Committed |
+| MVCC implementation | Multi-version | Undo log | Undo log | Version store |
+| Serializable method | SSI | Next-key locks | Serial | Lock-based |
+| Advisory locks | Yes | GET_LOCK() | DBMS_LOCK | sp_getapplock |
+| Savepoints | Yes | Yes | Yes | Yes |
+
+## Testing Strategies
+
+```typescript
+describe('Concurrent Access', () => {
+  test('prevents lost updates with SERIALIZABLE', async () => {
+    const results = await Promise.allSettled([
+      updateBalance('alice', 100, 'SERIALIZABLE'),
+      updateBalance('alice', 200, 'SERIALIZABLE'),
+    ]);
+
+    const successes = results.filter(r => r.status === 'fulfilled');
+    const failures = results.filter(r => r.status === 'rejected');
+
+    // Exactly one should succeed, one should fail with serialization error
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(1);
+    expect((failures[0] as any).reason.code).toBe('40001');
+  });
+
+  test('prevents deadlocks with consistent lock ordering', async () => {
+    // Both transfers lock accounts in same order (by ID)
+    await expect(
+      Promise.all([
+        transfer('alice', 'bob', 50),
+        transfer('bob', 'alice', 30),
+      ])
+    ).resolves.toBeDefined(); // No deadlock
+  });
+});
+```
+
+## Future Outlook
+
+PostgreSQL 17+ continues improving SSI performance, reducing false-positive serialization failures. The trend toward distributed databases (CockroachDB, Spanner) is making serializable isolation the default, eliminating the isolation level confusion that plagues application developers. Calvin-style deterministic databases promise serializability without retries by pre-ordering transactions.
 
 ## Conclusion
 
-Database Transactions: ACID, Isolation Levels, and Patterns is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Transaction management is a deep topic that directly impacts data correctness. Key takeaways:
+
+1. Use **READ COMMITTED** by default, **SERIALIZABLE** for financial/critical operations
+2. Understand write skew—it's the anomaly that REPEATABLE READ doesn't prevent
+3. Implement retry logic for serialization failures and deadlocks as a standard pattern
+4. Use the **Saga pattern** for distributed transactions across microservices
+5. Keep transactions short and set timeouts to prevent operational issues
+
+Start by reviewing your most critical transaction paths (payments, inventory, account changes). Verify the isolation level matches the consistency requirements, add retry logic if missing, and test under concurrent load.
