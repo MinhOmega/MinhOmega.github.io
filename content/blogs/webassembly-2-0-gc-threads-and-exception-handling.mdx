@@ -9,54 +9,548 @@ author: "MinhVo"
 
 ## Introduction
 
-WebAssembly 2.0: GC, Threads, and Exception Handling is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+WebAssembly has evolved dramatically since its initial release in 2017, transforming from a compilation target for C and C++ into a universal runtime that powers everything from browser-based games to server-side microservices. The 2.0 wave of proposals represents the most significant expansion of Wasm's capabilities since its inception, addressing long-standing limitations around memory management, concurrency, and error handling that previously restricted its practical applicability in production environments.
 
-## Key Concepts
+For developers working with languages that rely on garbage collection, the introduction of WasmGC is transformative. Previously, compiling Java, C#, or Dart to WebAssembly required shipping an entire garbage collector as part of the compiled binary, adding hundreds of kilobytes to bundle sizes and introducing performance overhead from running a GC within a GC-hostile environment. The new garbage collection proposal provides first-class support for managed heap objects directly in the Wasm specification, enabling runtimes to integrate with the host's garbage collector natively.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+These proposals are not theoretical abstractions shipping sometime in the distant future. Chrome and Firefox have already shipped WasmGC support, Kotlin/Wasm and Dart/Flutter are actively leveraging these features in production builds, and the threading model has been stable in major browsers since 2021. This guide explores each proposal in depth, demonstrates practical usage patterns, and examines how they reshape the landscape of web and server-side development.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![WebAssembly Evolution](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding WasmGC: Managed Memory Without the Overhead
 
-Let's look at a practical example:
+The garbage collection proposal (WasmGC) introduces struct and array types directly into the WebAssembly type system, allowing compiled languages to represent objects, arrays, and type hierarchies natively rather than encoding them as raw linear memory operations. This is a fundamental architectural shift that affects how every managed language targets Wasm.
+
+### Before WasmGC: The Emscripten Approach
+
+Prior to WasmGC, languages like Kotlin or Dart compiled to Wasm by bundling their runtime and garbage collector as Wasm code itself. A typical Kotlin/Wasm binary would include the entire Kotlin runtime, a mark-and-sweep or generational GC implementation, and type metadata encoded as byte arrays. This approach had several critical problems: binary sizes were bloated (often 2-5MB for a simple application), garbage collection pauses were unpredictable because the Wasm GC ran inside the browser's main thread, and the collected objects were invisible to the browser's DevTools, making memory debugging nearly impossible.
+
+### After WasmGC: Native Integration
+
+With WasmGC, the compiled output declares typed structures that the browser's V8 or SpiderMonkey engine understands natively:
+
+```wasm
+;; Define a struct type with typed fields
+(type $Point (struct (field $x f64) (field $y f64)))
+
+;; Define an array type
+(type $IntArray (array (field i32)))
+
+;; Define a subtype hierarchy
+(type $Animal (struct (field $name (ref null extern)) (field $age i32)))
+(type $Dog (sub $Animal (struct (field $name (ref null extern)) (field $age i32) (field $breed (ref null extern)))))
+```
+
+The browser's garbage collector now directly manages these objects, which means they appear in heap snapshots in DevTools, benefit from the browser's optimized GC algorithms (generational, incremental, concurrent), and require no additional runtime to be shipped in the binary. Kotlin/Wasm applications have seen binary size reductions of 40-60% after migrating to WasmGC, with additional performance improvements from the browser's native GC handling collection cycles more efficiently than the bundled alternative.
+
+### Type Safety and Downcasting
+
+WasmGC introduces runtime type checking through `ref.test` and `ref.cast` instructions, enabling safe downcasting in the type hierarchy:
+
+```wasm
+;; Check if a reference is of a specific type
+(ref.test (ref $Dog) (local.get $animal))
+
+;; Cast with trap on failure
+(ref.cast (ref $Dog) (local.get $animal))
+```
+
+This enables patterns like visitor dispatch and polymorphic collections while maintaining the safety guarantees that managed language developers expect.
+
+![Garbage Collection Visualization](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### The Threading Model
+
+WebAssembly threads use Web Workers under the hood, sharing memory through `SharedArrayBuffer`. This is fundamentally different from OS-level threads in several important ways: there is no shared call stack (each thread has its own Wasm instance), communication happens exclusively through shared linear memory and the `Atomics` API, and the number of available threads is limited by the browser's Worker pool (typically matching the number of logical CPU cores).
+
+#### Shared Memory Architecture
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Creating shared memory for multi-threaded Wasm
+const memory = new WebAssembly.Memory({
+  initial: 256,
+  maximum: 4096,
+  shared: true,  // This enables SharedArrayBuffer
+});
+
+// The buffer is a SharedArrayBuffer that can be passed to Workers
+const buffer = memory.buffer;
+
+// Synchronization using Atomics
+Atomics.store(new Int32Array(buffer), 0, 42);        // Atomic write
+const value = Atomics.load(new Int32Array(buffer), 0); // Atomic read
+Atomics.wait(new Int32Array(buffer), 0, 0);            // Block until notified
+Atomics.notify(new Int32Array(buffer), 0, 1);          // Wake 1 waiter
+```
+
+#### Memory Ordering Constraints
+
+Wasm follows the same memory model as JavaScript, which uses sequentially consistent memory ordering for `Atomics` operations and relaxed ordering for non-atomic accesses. This means non-atomic reads and writes to shared memory can be reordered by the engine, and developers must use `Atomics` for any data that needs synchronization guarantees. A common pitfall is assuming that writing to shared memory from one thread is immediately visible to another; without atomic operations, the compiler and runtime are free to delay or reorder these writes.
+
+### Exception Handling Architecture
+
+The exception handling proposal introduces try-catch semantics to WebAssembly without requiring JavaScript glue code. Before this proposal, handling errors from Wasm required either returning error codes (verbose and error-prone) or throwing JavaScript exceptions (which required expensive boundary crossings). The native exception handling allows Wasm modules to define, throw, and catch exception tags directly.
+
+```wasm
+;; Define an exception tag
+(tag $OutOfBounds (param i32))
+
+;; Try-catch block
+(try (result i32)
+  (do
+    ;; Code that might throw
+    (call $arrayGet (local.get $index))
+  )
+  (catch $OutOfBounds
+    ;; Handle the exception
+    (i32.const -1)
+  )
+)
+```
+
+## Step-by-Step Implementation
+
+### Setting Up a Multi-Threaded Wasm Application
+
+Let's build a practical example: a parallel image processing pipeline that applies filters to image data using multiple Wasm threads.
+
+First, create the WebAssembly module with threading support:
+
+```typescript
+// src/worker.ts - Worker thread for image processing
+interface WorkerMessage {
+  type: 'process';
+  imageData: SharedArrayBuffer;
+  width: number;
+  height: number;
+  startY: number;
+  endY: number;
+  filter: 'grayscale' | 'blur' | 'sharpen';
+  syncIndex: number;
+}
+
+let wasmInstance: WebAssembly.Instance | null = null;
+
+async function initWasm() {
+  const response = await fetch('/image-processor.wasm');
+  const bytes = await response.arrayBuffer();
+  const memory = new WebAssembly.Memory({
+    initial: 256,
+    maximum: 4096,
+    shared: true,
+  });
+
+  const importObject = {
+    env: {
+      memory,
+      log: (ptr: number, len: number) => {
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        console.log(new TextDecoder().decode(bytes));
+      },
+    },
+  };
+
+  const { instance } = await WebAssembly.instantiate(bytes, importObject);
+  wasmInstance = instance;
+  return { instance, memory };
+}
+
+self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
+  if (!wasmInstance) await initWasm();
+  const msg = event.data;
+
+  if (msg.type === 'process') {
+    const sharedArray = new Uint8ClampedArray(msg.imageData);
+
+    // Process the assigned rows
+    for (let y = msg.startY; y < msg.endY; y++) {
+      for (let x = 0; x < msg.width; x++) {
+        const idx = (y * msg.width + x) * 4;
+        const r = sharedArray[idx];
+        const g = sharedArray[idx + 1];
+        const b = sharedArray[idx + 2];
+
+        if (msg.filter === 'grayscale') {
+          const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+          sharedArray[idx] = gray;
+          sharedArray[idx + 1] = gray;
+          sharedArray[idx + 2] = gray;
+        }
+      }
+    }
+
+    // Signal completion using Atomics
+    Atomics.store(new Int32Array(msg.imageData), msg.syncIndex, 1);
+    Atomics.notify(new Int32Array(msg.imageData), msg.syncIndex);
+    self.postMessage({ type: 'done' });
+  }
+};
+```
+
+### Main Thread Orchestration
+
+The main thread coordinates work distribution across workers:
+
+```typescript
+// src/main.ts - Main thread orchestrator
+class ParallelImageProcessor {
+  private workers: Worker[] = [];
+  private memory: SharedArrayBuffer | null = null;
+
+  constructor(threadCount: number = navigator.hardwareConcurrency || 4) {
+    for (let i = 0; i < threadCount; i++) {
+      this.workers.push(new Worker(new URL('./worker.ts', import.meta.url)));
+    }
+  }
+
+  async processImage(
+    imageData: ImageData,
+    filter: 'grayscale' | 'blur' | 'sharpen'
+  ): Promise<ImageData> {
+    const { width, height, data } = imageData;
+    const threadCount = Math.min(this.workers.length, height);
+
+    // Create shared memory for the image data
+    // Extra space at end for synchronization flags
+    const syncOffset = data.length;
+    const totalSize = syncOffset + threadCount * 4;
+    this.memory = new SharedArrayBuffer(totalSize);
+    const sharedData = new Uint8ClampedArray(this.memory);
+    sharedData.set(data);
+
+    const syncArray = new Int32Array(this.memory, syncOffset, threadCount);
+    syncArray.fill(0); // Initialize sync flags
+
+    const rowsPerThread = Math.ceil(height / threadCount);
+    const promises: Promise<void>[] = [];
+
+    for (let i = 0; i < threadCount; i++) {
+      const startY = i * rowsPerThread;
+      const endY = Math.min(startY + rowsPerThread, height);
+
+      if (startY >= height) break;
+
+      promises.push(
+        new Promise<void>((resolve) => {
+          this.workers[i].onmessage = () => resolve();
+          this.workers[i].postMessage({
+            type: 'process',
+            imageData: this.memory,
+            width,
+            height,
+            startY,
+            endY,
+            filter,
+            syncIndex: i,
+          });
+        })
+      );
+    }
+
+    // Wait for all threads to complete using Atomics
+    for (let i = 0; i < threadCount; i++) {
+      while (Atomics.load(syncArray, i) === 0) {
+        Atomics.wait(syncArray, i, 0, 100); // Wait with 100ms timeout
+      }
+    }
+
+    await Promise.all(promises);
+
+    // Copy results back
+    const result = new ImageData(
+      new Uint8ClampedArray(sharedData.subarray(0, data.length)),
+      width,
+      height
+    );
+
+    return result;
+  }
+
+  destroy() {
+    this.workers.forEach((w) => w.terminate());
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing WebAssembly solutions in production environments.
+### Exception Handling in Practice
 
-## Best Practices
+Using native Wasm exception handling for error propagation across the Wasm-JS boundary:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// Compiling Wasm with exception handling support using Emscripten
+// emcc -O3 -fwasm-exceptions -o module.wasm source.c
 
-## Common Pitfalls
+// Loading and using exceptions in TypeScript
+async function loadModuleWithExceptions() {
+  const response = await fetch('/module.wasm');
+  const bytes = await response.arrayBuffer();
+
+  const tag = new WebAssembly.Tag({ parameters: ['i32', 'string'] });
+
+  const importObject = {
+    env: {
+      throwOutOfBounds: (index: number) => {
+        throw new WebAssembly.Exception(tag, [index, `Index ${index} out of bounds`]);
+      },
+    },
+  };
+
+  const { instance } = await WebAssembly.instantiate(bytes, importObject);
+
+  try {
+    const result = (instance.exports.processData as Function)(42);
+    return result;
+  } catch (e) {
+    if (e instanceof WebAssembly.Exception) {
+      if (e.is(tag)) {
+        const [index, message] = e.getArg(tag, 0);
+        console.error(`Wasm exception at index ${index}: ${message}`);
+      }
+    }
+    throw e;
+  }
+}
+```
+
+![WebAssembly Threading Architecture](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Kotlin/Wasm for Full-Stack Applications
+
+JetBrains' Kotlin/Wasm compiler now targets WasmGC, enabling Kotlin code to run in the browser with near-native performance and significantly smaller binaries than the previous Kotlin/JS target. Compose Multiplatform, the declarative UI framework, compiles to WasmGC and renders using Canvas2D or WebGL, providing a native-like experience in the browser. Applications built with Kotlin/Wasm benefit from the language's null safety, coroutines, and rich standard library while producing compact, fast-executing Wasm binaries.
+
+### Game Engines and Physics Simulation
+
+WebAssembly threads enable game engines to offload physics calculations, AI pathfinding, and asset loading to worker threads while keeping the main thread free for rendering. Engines like Unity (via its Wasm build target) use shared memory to pass physics state between the simulation thread and the render thread without serialization overhead. The exception handling proposal is particularly valuable here because physics engines frequently encounter edge cases (division by zero in collision detection, invalid mesh data) that need structured error handling without crashing the entire simulation.
+
+### Scientific Computing and Data Visualization
+
+Libraries like NumPy compiled to Wasm can leverage SIMD instructions and threads to perform matrix operations and statistical calculations at speeds approaching native code. When combined with WasmGC, languages like Dart can build data visualization dashboards where the computation layer runs as optimized Wasm while the UI layer uses Flutter's web renderer, all with automatic memory management handled by the browser's GC.
+
+## Best Practices for Production
+
+1. **Profile before threading** - Threading introduces synchronization overhead that can negate parallelism benefits for small workloads. Use the browser's Performance profiler to identify CPU-bound work that exceeds 16ms per frame before distributing across threads. The sweet spot for Wasm threads is compute-intensive workloads where the parallelizable portion exceeds 80% of total execution time.
+
+2. **Minimize shared memory contention** - Design data structures so that each thread writes to a separate memory region. False sharing (where threads write to different data in the same cache line) degrades performance significantly. Pad thread-local data to 64-byte boundaries to avoid cache line contention on modern CPUs.
+
+3. **Use structured clone for complex data** - SharedArrayBuffer only works for raw binary data. For transferring complex objects between threads, use `postMessage` with structured clone or transfer the underlying ArrayBuffer. Avoid serializing to JSON; structured clone handles most JavaScript objects natively without the overhead of string parsing.
+
+4. **Implement progressive enhancement** - Detect WasmGC and threading support using feature detection rather than user-agent sniffling. Fall back to single-threaded JavaScript or non-GC Wasm for browsers that don't support these features. Feature detection can be done by attempting to compile a minimal Wasm module that uses the feature.
+
+5. **Set proper COOP/COEP headers** - `SharedArrayBuffer` requires cross-origin isolation. Set `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on your server responses. Without these headers, `SharedArrayBuffer` is undefined and threading silently fails.
+
+6. **Handle thread termination gracefully** - Workers can be terminated by the browser under memory pressure. Implement heartbeat mechanisms to detect dead workers and re-spawn them. Use `Atomics.wait` with timeouts rather than indefinite blocking to avoid hanging threads that prevent garbage collection.
+
+7. **Optimize WasmGC type hierarchies** - Shallow type hierarchies perform better than deep ones because type checks (`ref.test`, `ref.cast`) walk the hierarchy linearly. Flatten your class hierarchies where possible and prefer composition over inheritance for performance-critical code paths.
+
+8. **Test across engines** - WasmGC and threading implementations vary between V8 (Chrome), SpiderMonkey (Firefox), and JavaScriptCore (Safari). Memory layout, GC behavior, and thread scheduling differ across engines. Test your application in all target browsers and use BrowserStack or similar services for cross-browser validation.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Missing COOP/COEP headers | SharedArrayBuffer is undefined, threading silently fails | Configure server to send `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` headers |
+| Data races on shared memory | Corrupted data, non-deterministic behavior | Use `Atomics` for all shared state; use tools like ThreadSanitizer during development |
+| WasmGC type mismatch traps | Runtime crashes from invalid casts | Use `ref.test` before `ref.cast`; implement proper type checking in polymorphic code |
+| Thread creation overhead | Spawning Workers is expensive (~5ms each) | Pre-create a thread pool at application startup; reuse workers across operations |
+| Excessive memory sharing | GC pressure increases when objects are shared across threads | Keep thread-local objects local; only share immutable data or pre-allocated buffers |
+| Exception handling not supported | Code using `try`/`catch` in Wasm fails in older browsers | Use feature detection; provide fallback using error codes for browsers without exception handling support |
+
+## Performance Optimization
+
+WasmGC performance depends heavily on how well your type layouts align with the engine's internal representation. V8 uses a compressed pointer format for WasmGC objects, which means 32-bit references are used when possible to reduce memory pressure. Designing your data structures with this in mind—keeping reference fields together and using value types for primitives—can improve cache utilization and reduce GC pause times.
+
+```typescript
+// Benchmarking WasmGC vs manual memory management
+async function benchmarkGC() {
+  const iterations = 1_000_000;
+
+  // WasmGC approach - objects managed by browser GC
+  const gcStart = performance.now();
+  for (let i = 0; i < iterations; i++) {
+    // Create and immediately discard objects
+    gcInstance.exports.createPoint(i, i * 2);
+  }
+  const gcTime = performance.now() - gcStart;
+
+  // Manual memory management approach
+  const manualStart = performance.now();
+  for (let i = 0; i < iterations; i++) {
+    // Allocate and manually free
+    const ptr = manualInstance.exports.alloc(16);
+    manualInstance.exports.setPoint(ptr, i, i * 2);
+    manualInstance.exports.free(ptr);
+  }
+  const manualTime = performance.now() - manualStart;
+
+  console.log(`WasmGC: ${gcTime.toFixed(2)}ms`);
+  console.log(`Manual: ${manualTime.toFixed(2)}ms`);
+  console.log(`Ratio: ${(gcTime / manualTime).toFixed(2)}x`);
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Wasm 2.0 (GC + Threads) | JavaScript (V8) | Native (C++/Rust) | Dart/Flutter Web |
+|---------|--------------------------|-----------------|-------------------|------------------|
+| Garbage Collection | Browser-native GC | V8's GC | Manual / None | Dart VM GC |
+| Threading | SharedArrayBuffer + Workers | Web Workers | OS Threads | Web Workers |
+| Exception Handling | Native Wasm try/catch | Native try/catch | Native try/catch | Native |
+| Binary Size | Small (no bundled GC) | N/A (source) | Large (static linking) | Medium |
+| Startup Time | Fast | Medium (parsing) | Fast | Medium |
+| Cross-Platform | Browser + WASI | Browser only | All platforms | Browser + Mobile |
+
+## Advanced Patterns
+
+### GC-Optimized Data Structures
+
+Designing data structures for WasmGC requires understanding how the engine lays out objects in memory. Group frequently accessed fields together to improve cache locality, prefer arrays of structs over structs of arrays for sequential access patterns, and use nullable references sparingly because they require additional indirection.
+
+```wasm
+;; Cache-friendly particle system
+(type $Particle (struct
+  (field $posX f32)   ;; Hot fields together
+  (field $posY f32)
+  (field $velX f32)
+  (field $velY f32)
+  (field $life f32)
+  (field $color i32)  ;; Cold field at end
+))
+
+;; Efficient array of particles
+(type $ParticleSystem (array (ref $Particle)))
+
+(func $updateParticles (param $system (ref $ParticleSystem)) (param $dt f32)
+  (local $i i32)
+  (local $len i32)
+  (local.set $len (array.len (local.get $system)))
+  
+  (loop $loop
+    (if (i32.lt_u (local.get $i) (local.get $len))
+      (then
+        (local $p (ref $Particle))
+        (local.set $p (array.get $ParticleSystem (local.get $system) (local.get $i)))
+        
+        ;; Update position from velocity
+        (struct.set $Particle $posX (local.get $p)
+          (f32.add
+            (struct.get $Particle $posX (local.get $p))
+            (f32.mul (struct.get $Particle $velX (local.get $p)) (local.get $dt))
+          )
+        )
+        
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+  )
+)
+```
+
+### Thread-Safe Queue Pattern
+
+Implementing a lock-free queue for inter-thread communication using atomic operations:
+
+```typescript
+class LockFreeQueue {
+  private buffer: Int32Array;
+  private head: number;  // Index into Int32Array
+  private tail: number;
+  private capacity: number;
+
+  constructor(sharedBuffer: SharedArrayBuffer, capacity: number) {
+    this.buffer = new Int32Array(sharedBuffer);
+    this.head = 0;    // Offset for head pointer
+    this.tail = 1;    // Offset for tail pointer
+    this.capacity = capacity;
+    Atomics.store(this.buffer, this.head, 0);
+    Atomics.store(this.buffer, this.tail, 0);
+  }
+
+  enqueue(value: number): boolean {
+    let currentTail: number;
+    let nextTail: number;
+    do {
+      currentTail = Atomics.load(this.buffer, this.tail);
+      nextTail = (currentTail + 1) % this.capacity;
+      if (nextTail === Atomics.load(this.buffer, this.head)) {
+        return false; // Queue full
+      }
+    } while (!Atomics.compareExchange(this.buffer, this.tail, currentTail, nextTail));
+
+    this.buffer[currentTail + 2] = value; // Data starts at offset 2
+    return true;
+  }
+
+  dequeue(): number | null {
+    let currentHead: number;
+    let nextHead: number;
+    do {
+      currentHead = Atomics.load(this.buffer, this.head);
+      if (currentHead === Atomics.load(this.buffer, this.tail)) {
+        return null; // Queue empty
+      }
+      nextHead = (currentHead + 1) % this.capacity;
+    } while (!Atomics.compareExchange(this.buffer, this.head, currentHead, nextHead));
+
+    return this.buffer[currentHead + 2];
+  }
+}
+```
+
+## Testing Strategies
+
+Testing multi-threaded Wasm code requires careful handling of non-determinism. Use deterministic scheduling in tests by controlling when threads are allowed to proceed using explicit barriers rather than relying on natural thread interleaving.
+
+```typescript
+import { describe, it, expect } from 'vitest';
+
+describe('Parallel Image Processor', () => {
+  it('produces identical results with 1 and 4 threads', async () => {
+    const imageData = createTestImage(1920, 1080);
+
+    const singleThread = new ParallelImageProcessor(1);
+    const result1 = await singleThread.processImage(imageData, 'grayscale');
+    singleThread.destroy();
+
+    const multiThread = new ParallelImageProcessor(4);
+    const result4 = await multiThread.processImage(imageData, 'grayscale');
+    multiThread.destroy();
+
+    // Results must be byte-identical
+    expect(Buffer.from(result1.data)).toEqual(Buffer.from(result4.data));
+  });
+
+  it('handles edge case where height < thread count', async () => {
+    const imageData = createTestImage(100, 2); // Only 2 rows
+    const processor = new ParallelImageProcessor(8); // 8 threads
+    const result = await processor.processImage(imageData, 'grayscale');
+    expect(result.height).toBe(2);
+    processor.destroy();
+  });
+});
+```
+
+## Future Outlook
+
+The WebAssembly roadmap includes several proposals that will further enhance the 2.0 capabilities. The stack switching proposal will enable green threads and coroutines within Wasm, allowing non-blocking operations without explicit async/await syntax. The component model will provide a standardized way to compose Wasm modules from different languages with well-defined interfaces. WASI (WebAssembly System Interface) is expanding to support networking, file system access, and GPU compute, making Wasm a viable target for server-side and edge computing workloads.
+
+For browser-based applications specifically, the combination of WasmGC, threads, and exception handling creates a foundation for running virtually any managed language in the browser with performance characteristics that approach native code. Kotlin/Wasm, Dart/Flutter, and .NET Blazor Wasm are all converging on these specifications, and we can expect production-quality toolchains for all major managed languages within the next two years.
 
 ## Conclusion
 
-WebAssembly 2.0: GC, Threads, and Exception Handling is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+WebAssembly 2.0's garbage collection, threading, and exception handling proposals represent a maturation of the platform from a low-level compilation target into a comprehensive runtime for web applications. WasmGC eliminates the overhead of shipping garbage collectors in every binary, threading enables true parallel computation in the browser, and native exception handling provides structured error management without JavaScript intermediaries.
+
+Key takeaways:
+
+1. WasmGC reduces binary sizes by 40-60% for managed languages by leveraging the browser's native garbage collector
+2. Threading via SharedArrayBuffer enables true parallel computation but requires proper synchronization with Atomics
+3. Native exception handling eliminates the need for error code patterns or expensive JS boundary crossings
+4. Cross-origin isolation headers are mandatory for threading; implement proper feature detection for graceful degradation
+5. Design data structures with cache locality and GC efficiency in mind for optimal performance
+6. Test across all target browsers as implementations vary between V8, SpiderMonkey, and JavaScriptCore
+
+These technologies are production-ready today. Start by experimenting with Kotlin/Wasm or Dart/Flutter web builds to see WasmGC in action, and use Web Workers with SharedArrayBuffer for compute-intensive tasks in your existing web applications.
