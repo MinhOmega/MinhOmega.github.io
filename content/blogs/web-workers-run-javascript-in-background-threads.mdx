@@ -260,6 +260,11 @@ self.addEventListener('fetch', (event) => {
 | Lifecycle | Tied to page | Independent | Independent |
 | Use case | Heavy computation | Cross-tab sync | Offline, caching |
 | Browser support | All | Most | All |
+| DOM access | No | No | No |
+| Network interception | No | No | Yes |
+| Push notifications | No | No | Yes |
+
+Dedicated workers are the go-to choice for offloading CPU-intensive work from the main thread. They are simple to create, have straightforward communication via postMessage, and are automatically terminated when the page closes. Shared workers are useful when multiple tabs need to share state or coordinate actions — for example, maintaining a single WebSocket connection across tabs. Service workers are fundamentally different: they don't help with computation but instead act as programmable network proxies. They enable offline-first architectures, background sync, and push notifications. All three types run in separate JavaScript contexts without DOM access, which is why communication happens exclusively through message passing.
 
 ## Best Practices
 
@@ -278,6 +283,78 @@ self.addEventListener('fetch', (event) => {
 | Creating too many workers | CPU overhead | Use a worker pool |
 | Service worker caching stale data | Users see old content | Implement cache versioning |
 
+## Worker Communication Patterns
+
+### Promise-Based Worker Wrapper
+
+Wrapping worker communication in Promises makes the API easier to use with async/await. This pattern eliminates callback nesting and enables standard error handling with try/catch:
+
+```javascript
+class WorkerClient {
+    constructor(script) {
+        this.worker = new Worker(script);
+        this.callbacks = new Map();
+        this.id = 0;
+
+        this.worker.onmessage = (event) => {
+            const { id, result, error } = event.data;
+            const callback = this.callbacks.get(id);
+            if (callback) {
+                this.callbacks.delete(id);
+                if (error) {
+                    callback.reject(new Error(error));
+                } else {
+                    callback.resolve(result);
+                }
+            }
+        };
+    }
+
+    execute(type, payload) {
+        return new Promise((resolve, reject) => {
+            const id = ++this.id;
+            this.callbacks.set(id, { resolve, reject });
+            this.worker.postMessage({ id, type, payload });
+        });
+    }
+
+    terminate() {
+        this.worker.terminate();
+    }
+}
+
+// Usage with async/await
+const worker = new WorkerClient('compute-worker.js');
+try {
+    const result = await worker.execute('factorial', { n: 100 });
+    console.log(result);
+} catch (err) {
+    console.error('Worker error:', err.message);
+}
+```
+
+### Broadcast Channel for Cross-Worker Communication
+
+When multiple workers need to communicate with each other or with the main thread, BroadcastChannel provides a simple pub/sub mechanism that works across tabs and workers:
+
+```javascript
+// Main thread or any worker
+const channel = new BroadcastChannel('data-sync');
+
+// Send updates
+channel.postMessage({ type: 'update', data: processedData });
+
+// Listen for updates from other workers
+channel.onmessage = (event) => {
+    if (event.data.type === 'update') {
+        updateLocalCache(event.data.data);
+    }
+};
+
+// Clean up when done
+channel.close();
+```
+
 ### Practical Use Cases
 
 Web Workers excel in several practical scenarios. Image processing applications use workers to apply filters, resize images, and generate thumbnails without freezing the interface. Data visualization tools use workers to process large datasets, compute aggregations, and generate chart data. Code editors use workers for syntax highlighting, linting, and autocompletion on background threads. Encryption and decryption operations use workers to process data without blocking user input. Scientific computing applications use workers for numerical simulations, data analysis, and machine learning inference. In each case, the worker handles the CPU-intensive work while the main thread remains responsive to user interactions.
@@ -285,6 +362,122 @@ Web Workers excel in several practical scenarios. Image processing applications 
 ### Worker Lifecycle Management
 
 Managing worker lifecycles is important for application performance and resource usage. Create workers when they are needed rather than at application startup, because each worker consumes memory and a system thread. Terminate workers when they are no longer needed using the terminate method, which immediately stops the worker without giving it a chance to clean up. Implement graceful shutdown by sending a message to the worker that triggers cleanup logic before the worker calls self.close. Monitor worker memory usage using the performance API and implement recycling strategies for long-running workers that may accumulate memory leaks. Balance the number of active workers against the available CPU cores to avoid thread contention.
+
+### Transferable Objects and SharedArrayBuffer
+
+By default, data sent via `postMessage` is cloned using the structured clone algorithm, which copies the data. For large ArrayBuffers, this is expensive. Transferable objects avoid the copy by transferring ownership:
+
+```javascript
+// Main thread: transfer ArrayBuffer to worker (zero-copy)
+const buffer = new ArrayBuffer(1024 * 1024); // 1MB
+const view = new Uint8Array(buffer);
+view.fill(42);
+
+// Transfer the buffer — main thread loses access
+worker.postMessage({ buffer }, [buffer]);
+console.log(buffer.byteLength); // 0 — buffer was transferred
+
+// Worker receives the buffer
+self.onmessage = (event) => {
+  const view = new Uint8Array(event.data.buffer);
+  console.log(view[0]); // 42
+};
+```
+
+SharedArrayBuffer goes further — it allows both the main thread and worker to access the same memory simultaneously:
+
+```javascript
+// Main thread
+const shared = new SharedArrayBuffer(1024);
+const sharedArray = new Int32Array(shared);
+sharedArray[0] = 100;
+
+worker.postMessage({ shared });
+
+// Both threads can read/write sharedArray[0] simultaneously
+// Use Atomics for thread-safe operations
+Atomics.add(sharedArray, 0, 1); // Atomic increment
+Atomics.store(sharedArray, 1, 42);
+const value = Atomics.load(sharedArray, 1); // 42
+
+// Wait/notify for synchronization
+Atomics.wait(sharedArray, 0, 100); // Blocks until value != 100
+Atomics.notify(sharedArray, 0, 1); // Wake one waiting thread
+```
+
+SharedArrayBuffer requires specific HTTP headers for security: `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`.
+
+### Worker Pool Implementation
+
+Creating a new worker for each task is expensive. A worker pool reuses workers:
+
+```javascript
+class WorkerPool {
+  constructor(size, script) {
+    this.workers = [];
+    this.queue = [];
+    this.activeWorkers = 0;
+
+    for (let i = 0; i < size; i++) {
+      this.workers.push(new Worker(script));
+    }
+  }
+
+  run(data) {
+    return new Promise((resolve, reject) => {
+      const worker = this.workers.find((w) => !w._busy);
+
+      if (worker) {
+        this._execute(worker, data, resolve, reject);
+      } else {
+        this.queue.push({ data, resolve, reject });
+      }
+    });
+  }
+
+  _execute(worker, data, resolve, reject) {
+    worker._busy = true;
+    this.activeWorkers++;
+
+    worker.onmessage = (event) => {
+      worker._busy = false;
+      this.activeWorkers--;
+      resolve(event.data);
+      this._processQueue();
+    };
+
+    worker.onerror = (error) => {
+      worker._busy = false;
+      this.activeWorkers--;
+      reject(error);
+      this._processQueue();
+    };
+
+    worker.postMessage(data);
+  }
+
+  _processQueue() {
+    if (this.queue.length === 0) return;
+
+    const worker = this.workers.find((w) => !w._busy);
+    if (!worker) return;
+
+    const { data, resolve, reject } = this.queue.shift();
+    this._execute(worker, data, resolve, reject);
+  }
+
+  terminate() {
+    this.workers.forEach((w) => w.terminate());
+  }
+}
+
+// Usage: 4-worker pool for parallel image processing
+const pool = new WorkerPool(4, 'image-worker.js');
+const results = await Promise.all(
+  images.map((img) => pool.run({ imageData: img }))
+);
+pool.terminate();
+```
 
 ### Module Workers
 
