@@ -398,6 +398,120 @@ SAMPLE BY 5m ALIGN TO CALENDAR;
 7. **Monitor ingestion lag**: Track write throughput vs query load. If queries slow down ingestion, route reads to replicas.
 8. **Use continuous aggregates for dashboards**: Pre-computed aggregates eliminate expensive real-time aggregation for common dashboard queries.
 
+## Downsampling and Continuous Aggregates
+
+Raw time-series data is expensive to query at scale. A sensor reporting every second generates 86,400 data points per day—querying a month of raw data scans 2.5M rows just to render a dashboard. Downsampling reduces this by pre-computing aggregates at coarser time intervals.
+
+```sql
+-- TimescaleDB: Continuous aggregate that auto-refreshes
+CREATE MATERIALIZED VIEW metrics_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 hour', time) AS bucket,
+  sensor_id,
+  AVG(value) AS avg_value,
+  MIN(value) AS min_value,
+  MAX(value) AS max_value,
+  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY value) AS p95_value,
+  COUNT(*) AS sample_count
+FROM metrics
+GROUP BY bucket, sensor_id;
+
+-- Add refresh policy: update hourly aggregates every hour
+SELECT add_continuous_aggregate_policy('metrics_hourly',
+  start_offset => INTERVAL '3 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour'
+);
+
+-- Query the aggregate instead of raw data
+SELECT * FROM metrics_hourly
+WHERE bucket >= now() - INTERVAL '30 days'
+AND sensor_id = 42;
+```
+
+```sql
+-- InfluxDB v3: Task-based downsampling
+-- Create a task that runs every hour to downsample data
+CREATE TABLE metrics_1h AS
+SELECT
+  date_trunc('hour', time) AS bucket,
+  host,
+  AVG(cpu_usage) AS avg_cpu,
+  MAX(cpu_usage) AS max_cpu,
+  COUNT(*) AS samples
+FROM cpu
+GROUP BY bucket, host;
+
+-- QuestDB: Sample by for in-query downsampling
+SELECT
+  ts,
+  host,
+  AVG(cpu_usage),
+  MAX(cpu_usage),
+  MIN(cpu_usage)
+FROM cpu
+WHERE ts >= dateadd('d', -30, now())
+SAMPLE BY 1h;
+```
+
+## Data Retention Policies
+
+Time-series data loses value over time. A retention policy automatically drops old data, preventing unbounded disk growth:
+
+```sql
+-- TimescaleDB: Drop data older than 90 days
+SELECT add_retention_policy('metrics', INTERVAL '90 days');
+
+-- Keep hourly aggregates for 2 years
+SELECT add_retention_policy('metrics_hourly', INTERVAL '2 years');
+
+-- InfluxDB v3: Retention is configured at the database level
+-- CREATE DATABASE metrics WITH DURATION 90d REPLICATION 1
+
+-- QuestDB: Partition-based retention
+-- Data is partitioned by day/month; drop old partitions
+ALTER TABLE metrics DROP PARTITION WHERE ts < dateadd('d', -90, now());
+```
+
+A common strategy is tiered retention: keep raw data for 7 days, hourly aggregates for 90 days, and daily aggregates for 2 years. This balances query granularity with storage cost—dashboards query aggregates, debugging queries raw data.
+
+## Real-World Use Case: IoT Fleet Monitoring
+
+Consider a fleet of 10,000 IoT devices reporting 50 metrics every 10 seconds. That's 50,000 data points per second, or 4.3 billion points per day. Here's how each database handles this:
+
+**QuestDB** excels here with its ingestion pipeline:
+
+```sql
+-- QuestDB: Create table with designated timestamp
+CREATE TABLE device_metrics (
+  ts TIMESTAMP,
+  device_id SYMBOL,
+  metric_name SYMBOL,
+  value DOUBLE
+) TIMESTAMP(ts) PARTITION BY DAY WAL
+DEDUP UPSERT KEYS(ts, device_id, metric_name);
+
+-- Ingest via InfluxDB line protocol (QuestDB supports it natively)
+-- POST /api/v2/write?db=device_metrics
+-- device_metrics,device_id=dev-001,metric_name=temperature value=23.5 1699234800000000000
+```
+
+**TimescaleDB** handles it with hypertables and compression:
+
+```sql
+-- Enable compression on chunks older than 3 days
+ALTER TABLE device_metrics SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'device_id, metric_name',
+  timescaledb.compress_orderby = 'ts DESC'
+);
+
+SELECT add_compression_policy('device_metrics', INTERVAL '3 days');
+```
+
+For this scale, QuestDB typically achieves 3-5x faster ingestion while TimescaleDB provides richer query capabilities (JOINs with device metadata, window functions, lateral joins).
+
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
