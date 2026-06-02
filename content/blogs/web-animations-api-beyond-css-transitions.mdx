@@ -13,6 +13,10 @@ The Web Animations API (WAAPI) is a powerful browser-native JavaScript API that 
 
 Originally developed as a joint effort between Mozilla, Google, and the W3C, the Web Animations API has achieved broad browser support and is now considered baseline technology available in all modern browsers. It's the engine behind popular animation libraries like Motion (formerly Framer Motion) and GSAP, which use WAAPI under the hood for hardware-accelerated animations.
 
+The WAAPI specification defines two core models that work together. The **Timing Model** controls when an animation starts, how long it lasts, how many times it repeats, and what easing curves it follows. The **Animation Model** controls what CSS properties change and how those changes are interpolated. This separation of concerns is what makes the API so powerful — you can independently manipulate timing (pause, reverse, speed up) without touching the animation definition itself.
+
+Unlike CSS animations, which are declarative and defined entirely in stylesheets, WAAPI gives you a `Animation` object for every animation you create. This object exposes methods like `play()`, `pause()`, `reverse()`, `finish()`, and `cancel()`, plus promise-based `finished` and `ready` properties that make sequencing and coordination trivial. You can inspect the current playback state, read computed timing values, adjust playback rate on the fly, and even seek to arbitrary points in the animation timeline.
+
 In this comprehensive guide, we'll explore every aspect of the Web Animations API, from basic keyframe animations to complex sequenced timelines. You'll learn how to create animations that are both performant and controllable, understand the compositing model that determines how animations layer together, and discover patterns for building reusable animation utilities that can power your entire application.
 
 ![Web animations](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
@@ -307,25 +311,114 @@ element.animate(
 // These compose correctly without overriding each other!
 ```
 
+## The Animation Interface Deep Dive
+
+Every call to `element.animate()` returns an `Animation` object that gives you full programmatic control. Understanding this interface is key to unlocking the API's power.
+
+```typescript
+const animation = element.animate(
+  [
+    { transform: 'translateX(-100%)', opacity: 0 },
+    { transform: 'translateX(0)', opacity: 1 },
+  ],
+  { duration: 500, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'forwards' }
+);
+
+// Playback state: 'idle' | 'running' | 'paused' | 'finished'
+console.log(animation.playState);
+
+// Current time in the animation (milliseconds)
+console.log(animation.currentTime);
+
+// Playback rate: 1 = normal, 2 = double speed, -1 = reverse
+animation.playbackRate = 2;
+
+// Get detailed computed timing information
+const timing = animation.effect?.getComputedTiming();
+// Returns: { activeDuration, currentTime, progress, currentIteration, ... }
+```
+
+### Promise-Based Lifecycle
+
+The `ready` and `finished` promises are one of WAAPI's biggest advantages over CSS animations. Instead of listening for string-based `animationend` events, you get proper promise chains:
+
+```typescript
+const animation = element.animate(keyframes, options);
+
+// 'ready' resolves when the animation begins playing
+await animation.ready;
+console.log('Animation is now running on the compositor');
+
+// 'finished' resolves when the animation completes all iterations
+await animation.finished;
+console.log('All iterations complete');
+element.classList.add('animation-done');
+```
+
+This makes sequential and parallel animation orchestration straightforward:
+
+```typescript
+// Run animations one after another
+async function sequence(animations: Animation[]) {
+  for (const anim of animations) {
+    anim.play();
+    await anim.finished;
+  }
+}
+
+// Run all animations simultaneously, then execute cleanup
+async function parallel(animations: Animation[]) {
+  animations.forEach(a => a.play());
+  await Promise.all(animations.map(a => a.finished));
+  console.log('All done');
+}
+```
+
+### Dynamic Playback Rate
+
+Changing `playbackRate` at runtime creates powerful interactive effects without redefining keyframes:
+
+```typescript
+// Scrub animation based on scroll progress
+const scrubAnimation = element.animate(
+  { transform: ['translateY(100px)', 'translateY(0)'] },
+  { duration: 1000, fill: 'both' }
+);
+scrubAnimation.pause(); // Pause so we can control manually
+
+window.addEventListener('scroll', () => {
+  const scrollPercent = window.scrollY / (document.body.scrollHeight - window.innerHeight);
+  scrubAnimation.currentTime = scrollPercent * scrubAnimation.effect?.getComputedTiming().activeDuration;
+});
+
+// Smooth speed changes (e.g., parallax-like effects)
+function setAnimationSpeed(animation: Animation, targetRate: number) {
+  animation.playbackRate = targetRate;
+}
+```
+
 ## Animation Timelines
 
 ### Document Timeline
+
+By default, every animation is tied to the document timeline, which advances based on `performance.now()`:
 
 ```typescript
 // Default timeline (document timeline)
 const animation = element.animate(keyframes, {
   duration: 1000,
-  timeline: document.timeline, // Default
+  timeline: document.timeline, // Default — can be omitted
 });
 
-// Access current time
-console.log(document.timeline.currentTime);
+// Access the current document timeline time
+console.log(document.timeline.currentTime); // milliseconds since page load
 ```
 
 ### ScrollTimeline
 
+Scroll-linked animations are one of the most impactful use cases for WAAPI. Instead of manually listening to scroll events and calculating progress, `ScrollTimeline` binds animation progress directly to scroll position:
+
 ```typescript
-// Scroll-linked animations
 const scrollContainer = document.querySelector('.scroll-container');
 
 const animation = element.animate(
@@ -338,31 +431,59 @@ const animation = element.animate(
     fill: 'both',
   }
 );
-
-// Progress is linked to scroll position
+// Progress is linked to scroll position:
 // 0% scroll = 0% animation progress
 // 100% scroll = 100% animation progress
 ```
 
-### ViewTimeline
+A practical example — a reading progress indicator:
 
 ```typescript
-// View-linked animations (scroll-driven)
-const card = document.querySelector('.card');
+function createProgressBar() {
+  const bar = document.createElement('div');
+  bar.className = 'reading-progress';
+  document.body.appendChild(bar);
 
-const animation = card.animate(
-  { opacity: [0, 1, 1, 0], transform: ['scale(0.8)', 'scale(1)', 'scale(1)', 'scale(0.8)'] },
-  {
-    timeline: new ViewTimeline({
-      subject: card,
-      axis: 'block',
-    }),
-    // Animate as the element enters and exits the viewport
-    rangeStart: 'entry 0%',
-    rangeEnd: 'exit 100%',
-  }
-);
+  bar.animate(
+    { scaleX: [0, 1] },
+    {
+      timeline: new ScrollTimeline({
+        source: document.documentElement,
+        axis: 'block',
+      }),
+      fill: 'both',
+      easing: 'linear',
+    }
+  );
+}
 ```
+
+### ViewTimeline
+
+ViewTimeline extends scroll-driven animations to elements entering and exiting the viewport. This is ideal for scroll-triggered reveal animations without any JavaScript event listeners:
+
+```typescript
+const cards = document.querySelectorAll('.card');
+
+cards.forEach(card => {
+  card.animate(
+    {
+      opacity: [0, 1, 1, 0],
+      transform: ['scale(0.9)', 'scale(1)', 'scale(1)', 'scale(0.9)'],
+    },
+    {
+      timeline: new ViewTimeline({
+        subject: card,
+        axis: 'block',
+      }),
+      rangeStart: 'entry 0%',
+      rangeEnd: 'exit 100%',
+    }
+  );
+});
+```
+
+This approach runs entirely on the compositor thread, making it far more performant than IntersectionObserver-based class toggling for scroll animations.
 
 ## Building Animation Utilities
 
@@ -530,15 +651,213 @@ function prepareAnimation(element: HTMLElement) {
 | Browser support | All modern browsers | All browsers |
 | Use case | Complex, interactive | Simple, declarative |
 
+## Real-World Animation Patterns
+
+### Modal Dialog Entrance/Exit
+
+Modals need smooth enter/exit animations that don't conflict with other page animations. WAAPI makes this clean:
+
+```typescript
+function animateModal(modal: HTMLElement, backdrop: HTMLElement): {
+  open: () => Promise<void>;
+  close: () => Promise<void>;
+} {
+  const openKeyframes = {
+    backdrop: [{ opacity: 0 }, { opacity: 1 }],
+    modal: [
+      { opacity: 0, transform: 'translateY(20px) scale(0.95)' },
+      { opacity: 1, transform: 'translateY(0) scale(1)' },
+    ],
+  };
+
+  const closeKeyframes = {
+    backdrop: [{ opacity: 1 }, { opacity: 0 }],
+    modal: [
+      { opacity: 1, transform: 'translateY(0) scale(1)' },
+      { opacity: 0, transform: 'translateY(10px) scale(0.98)' },
+    ],
+  };
+
+  const opts: KeyframeAnimationOptions = {
+    duration: 250,
+    easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+    fill: 'forwards',
+  };
+
+  return {
+    async open() {
+      backdrop.animate(openKeyframes.backdrop, opts);
+      await modal.animate(openKeyframes.modal, opts).finished;
+    },
+    async close() {
+      backdrop.animate(closeKeyframes.backdrop, opts);
+      await modal.animate(closeKeyframes.modal, opts).finished;
+    },
+  };
+}
+```
+
+### Toast Notification System
+
+Toast notifications benefit from promise-based sequencing for enter, hold, and exit phases:
+
+```typescript
+function showToast(message: string, duration = 3000) {
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  const enterAnim = toast.animate(
+    [
+      { transform: 'translateY(100%)', opacity: 0 },
+      { transform: 'translateY(0)', opacity: 1 },
+    ],
+    { duration: 300, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'forwards' }
+  );
+
+  enterAnim.finished.then(() => {
+    // Hold for duration, then exit
+    const exitAnim = toast.animate(
+      [
+        { transform: 'translateY(0)', opacity: 1 },
+        { transform: 'translateY(100%)', opacity: 0 },
+      ],
+      { duration: 200, easing: 'ease-in', fill: 'forwards' }
+    );
+    exitAnim.finished.then(() => toast.remove());
+  });
+}
+```
+
+### Page Transition Pattern
+
+For single-page apps, WAAPI can orchestrate coordinated page transitions:
+
+```typescript
+async function pageTransition(
+  outgoing: HTMLElement,
+  incoming: HTMLElement,
+  direction: 'forward' | 'backward' = 'forward'
+) {
+  const offset = direction === 'forward' ? '-100%' : '100%';
+
+  const exitAnimation = outgoing.animate(
+    { transform: ['translateX(0)', `translateX(${offset})`] },
+    { duration: 300, easing: 'ease-in-out', fill: 'forwards' }
+  );
+
+  incoming.animate(
+    { transform: [`translateX(${-parseFloat(offset)}px)`, 'translateX(0)'] },
+    { duration: 300, easing: 'ease-in-out', fill: 'forwards' }
+  );
+
+  await exitAnimation.finished;
+  outgoing.style.display = 'none';
+}
+```
+
+![Code animation patterns](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Accessibility: Respecting Reduced Motion
+
+Animations can cause discomfort for users with vestibular disorders. Always check the `prefers-reduced-motion` media query:
+
+```typescript
+function getAnimationDuration(normal: number): number {
+  const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  return prefersReduced ? 0 : normal;
+}
+
+function safeAnimate(
+  element: HTMLElement,
+  keyframes: Keyframe[],
+  options: KeyframeAnimationOptions
+): Animation {
+  const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  if (prefersReduced) {
+    // Jump to the final state instantly
+    return element.animate(keyframes, { ...options, duration: 0 });
+  }
+
+  return element.animate(keyframes, options);
+}
+
+// Listen for preference changes
+window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (e) => {
+  const animations = document.getAnimations();
+  animations.forEach(anim => {
+    if (e.matches) {
+      anim.playbackRate = 100; // Effectively instant
+    } else {
+      anim.playbackRate = 1; // Restore normal speed
+    }
+  });
+});
+```
+
+## Debugging WAAPI Animations
+
+### Listing Active Animations
+
+The `document.getAnimations()` and `element.getAnimations()` methods are invaluable for debugging:
+
+```typescript
+// See all animations currently running on the page
+const allAnimations = document.getAnimations();
+console.log(`Active animations: ${allAnimations.length}`);
+
+allAnimations.forEach((anim, i) => {
+  const timing = anim.effect?.getComputedTiming();
+  console.log(`Animation ${i}:`, {
+    playState: anim.playState,
+    currentTime: anim.currentTime,
+    progress: timing?.progress,
+    duration: timing?.activeDuration,
+  });
+});
+
+// See animations on a specific element
+const btn = document.querySelector('button');
+const btnAnimations = btn?.getAnimations();
+console.log('Button animations:', btnAnimations?.length);
+```
+
+### Chrome DevTools Animation Inspector
+
+Chrome DevTools provides a dedicated Animations panel (under the Elements tab) that visualizes all WAAPI and CSS animations. You can pause, scrub, replay, and modify timing in real time. This is the single most useful tool for debugging animation issues.
+
+```typescript
+// Mark an animation for easy identification in DevTools
+const animation = element.animate(keyframes, options);
+animation.id = 'modal-enter'; // Visible in DevTools animation inspector
+```
+
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Not using fill:'forwards' | Animation snaps back | Set fill: 'forwards' for final state |
-| Animating layout properties | Poor performance | Stick to transform and opacity |
-| Memory leaks from running animations | Page slows down | Cancel animations in cleanup |
-| Not awaiting finished | Race conditions | Use animation.finished promise |
-| Ignoring reduced motion | Accessibility issues | Check prefers-reduced-motion |
+| Not using `fill: 'forwards'` | Element snaps back to original state | Set `fill: 'forwards'` for animations whose final state should persist |
+| Animating layout properties (`width`, `height`, `top`, `left`) | Triggers layout recalculation, janky 60fps target | Use `transform` and `opacity` — they run on the compositor thread |
+| Not cleaning up finished animations | Memory leaks over time | Call `animation.cancel()` or let it be garbage collected |
+| Not awaiting `finished` | Race conditions in sequences | Always `await animation.finished` in async flows |
+| Ignoring `prefers-reduced-motion` | Accessibility violations, user discomfort | Check the media query and provide instant or no-animation alternatives |
+| Creating too many concurrent animations | Compositor overload, dropped frames | Batch animations and use `requestAnimationFrame` for coordination |
+
+## Comparison with CSS Animations
+
+| Feature | Web Animations API | CSS Animations |
+|---------|----------------|----------------|
+| JavaScript control | Full playback control (play, pause, reverse, seek) | Limited (add/remove classes) |
+| Dynamic keyframes | Runtime keyframe changes | Static `@keyframes` rules |
+| Sequencing | Promise-based `finished` and `ready` | `animationend` event listeners |
+| Performance | Hardware-accelerated on compositor | Hardware-accelerated on compositor |
+| Timeline control | `ScrollTimeline`, `ViewTimeline` | `scroll-timeline` CSS property |
+| Browser support | All modern browsers (Baseline 2023) | All browsers including legacy |
+| Use case | Complex, interactive, orchestrated | Simple, declarative, standalone |
+
+The key takeaway: CSS animations are ideal for simple, state-driven transitions (hover effects, class toggles). WAAPI shines when you need programmatic control, sequencing, scroll-linking, or dynamic animation parameters.
 
 ## Testing Strategies
 
@@ -548,44 +867,55 @@ describe('Animation tests', () => {
   it('completes fade-in animation', async () => {
     const element = document.createElement('div');
     document.body.appendChild(element);
-    
+
     const animation = element.animate(
       [{ opacity: 0 }, { opacity: 1 }],
       { duration: 100 }
     );
-    
+
     await animation.finished;
-    
+
     expect(animation.playState).toBe('finished');
     expect(getComputedStyle(element).opacity).toBe('1');
   });
-  
+
   it('respects reduced motion preference', () => {
     // Mock prefers-reduced-motion
     window.matchMedia = jest.fn().mockImplementation(query => ({
       matches: query === '(prefers-reduced-motion: reduce)',
       media: query,
     }));
-    
+
     const element = document.createElement('div');
-    const animation = animateWithReducedMotion(element, keyframes, options);
-    
-    // Should use reduced animation
+    const animation = safeAnimate(element, [{ opacity: 0 }, { opacity: 1 }], { duration: 300 });
+
+    // Should use reduced animation (duration 0)
     expect(animation.effect?.getComputedTiming().duration).toBe(0);
+  });
+
+  it('cancels animations on unmount', async () => {
+    const element = document.createElement('div');
+    const animation = element.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 1000 });
+
+    // Simulate component unmount
+    animation.cancel();
+
+    expect(animation.playState).toBe('idle');
+    expect(element.getAnimations().length).toBe(0);
   });
 });
 ```
 
 ## Future Outlook
 
-The Web Animations API continues to evolve:
+The Web Animations API continues to evolve with the web platform:
 
-1. **Scroll-driven animations**: Now in all major browsers with ScrollTimeline and ViewTimeline
-2. **Individual transform properties**: `translate`, `rotate`, `scale` as separate CSS properties
-3. **CSS custom property animation**: Animating `--custom-properties` directly
-4. **Timeline scope improvements**: More granular control over animation timing
+1. **Scroll-driven animations**: `ScrollTimeline` and `ViewTimeline` are now in all major browsers, replacing the need for libraries like ScrollTrigger for many use cases.
+2. **Individual transform properties**: `translate`, `rotate`, and `scale` as separate CSS properties that compose correctly — no more `transform` shorthand conflicts.
+3. **CSS custom property animation**: Animating `--custom-properties` directly opens up theming and design token animations.
+4. **Timeline scope improvements**: More granular control over animation timing with named timelines and timeline scoping.
 
-The Web Animations API provides programmatic control over animations with better performance than JavaScript-based animation libraries for many use cases.
+The Web Animations API provides programmatic control over animations with better performance than JavaScript-based animation libraries for many use cases. Understanding WAAPI means you can build sophisticated animation systems without any external dependencies.
 
 ## Conclusion
 
