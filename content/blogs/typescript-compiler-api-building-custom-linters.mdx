@@ -9,54 +9,646 @@ author: "MinhVo"
 
 ## Introduction
 
-TypeScript Compiler API: Building Custom Linters is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+The TypeScript Compiler API is one of the most powerful yet underutilized features of the TypeScript ecosystem. While most developers interact with TypeScript through `tsc` or their IDE, the Compiler API provides programmatic access to the full compilation pipeline—parsing, binding, type checking, and emission. This enables building sophisticated tools like custom linters, code generators, and refactoring utilities that understand TypeScript's type system.
 
-## Key Concepts
+![TypeScript Compiler API architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+Building a custom linter with the TypeScript Compiler API offers capabilities that standalone AST-based tools like ESLint cannot match. Because the Compiler API provides access to the full type checker, your lint rules can make decisions based on actual type information—detecting patterns like unused generic type parameters, incorrect error handling of specific types, or misuse of utility types. This guide walks through the entire process of building a production-ready custom linter using the TypeScript Compiler API.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding the Compiler API Architecture
 
-## Practical Implementation
+The TypeScript Compiler API exposes the entire compilation pipeline through a series of interconnected modules. Understanding these modules is essential for building effective tools.
 
-Let's look at a practical example:
+### Program and Source Files
+
+The `Program` object is the entry point for all compilation operations. It represents the entire set of source files being compiled and provides access to the type checker, compiler options, and source file ASTs:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import * as ts from "typescript";
+
+// Create a program from a list of files
+const program = ts.createProgram({
+  rootNames: ["src/index.ts", "src/utils.ts"],
+  options: {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    strict: true
+  }
+});
+
+// Access the source files
+const sourceFiles = program.getSourceFiles();
+sourceFiles.forEach(sf => {
+  console.log(sf.fileName, sf.text.length);
+});
+```
+
+![Compiler pipeline stages](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+### The Type Checker
+
+The `TypeChecker` is the heart of the Compiler API. It resolves types, performs type checking, and provides information about symbols and declarations:
+
+```typescript
+const checker = program.getTypeChecker();
+
+// Get the type of an expression
+const sourceFile = program.getSourceFile("src/index.ts")!;
+const diagnostics = program.getSemanticDiagnostics(sourceFile);
+
+// Resolve a symbol at a specific position
+function getTypeAtPosition(sourceFile: ts.SourceFile, position: number) {
+  const token = getTokenAtPosition(sourceFile, position);
+  return checker.getTypeAtLocation(token);
 }
 ```
 
-This pattern demonstrates the core approach to implementing TypeScript solutions in production environments.
+### AST Nodes and Visitors
 
-## Best Practices
+Every TypeScript source file is represented as a tree of `Node` objects. The Compiler API provides several mechanisms for traversing these trees:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// Recursive visitor pattern
+function visit(node: ts.SourceFile, context: ts.TransformationContext) {
+  // Process the current node
+  if (ts.isCallExpression(node)) {
+    console.log("Found call expression:", node.expression.getText());
+  }
 
-## Common Pitfalls
+  // Visit children
+  ts.forEachChild(node, child => visit(child, context));
+}
+
+// Using the transformer API
+function createTransformer(): ts.TransformerFactory<ts.SourceFile> {
+  return (context) => (sourceFile) => {
+    visit(sourceFile, context);
+    return sourceFile;
+  };
+}
+```
+
+## Core Architecture: Building a Linter Framework
+
+A custom linter built on the TypeScript Compiler API typically has three components: a rule definition system, an AST walker, and a diagnostics reporter.
+
+### Rule Definition System
+
+Define a standardized interface for lint rules:
+
+```typescript
+interface LintRule {
+  name: string;
+  description: string;
+  category: "error" | "warning" | "suggestion";
+  check(
+    node: ts.Node,
+    checker: ts.TypeChecker,
+    program: ts.Program
+  ): LintViolation[];
+}
+
+interface LintViolation {
+  node: ts.Node;
+  message: string;
+  severity: "error" | "warning";
+  fix?: ts.TextChange[];
+}
+```
+
+### AST Walker with Type Context
+
+Build a walker that traverses the AST while maintaining type context:
+
+```typescript
+class LintWalker {
+  private violations: LintViolation[] = [];
+  private checker: ts.TypeChecker;
+  private rules: LintRule[];
+
+  constructor(checker: ts.TypeChecker, rules: LintRule[]) {
+    this.checker = checker;
+    this.rules = rules;
+  }
+
+  walk(sourceFile: ts.SourceFile): LintViolation[] {
+    this.violations = [];
+    this.visitNode(sourceFile);
+    return this.violations;
+  }
+
+  private visitNode(node: ts.Node): void {
+    for (const rule of this.rules) {
+      const violations = rule.check(node, this.checker, program);
+      this.violations.push(...violations);
+    }
+
+    ts.forEachChild(node, child => this.visitNode(child));
+  }
+}
+```
+
+## Step-by-Step Implementation
+
+### Setting Up the Project
+
+```bash
+mkdir ts-custom-linter && cd ts-custom-linter
+npm init -y
+npm install typescript ts-node vitest
+```
+
+### Creating the Linter Entry Point
+
+```typescript
+// src/linter.ts
+import * as ts from "typescript";
+import { LintRule, LintViolation } from "./types";
+import { noAnyRule } from "./rules/no-any";
+import { noEmptyCatchRule } from "./rules/no-empty-catch";
+import { requireReturnTypesRule } from "./rules/require-return-types";
+
+export class TypeScriptLinter {
+  private rules: LintRule[] = [];
+  private program: ts.Program;
+
+  constructor(fileNames: string[], compilerOptions: ts.CompilerOptions) {
+    this.program = ts.createProgram(fileNames, compilerOptions);
+    this.rules = [noAnyRule, noEmptyCatchRule, requireReturnTypesRule];
+  }
+
+  lint(): Map<string, LintViolation[]> {
+    const results = new Map<string, LintViolation[]>();
+    const checker = this.program.getTypeChecker();
+
+    for (const sourceFile of this.program.getSourceFiles()) {
+      if (sourceFile.isDeclarationFile) continue;
+
+      const violations = this.walkSourceFile(sourceFile, checker);
+      if (violations.length > 0) {
+        results.set(sourceFile.fileName, violations);
+      }
+    }
+
+    return results;
+  }
+
+  private walkSourceFile(
+    sourceFile: ts.SourceFile,
+    checker: ts.TypeChecker
+  ): LintViolation[] {
+    const violations: LintViolation[] = [];
+
+    const visit = (node: ts.Node) => {
+      for (const rule of this.rules) {
+        const ruleViolations = rule.check(node, checker, this.program);
+        violations.push(...ruleViolations);
+      }
+      ts.forEachChild(node, visit);
+    };
+
+    visit(sourceFile);
+    return violations;
+  }
+}
+```
+
+![Linting workflow](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+### Implementing Rule: No `any` Type
+
+```typescript
+// src/rules/no-any.ts
+import * as ts from "typescript";
+import { LintRule, LintViolation } from "../types";
+
+export const noAnyRule: LintRule = {
+  name: "no-any",
+  description: "Disallows the use of the 'any' type",
+  category: "error",
+
+  check(node: ts.Node, checker: ts.TypeChecker): LintViolation[] {
+    const violations: LintViolation[] = [];
+
+    if (ts.isTypeReferenceNode(node)) {
+      if (node.typeName.getText() === "any") {
+        violations.push({
+          node,
+          message: "Avoid using 'any' type. Use 'unknown' instead.",
+          severity: "error"
+        });
+      }
+    }
+
+    // Check for implicit any in function parameters
+    if (ts.isParameter(node) && !node.type) {
+      const type = checker.getTypeAtLocation(node);
+      if (type.flags & ts.TypeFlags.Any) {
+        violations.push({
+          node,
+          message: `Parameter '${node.name.getText()}' has implicit 'any' type.`,
+          severity: "error"
+        });
+      }
+    }
+
+    return violations;
+  }
+};
+```
+
+### Implementing Rule: No Empty Catch
+
+```typescript
+// src/rules/no-empty-catch.ts
+import * as ts from "typescript";
+import { LintRule, LintViolation } from "../types";
+
+export const noEmptyCatchRule: LintRule = {
+  name: "no-empty-catch",
+  description: "Disallows empty catch blocks",
+  category: "warning",
+
+  check(node: ts.Node): LintViolation[] {
+    if (!ts.isCatchClause(node)) return [];
+
+    const block = node.block;
+    if (block.statements.length === 0) {
+      return [{
+        node,
+        message: "Empty catch block. Handle the error or add a comment explaining why.",
+        severity: "warning"
+      }];
+    }
+
+    // Check for catch blocks that only rethrow
+    if (block.statements.length === 1) {
+      const stmt = block.statements[0];
+      if (ts.isThrowStatement(stmt)) {
+        return [{
+          node,
+          message: "Catch block only rethrows. Consider removing the try/catch.",
+          severity: "warning"
+        }];
+      }
+    }
+
+    return [];
+  }
+};
+```
+
+### Implementing Rule: Require Return Types
+
+```typescript
+// src/rules/require-return-types.ts
+import * as ts from "typescript";
+import { LintRule, LintViolation } from "../types";
+
+export const requireReturnTypesRule: LintRule = {
+  name: "require-return-types",
+  description: "Requires explicit return types on exported functions",
+  category: "warning",
+
+  check(node: ts.Node, checker: ts.TypeChecker): LintViolation[] {
+    if (!ts.isFunctionDeclaration(node)) return [];
+
+    // Only check exported functions
+    const modifiers = ts.getModifiers(node);
+    const isExported = modifiers?.some(
+      m => m.kind === ts.SyntaxKind.ExportKeyword
+    );
+
+    if (!isExported || !node.name) return [];
+
+    if (!node.type) {
+      const returnType = checker.getReturnTypeOfSignature(
+        checker.getSignatureFromDeclaration(node)!
+      );
+      const returnTypeString = checker.typeToString(returnType);
+
+      return [{
+        node: node.name,
+        message: `Exported function '${node.name.text}' is missing explicit return type. Inferred type: ${returnTypeString}`,
+        severity: "warning",
+        fix: [{
+          span: { start: node.parameters.end, length: 0 },
+          newText: `: ${returnTypeString}`
+        }]
+      }];
+    }
+
+    return [];
+  }
+};
+```
+
+### Creating the CLI Entry Point
+
+```typescript
+// src/cli.ts
+import * as ts from "typescript";
+import * as path from "path";
+import { TypeScriptLinter } from "./linter";
+
+const configPath = ts.findConfigFile(
+  "./",
+  ts.sys.fileExists,
+  "tsconfig.json"
+);
+
+if (!configPath) {
+  console.error("Could not find tsconfig.json");
+  process.exit(1);
+}
+
+const { config } = ts.readConfigFile(configPath, ts.sys.readFile);
+const parsedConfig = ts.parseJsonConfigFileContent(
+  config,
+  ts.sys,
+  "./"
+);
+
+const linter = new TypeScriptLinter(
+  parsedConfig.fileNames,
+  parsedConfig.options
+);
+
+const results = lint();
+let totalErrors = 0;
+let totalWarnings = 0;
+
+for (const [file, violations] of results) {
+  for (const violation of violations) {
+    const { line, character } = ts.getLineAndCharacterOfPosition(
+      violation.node.getSourceFile(),
+      violation.node.getStart()
+    );
+
+    const severity = violation.severity === "error" ? "❌" : "⚠️";
+    console.log(
+      `${severity} ${path.relative(".", file)}:${line + 1}:${character + 1} - ${violation.message}`
+    );
+
+    if (violation.severity === "error") totalErrors++;
+    else totalWarnings++;
+  }
+}
+
+console.log(`\nFound ${totalErrors} errors and ${totalWarnings} warnings`);
+process.exit(totalErrors > 0 ? 1 : 0);
+```
+
+## Real-World Use Cases
+
+### Use Case 1: API Contract Enforcement
+
+Ensure that API handler functions follow specific patterns:
+
+```typescript
+export const apiHandlerRule: LintRule = {
+  name: "api-handler-conventions",
+  description: "Ensures API handlers return proper error types",
+  category: "error",
+
+  check(node: ts.Node, checker: ts.TypeChecker): LintViolation[] {
+    if (!ts.isFunctionDeclaration(node)) return [];
+
+    const returnType = node.type;
+    if (!returnType || !ts.isTypeReferenceNode(returnType)) return [];
+
+    const typeName = returnType.typeName.getText();
+    if (typeName !== "ApiResponse") return [];
+
+    // Check that all throw statements use ApiError
+    const violations: LintViolation[] = [];
+    const visit = (n: ts.Node) => {
+      if (ts.isThrowStatement(n) && n.expression) {
+        const throwType = checker.getTypeAtLocation(n.expression);
+        if (!checker.isTypeAssignableTo(
+          throwType,
+          checker.getTypeAtLocation(returnType)
+        )) {
+          violations.push({
+            node: n,
+            message: "API handlers must throw ApiError instances",
+            severity: "error"
+          });
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(node);
+
+    return violations;
+  }
+};
+```
+
+### Use Case 2: Database Query Safety
+
+Detect potential SQL injection vulnerabilities in database queries:
+
+```typescript
+export const sqlInjectionRule: LintRule = {
+  name: "no-sql-injection",
+  description: "Prevents string concatenation in SQL queries",
+  category: "error",
+
+  check(node: ts.Node): LintViolation[] {
+    if (!ts.isCallExpression(node)) return [];
+
+    const expression = node.expression;
+    if (!ts.isPropertyAccessExpression(expression)) return [];
+
+    if (expression.name.text !== "query") return [];
+
+    const firstArg = node.arguments[0];
+    if (!firstArg) return [];
+
+    // Check for template literals with interpolations
+    if (ts.isTemplateExpression(firstArg)) {
+      if (firstArg.templateSpans.length > 0) {
+        return [{
+          node: firstArg,
+          message: "Use parameterized queries instead of template literals",
+          severity: "error"
+        }];
+      }
+    }
+
+    // Check for string concatenation
+    if (ts.isBinaryExpression(firstArg) &&
+        firstArg.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      return [{
+        node: firstArg,
+        message: "Use parameterized queries instead of string concatenation",
+        severity: "error"
+      }];
+    }
+
+    return [];
+  }
+};
+```
+
+### Use Case 3: Performance Pattern Detection
+
+Detect patterns that could cause performance issues:
+
+```typescript
+export const noInlineLoopsRule: LintRule = {
+  name: "no-expensive-loops",
+  description: "Warns about potentially expensive loop patterns",
+  category: "warning",
+
+  check(node: ts.Node, checker: ts.TypeChecker): LintViolation[] {
+    if (!ts.isForOfStatement(node)) return [];
+
+    // Check if iterating over a large array type
+    const iterType = checker.getTypeAtLocation(node.expression);
+    const numberIndexType = checker.getIndexTypeOfType(
+      iterType,
+      ts.IndexKind.Number
+    );
+
+    if (numberIndexType && checker.isArrayType(iterType)) {
+      // Check for nested loops
+      let hasNestedLoop = false;
+      const visit = (n: ts.Node) => {
+        if (ts.isForOfStatement(n) || ts.isForStatement(n)) {
+          hasNestedLoop = true;
+        }
+        ts.forEachChild(n, visit);
+      };
+      ts.forEachChild(node.statement, visit);
+
+      if (hasNestedLoop) {
+        return [{
+          node,
+          message: "Nested loops detected. Consider using Map or reduce for O(n) solutions.",
+          severity: "warning"
+        }];
+      }
+    }
+
+    return [];
+  }
+};
+```
+
+## Best Practices for Production
+
+1. **Use the correct Node traversal pattern**: Use `ts.forEachChild` for visiting only direct children, or a recursive visitor for full tree traversal. Never mix the two approaches.
+
+2. **Cache type checker results**: Type resolution is expensive. Cache the results of `checker.getTypeAtLocation()` for nodes you'll reference multiple times.
+
+3. **Handle declaration files properly**: Skip `.d.ts` files in your linter unless you're specifically checking declaration quality.
+
+4. **Provide auto-fixes when possible**: The `ts.TextChange` interface enables auto-fixing, which dramatically improves the developer experience with custom lint rules.
+
+5. **Use incremental compilation**: For watch-mode linters, use `ts.createWatchProgram` to leverage incremental compilation and only recheck changed files.
+
+6. **Test with real TypeScript code**: Create a comprehensive test suite using real-world TypeScript patterns, not just simple test cases.
+
+7. **Profile performance**: Large codebases can make the type checker slow. Profile your linter and consider limiting the scope of type-heavy rules.
+
+8. **Document rule rationale**: Each rule should have clear documentation explaining why it exists and what problem it solves.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using deprecated API methods | Breaks on TypeScript upgrades | Use `ts.createProgram` instead of deprecated `ts.createLanguageService` for linting |
+| Not handling missing types | Crashes on untyped code | Always check for `undefined` return values from type checker methods |
+| Checking too many nodes | Slow linting | Filter by node kind before performing expensive type checks |
+| Memory leaks in watch mode | Increasing memory usage | Properly dispose of old programs and source files |
+| Ignoring JSX/TSX files | Missing lint violations | Include `.tsx` in your file glob patterns |
+
+## Performance Optimization
+
+Type checker operations are the most expensive part of custom linting. Optimize by checking node types early:
+
+```typescript
+// Efficient: check node kind first
+function efficientCheck(node: ts.Node, checker: ts.TypeChecker) {
+  // Quick check before expensive type resolution
+  if (!ts.isCallExpression(node)) return [];
+
+  // Only resolve types when necessary
+  const type = checker.getTypeAtLocation(node.expression);
+  // ... further checks
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | TS Compiler API | ESLint Plugin | TSLint |
+|---------|----------------|---------------|--------|
+| Type checking | Full access | Via parser services | Limited |
+| AST access | Complete | Complete | Complete |
+| Auto-fix support | Manual | Built-in | Built-in |
+| Performance | Moderate | Fast | Fast |
+| Type-aware rules | Native | Complex setup | N/A |
+| Maintenance | TypeScript team | Community | Deprecated |
+
+## Testing Strategies
+
+```typescript
+import { describe, it, expect } from "vitest";
+import * as ts from "typescript";
+import { noAnyRule } from "../rules/no-any";
+
+function createTestProgram(code: string) {
+  const fileName = "/test.ts";
+  const sourceFile = ts.createSourceFile(fileName, code, ts.ScriptTarget.ES2022);
+  const program = ts.createProgram([fileName], {}, {
+    getSourceFile: (name) => name === fileName ? sourceFile : undefined,
+    writeFile: () => {},
+    getCurrentDirectory: () => "/",
+    getCanonicalFileName: (f) => f,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => "\n",
+    fileExists: (f) => f === fileName,
+    readFile: (f) => f === fileName ? code : undefined
+  });
+  return { program, sourceFile };
+}
+
+describe("no-any rule", () => {
+  it("should detect explicit any type", () => {
+    const code = `let x: any = 42;`;
+    const { program, sourceFile } = createTestProgram(code);
+    const checker = program.getTypeChecker();
+
+    const violations = noAnyRule.check(sourceFile, checker, program);
+    expect(violations).toHaveLength(1);
+    expect(violations[0].message).toContain("'any'");
+  });
+
+  it("should detect implicit any in parameters", () => {
+    const code = `function greet(name) { return name; }`;
+    const { program, sourceFile } = createTestProgram(code);
+    const checker = program.getTypeChecker();
+
+    const violations = noAnyRule.check(sourceFile, checker, program);
+    expect(violations.length).toBeGreaterThan(0);
+  });
+});
+```
+
+## Future Outlook
+
+The TypeScript Compiler API continues to evolve alongside the language. Upcoming features like isolated declarations and decorator metadata will require new API surface areas, while the Strada project (a potential Rust-based TypeScript compiler) could provide alternative APIs for high-performance tooling. The `ts.createProgram` API will remain the foundation for custom tooling, but expect improvements in incremental compilation and watch mode capabilities.
 
 ## Conclusion
 
-TypeScript Compiler API: Building Custom Linters is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Building custom linters with the TypeScript Compiler API enables type-aware analysis that goes far beyond what standalone AST tools can achieve. Key takeaways:
+
+1. **The Compiler API** provides full access to parsing, binding, and type checking
+2. **Type-aware lint rules** can detect patterns invisible to AST-only tools
+3. **The visitor pattern** with `ts.forEachChild` is the standard AST traversal approach
+4. **Auto-fixes** using `ts.TextChange` dramatically improve developer experience
+5. **Performance matters**—filter by node kind before expensive type resolution
+
+By leveraging the TypeScript Compiler API, you can build tools that enforce architectural patterns, detect security vulnerabilities, and ensure API consistency across your entire codebase.

@@ -9,54 +9,552 @@ author: "MinhVo"
 
 ## Introduction
 
-TypeScript 5.4: NoInfer and Improved Narrowing is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+TypeScript 5.4, released in March 2024, introduced the highly anticipated `NoInfer` utility type—a feature that gives library authors and application developers precise control over type inference in generic functions. Alongside `NoInfer`, TypeScript 5.4 delivers improved narrowing in closures, better control flow analysis for `switch` statements, and several other quality-of-life improvements that make the type system more predictable and powerful.
 
-## Key Concepts
+![TypeScript 5.4 release features](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+The `NoInfer` utility type addresses a long-standing pain point in TypeScript's type inference: when you want a generic function to infer its type parameter from one argument but not another. Before TypeScript 5.4, developers relied on workarounds like intersection types or separate overload signatures. With `NoInfer`, this becomes a clean, first-class feature that communicates intent clearly and prevents subtle type inference bugs.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding NoInfer: The Core Problem It Solves
 
-## Practical Implementation
-
-Let's look at a practical example:
+TypeScript's type inference is powerful, but it sometimes infers types from the wrong argument. Consider a function that creates a state machine with an initial state and valid transitions:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+function createMachine<TState extends string>(
+  initialState: TState,
+  transitions: Record<TState, TState[]>
+): { state: TState; transition: (newState: TState) => void } {
+  let currentState = initialState;
+  return {
+    state: currentState,
+    transition: (newState: TState) => {
+      const valid = transitions[currentState]?.includes(newState);
+      if (!valid) throw new Error(`Invalid transition: ${newState}`);
+      currentState = newState;
+    }
+  };
 }
 ```
 
-This pattern demonstrates the core approach to implementing TypeScript solutions in production environments.
+The problem arises when TypeScript infers `TState` from both arguments, potentially widening the type:
 
-## Best Practices
+```typescript
+// TypeScript infers TState as "idle" | "loading" | "success" | "error" | "unknown"
+const machine = createMachine("idle", {
+  idle: ["loading"],
+  loading: ["success", "error"],
+  success: [],
+  error: [],
+});
+```
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+![Type inference problem illustration](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Common Pitfalls
+### How NoInfer Fixes This
+
+With `NoInfer`, you can tell TypeScript to infer `TState` from `initialState` only, while `transitions` must conform to the already-inferred type:
+
+```typescript
+function createMachine<TState extends string>(
+  initialState: TState,
+  transitions: Record<NoInfer<TState>, NoInfer<TState>[]>
+): { state: TState; transition: (newState: TState) => void } {
+  let currentState = initialState;
+  return {
+    state: currentState,
+    transition: (newState: TState) => {
+      const valid = transitions[currentState]?.includes(newState);
+      if (!valid) throw new Error(`Invalid transition: ${newState}`);
+      currentState = newState;
+    }
+  };
+}
+
+// Now TState is inferred as "idle" from initialState
+// transitions must match Record<"idle", string[]>
+const machine = createMachine("idle", {
+  idle: ["loading"],
+});
+```
+
+## NoInfer Implementation Details
+
+Under the hood, `NoInfer<T>` is implemented as a conditional type that prevents the type checker from using the wrapped position as an inference site:
+
+```typescript
+// The actual implementation in TypeScript 5.4
+type NoInfer<T> = [T][T extends any ? 0 : never];
+```
+
+This leverages TypeScript's inference from index types behavior—the type `T` appears in a position that TypeScript won't use for inference because it's wrapped in a tuple index access. The conditional `T extends any ? 0 : never` is always true (since every type extends `any`), but it creates a non-inferential position for `T`.
+
+### Practical Use Cases for NoInfer
+
+#### Use Case 1: Event Emitter Type Safety
+
+```typescript
+type EventMap = {
+  click: { x: number; y: number };
+  change: { value: string };
+  submit: { data: FormData };
+};
+
+function on<TEvent extends keyof EventMap>(
+  event: TEvent,
+  handler: (payload: NoInfer<EventMap[TEvent]>) => void
+): void {
+  // Implementation
+}
+
+// TypeScript infers TEvent as "click"
+// handler must accept { x: number; y: number }
+on("click", (payload) => {
+  console.log(payload.x, payload.y);
+});
+```
+
+#### Use Case 2: Builder Pattern
+
+```typescript
+interface Builder<T> {
+  setKey(key: string): Builder<T>;
+  setValue(value: T): Builder<T>;
+  build(): T;
+}
+
+function createBuilder<T>(defaultValue: NoInfer<T>): Builder<T> {
+  let key = "";
+  let value = defaultValue;
+
+  return {
+    setKey(k: string) { key = k; return this as unknown as Builder<T>; },
+    setValue(v: T) { value = v; return this as unknown as Builder<T>; },
+    build() { return value; }
+  };
+}
+
+// T is inferred from defaultValue, not from setValue
+const builder = createBuilder(42).setValue(100);
+const result = builder.build(); // type: number
+```
+
+#### Use Case 3: Configuration Objects with Defaults
+
+```typescript
+interface Config<T> {
+  value: T;
+  validate: (v: T) => boolean;
+  default: NoInfer<T>;
+}
+
+function defineConfig<T>(config: NoInfer<Config<T>>): Config<T> {
+  return config;
+}
+
+// T is inferred as { host: string; port: number }
+const config = defineConfig({
+  value: { host: "localhost", port: 3000 },
+  validate: (v) => typeof v.port === "number",
+  default: { host: "0.0.0.0", port: 8080 }
+});
+```
+
+## Improved Narrowing in Closures
+
+TypeScript 5.4 improves control flow narrowing for variables captured in closures. Previously, narrowing information could be lost when a variable was referenced inside a nested function:
+
+```typescript
+function processValue(value: string | number | null) {
+  if (value === null) {
+    throw new Error("Value cannot be null");
+  }
+
+  // TypeScript 5.4: value is string | number here
+  const callback = () => {
+    // TypeScript 5.3: value is string | number | null
+    // TypeScript 5.4: value is string | number ✓
+    if (typeof value === "string") {
+      return value.toUpperCase();
+    }
+    return value.toFixed(2);
+  };
+
+  return callback();
+}
+```
+
+### Closure Narrowing with Type Predicates
+
+TypeScript 5.4 also better handles narrowing through type predicates in closures:
+
+```typescript
+function createValidator<T>(
+  predicate: (value: unknown) => value is T
+) {
+  return (value: unknown): T | null => {
+    if (predicate(value)) {
+      return value; // TypeScript 5.4: properly narrowed to T
+    }
+    return null;
+  };
+}
+
+const isString = createValidator(
+  (value: unknown): value is string => typeof value === "string"
+);
+
+const result = isString("hello"); // string | null
+```
+
+![Narrowing in closures](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Core Architecture: How Narrowing Works Internally
+
+The TypeScript compiler maintains a control flow graph for each function body. At each node in the graph, the compiler tracks the narrowed type of each variable. When a variable is captured in a closure, the compiler must determine which narrowing information applies inside the closure body.
+
+### Before TypeScript 5.4
+
+The compiler conservatively invalidated all narrowing information when a variable was captured in a closure. This was safe but overly restrictive—many valid narrowing patterns were rejected.
+
+### After TypeScript 5.4
+
+The compiler now tracks whether a captured variable has been potentially mutated between the narrowing point and the closure usage. If no mutations are possible, the narrowing information is preserved inside the closure.
+
+```typescript
+function example(x: string | number) {
+  if (typeof x === "string") {
+    // x is narrowed to string
+    const fn = () => {
+      // TypeScript 5.4: x is still string
+      // (no mutation between narrowing and closure capture)
+      console.log(x.toUpperCase());
+    };
+    fn();
+  }
+}
+```
+
+## Step-by-Step Implementation
+
+### Updating to TypeScript 5.4
+
+```bash
+npm install typescript@5.4 --save-dev
+npx tsc --version  # 5.4.x
+```
+
+### Implementing a Type-Safe Registry
+
+Build a type-safe registry using `NoInfer`:
+
+```typescript
+interface RegistryItem<T> {
+  name: string;
+  factory: () => T;
+  validate: (item: T) => boolean;
+}
+
+class TypeSafeRegistry {
+  private items = new Map<string, RegistryItem<any>>();
+
+  register<T>(
+    name: string,
+    factory: NoInfer<() => T>,
+    validate: NoInfer<(item: T) => boolean>
+  ): void {
+    this.items.set(name, { name, factory, validate });
+  }
+
+  create<T>(name: string): T {
+    const item = this.items.get(name);
+    if (!item) throw new Error(`Item ${name} not registered`);
+
+    const result = item.factory();
+    if (!item.validate(result)) {
+      throw new Error(`Item ${name} failed validation`);
+    }
+
+    return result;
+  }
+}
+
+const registry = new TypeSafeRegistry();
+
+// T is inferred as User from the factory function
+registry.register<User>(
+  "user",
+  () => ({ id: 1, name: "John", email: "john@example.com" }),
+  (user) => typeof user.id === "number" && typeof user.name === "string"
+);
+```
+
+### Building Type-Safe Event Systems
+
+```typescript
+interface EventMap {
+  "user:created": { id: string; name: string };
+  "user:updated": { id: string; changes: Partial<User> };
+  "user:deleted": { id: string };
+}
+
+class EventEmitter<Events extends Record<string, any>> {
+  private handlers = new Map<string, Set<Function>>();
+
+  on<TEvent extends keyof Events>(
+    event: TEvent,
+    handler: (payload: NoInfer<Events[TEvent]>) => void
+  ): () => void {
+    if (!this.handlers.has(event as string)) {
+      this.handlers.set(event as string, new Set());
+    }
+    this.handlers.get(event as string)!.add(handler);
+
+    return () => {
+      this.handlers.get(event as string)?.delete(handler);
+    };
+  }
+
+  emit<TEvent extends keyof Events>(
+    event: TEvent,
+    payload: Events[TEvent]
+  ): void {
+    this.handlers.get(event as string)?.forEach(
+      (handler) => handler(payload)
+    );
+  }
+}
+
+const emitter = new EventEmitter<EventMap>();
+
+// TypeScript infers the correct payload type
+emitter.on("user:created", (payload) => {
+  console.log(payload.id, payload.name);
+});
+```
+
+![Event system architecture](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Use Case 1: Form Validation Libraries
+
+`NoInfer` excels in form validation where field types should be inferred from schema definitions:
+
+```typescript
+interface FieldSchema<T> {
+  type: string;
+  validate: (value: T) => boolean;
+  default: NoInfer<T>;
+  label: string;
+}
+
+function defineField<T>(schema: NoInfer<FieldSchema<T>>): FieldSchema<T> {
+  return schema;
+}
+
+const emailField = defineField({
+  type: "email",
+  validate: (value) => /^[^\s@]+@[^\s@]+$/.test(value),
+  default: "",
+  label: "Email Address"
+});
+// emailField.default is type string
+```
+
+### Use Case 2: State Management
+
+```typescript
+interface SliceConfig<TState, TActions> {
+  name: string;
+  initialState: TState;
+  reducers: NoInfer<TActions>;
+}
+
+function createSlice<TState, TActions extends Record<string, (state: TState) => TState>>(
+  config: SliceConfig<TState, TActions>
+): { name: string; reducer: (state: TState, action: keyof TActions) => TState } {
+  return {
+    name: config.name,
+    reducer: (state, action) => config.reducers[action](state)
+  };
+}
+```
+
+### Use Case 3: Query Builder Pattern
+
+```typescript
+interface QueryConfig<T> {
+  table: string;
+  select: (keyof T)[];
+  where: NoInfer<(row: T) => boolean>;
+  limit?: number;
+}
+
+function createQuery<T>(config: QueryConfig<T>): string {
+  const columns = config.select.join(", ");
+  return `SELECT ${columns} FROM ${config.table}` +
+    (config.limit ? ` LIMIT ${config.limit}` : "");
+}
+```
+
+## Best Practices for Production
+
+1. **Use NoInfer to prevent accidental widening**: When designing generic APIs, apply `NoInfer` to arguments that should not influence type inference. This makes your API more predictable for consumers.
+
+2. **Prefer NoInfer over function overloads**: In many cases, `NoInfer` provides cleaner type signatures than function overloads. Reserve overloads for truly different call signatures.
+
+3. **Combine NoInfer with constraints**: Use `NoInfer<T extends SomeConstraint>` to both prevent inference and ensure type safety at the definition site.
+
+4. **Document inference behavior**: When using `NoInfer` in public APIs, document which arguments drive inference so users understand the type resolution.
+
+5. **Test inference with edge cases**: Write type-level tests using `expect-type` or `tsd` to verify that your `NoInfer` usage produces the expected types in various scenarios.
+
+6. **Use closures for deferred execution**: With improved narrowing in closures, prefer creating named functions for deferred execution instead of inline callbacks with complex control flow.
+
+7. **Validate at boundaries**: Even with improved narrowing, validate data at system boundaries (API responses, user input) using runtime validation libraries.
+
+8. **Keep narrowing simple**: Complex narrowing chains can be hard to follow. Extract complex type guards into named functions for readability.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Applying NoInfer to all generic params | No inference at all | Only NoInfer the params that shouldn't drive inference |
+| Forgetting closure mutation tracking | Stale narrowing information | Avoid mutating captured variables after narrowing |
+| Over-relying on inference | Unexpected type widening | Use explicit type annotations when inference is ambiguous |
+| Using NoInfer with conditional types | Complex type resolution | Test thoroughly; consider simplifying the type structure |
+| Ignoring null narrowing | Runtime null errors | Enable `strictNullChecks` and handle all null cases |
+
+## Performance Optimization
+
+TypeScript 5.4's improved narrowing reduces the need for runtime type assertions, potentially eliminating unnecessary `as` casts and their associated runtime checks:
+
+```typescript
+// Before: Manual type assertion needed
+function processOld(value: string | number) {
+  if (typeof value === "string") {
+    const callback = () => {
+      const str = value as string; // Unnecessary cast
+      console.log(str.toUpperCase());
+    };
+    callback();
+  }
+}
+
+// After: TypeScript 5.4 narrows correctly
+function processNew(value: string | number) {
+  if (typeof value === "string") {
+    const callback = () => {
+      console.log(value.toUpperCase()); // No cast needed
+    };
+    callback();
+  }
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | NoInfer | Function Overloads | Conditional Inference |
+|---------|---------|-------------------|----------------------|
+| Readability | High | Medium | Low |
+| Type safety | Full | Full | Full |
+| Inference control | Per-argument | Per-signature | Complex rules |
+| Maintenance | Low | Medium | High |
+| Library API design | Ideal | Good | Niche |
+
+## Advanced Patterns
+
+### NoInfer with Mapped Types
+
+```typescript
+type ConfigSchema = {
+  host: string;
+  port: number;
+  ssl: boolean;
+};
+
+function createConfig<T extends ConfigSchema>(
+  defaults: NoInfer<T>,
+  overrides: Partial<NoInfer<T>>
+): T {
+  return { ...defaults, ...overrides } as T;
+}
+
+const config = createConfig(
+  { host: "localhost", port: 3000, ssl: false },
+  { port: 8080 }
+);
+// T is inferred from defaults, not overrides
+```
+
+### NoInfer with Recursive Types
+
+```typescript
+type TreeNode<T> = {
+  value: T;
+  children: TreeNode<NoInfer<T>>[];
+};
+
+function createTree<T>(rootValue: NoInef<T>): TreeNode<T> {
+  return {
+    value: rootValue,
+    children: []
+  };
+}
+
+const tree = createTree({ id: 1, name: "root" });
+// TreeNode<{ id: number; name: string }>
+```
+
+## Testing Strategies
+
+```typescript
+import { expectTypeOf } from "vitest";
+
+describe("NoInfer behavior", () => {
+  it("should infer T from first argument only", () => {
+    function fn<T>(first: T, second: NoInef<T>): T {
+      return first;
+    }
+
+    const result = fn("hello", "world");
+    expectTypeOf(result).toEqualTypeOf<string>();
+  });
+
+  it("should reject mismatched types in NoInfer position", () => {
+    function fn<T>(first: T, second: NoInfer<T>): T {
+      return first;
+    }
+
+    // @ts-expect-error: second arg must match first
+    fn("hello", 42);
+  });
+
+  it("should narrow in closures after null check", () => {
+    function process(value: string | null) {
+      if (value === null) return;
+
+      const fn = () => {
+        expectTypeOf(value).toEqualTypeOf<string>();
+      };
+      fn();
+    }
+  });
+});
+```
+
+## Future Outlook
+
+TypeScript 5.4's `NoInfer` utility type represents a broader trend toward giving developers more control over type inference. Future TypeScript versions may introduce additional inference modifiers, such as `Infer<T>` (explicitly allowing inference from a position) or position-specific inference control. The improved closure narrowing is part of an ongoing effort to make TypeScript's control flow analysis as precise as possible, with async narrowing being a natural next step.
 
 ## Conclusion
 
-TypeScript 5.4: NoInfer and Improved Narrowing is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+TypeScript 5.4's `NoInfer` utility type and improved narrowing in closures are significant advances in TypeScript's type system. Key takeaways:
+
+1. **`NoInfer<T>`** prevents type inference from a specific generic parameter position
+2. **Closure narrowing** now preserves type narrowing when captured variables aren't mutated
+3. **Library authors** gain precise control over inference with minimal boilerplate
+4. **Type-level testing** is essential for verifying `NoInfer` behavior
+5. **Combining `NoInfer` with constraints** provides both safety and control
+
+These features make TypeScript more predictable and expressive, enabling developers to build type-safe APIs that are both powerful and easy to use.
