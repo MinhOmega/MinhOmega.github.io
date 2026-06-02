@@ -87,8 +87,8 @@ export default async function BlogPage({ params }: BlogPageProps) {
 
   return (
     <main className="relative w-full lg:h-screen lg:overflow-hidden p-0 sm:p-5">
-      <div className="w-full h-full rounded-2xl sm:border flex flex-wrap justify-between lg:divide-x">
-        <div className="relative w-full lg:w-2/5 lg:min-h-0 lg:overflow-y-auto scrollbar-hide p-2 md:p-8 pb-16 lg:pb-20">
+      <div className="w-full h-full rounded-2xl sm:border flex flex-wrap lg:flex-nowrap justify-between lg:divide-x">
+        <div className="relative w-full lg:w-2/5 lg:h-full lg:min-h-0 lg:overflow-y-auto scrollbar-hide p-2 md:p-8 pb-16 lg:pb-20">
           <div className="flex justify-between mb-2 sticky top-0 z-10 bg-background">
             <Link href="/blogs" className="group/back text-xs">
               <ArrowLeft
@@ -137,7 +137,7 @@ export default async function BlogPage({ params }: BlogPageProps) {
 
         <article
           id="tab-section"
-          className="relative w-full lg:w-3/5 lg:min-h-0 lg:overflow-y-auto p-2 md:p-8 pb-16 lg:pb-20"
+          className="relative w-full lg:w-3/5 lg:h-full lg:min-h-0 lg:overflow-y-auto scrollbar-hide p-2 md:p-8 pb-16 lg:pb-20"
         >
           <div className="prose prose-neutral dark:prose-invert max-w-none">
             <MDXContentRenderer code={blog.body} />
