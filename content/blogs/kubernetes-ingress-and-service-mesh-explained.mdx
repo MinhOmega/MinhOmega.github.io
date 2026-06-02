@@ -504,11 +504,158 @@ istioctl authn tls-check user-service.production.svc.cluster.local
 kubectl get pods -n production -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.name}{" "}{end}{"\n"}{end}'
 ```
 
+## Gateway API: The Future of Kubernetes Ingress
+
+The Kubernetes Gateway API is the successor to Ingress, providing a more expressive, role-oriented, and extensible approach to traffic management. Unlike Ingress (a single resource type with provider-specific annotations), Gateway API uses multiple resource types that separate concerns:
+
+```yaml
+# GatewayClass — infrastructure provider defines this
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: istio
+spec:
+  controllerName: istio.io/gateway-controller
+
+---
+# Gateway — cluster operator configures this
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: production-gateway
+  namespace: istio-system
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              gateway-access: "true"
+
+---
+# HTTPRoute — application developer configures this
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-routes
+  namespace: production
+spec:
+  parentRefs:
+    - name: production-gateway
+      namespace: istio-system
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: api-v1
+          port: 80
+          weight: 90
+        - name: api-v2
+          port: 80
+          weight: 10
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v2
+      backendRefs:
+        - name: api-v2
+          port: 80
+```
+
+The key advantage is role separation: infrastructure teams manage GatewayClass and Gateway, while application teams manage HTTPRoute. This eliminates the annotation sprawl problem that plagues NGINX Ingress in large clusters.
+
+## Observability: Tracing, Metrics, and Kiali
+
+Service mesh observability requires three pillars: metrics, traces, and topology visualization. Istio provides all three through integration with Prometheus, Jaeger, and Kiali.
+
+```bash
+# Install Kiali + Jaeger + Prometheus addon
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/kiali.yaml
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/jaeger.yaml
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/prometheus.yaml
+
+# Access Kiali dashboard
+istioctl dashboard kiali
+```
+
+Kiali provides a real-time service topology graph showing request flow, latency, error rates, and mTLS status between all services. Jaeger traces individual requests across service boundaries, revealing bottlenecks and latency sources that are invisible in per-service metrics.
+
+For Ingress-level observability, enable the NGINX Ingress controller's built-in Prometheus metrics:
+
+```yaml
+controller:
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+  customHeaders: "X-Request-ID:$req_id"
+```
+
+Key metrics to monitor:
+
+| Metric | What It Tells You |
+|--------|-------------------|
+| `nginx_ingress_controller_requests` | Request rate, status codes per ingress |
+| `nginx_ingress_controller_request_duration_seconds` | Latency distribution per route |
+| `nginx_ingress_controller_connections` | Active connections, connection rate |
+| `istio_requests_total` | Mesh-level request rate with source/destination labels |
+| `istio_request_duration_milliseconds` | Mesh-level latency with full attribution |
+
 ## Future Outlook
 
-The Kubernetes Gateway API is the successor to Ingress, providing a more expressive and role-oriented approach to traffic management. It separates infrastructure concerns (GatewayClass) from cluster operations (Gateway) from application routing (HTTPRoute). All major Ingress controllers and service meshes are adopting Gateway API.
+Istio's ambient mesh mode eliminates sidecar proxies, reducing resource overhead and operational complexity. This moves proxy functionality to ztunnel (a per-node daemon) for L4 and waypoint proxies for L7, making service mesh adoption significantly easier. Ambient mesh reduces per-pod memory overhead from ~50MB (Envoy sidecar) to nearly zero for L4-only workloads. It also eliminates the init container that hijacks iptables rules, simplifying pod startup and reducing the blast radius of proxy failures.
 
-Istio's ambient mesh mode eliminates sidecar proxies, reducing resource overhead and operational complexity. This moves proxy functionality to ztunnel (a per-node daemon) for L4 and waypoint proxies for L7, making service mesh adoption significantly easier.
+Traefik is another popular Ingress controller worth considering. Its key differentiator is dynamic configuration via CRDs (IngressRoute) and built-in Let's Encrypt integration:
+
+```yaml
+# Traefik IngressRoute — cleaner than NGINX annotations
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-route
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`api.example.com`) && PathPrefix(`/v1`)
+      kind: Rule
+      services:
+        - name: api-v1
+          port: 80
+      middlewares:
+        - name: rate-limit
+    - match: Host(`api.example.com`) && PathPrefix(`/v2`)
+      kind: Rule
+      services:
+        - name: api-v2
+          port: 80
+  tls:
+    certResolver: letsencrypt
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+spec:
+  rateLimit:
+    average: 100
+    burst: 200
+```
 
 ## Conclusion
 
