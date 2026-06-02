@@ -9,316 +9,904 @@ author: "MinhVo"
 
 ## Introduction
 
-The Web Codecs API provides low-level access to browser media encoders and decoders, enabling frame-by-frame processing of audio and video. Unlike the `<video>` element which handles everything internally, Web Codecs gives you raw frames and audio data to process, transform, or stream. This API is essential for building video editors, real-time streaming applications, computer vision systems, and custom media pipelines.
+The Web Codecs API provides low-level access to browser media encoders and decoders, enabling frame-by-frame processing of audio and video entirely within the browser. Unlike the `<video>` element which abstracts away all encoding and decoding internals, Web Codecs hands you raw pixel data and audio samples to manipulate, transform, or transmit however you see fit. This is the API that powers browser-based video editors, real-time streaming platforms, computer vision pipelines, and custom media processing workflows that previously required native code or server-side infrastructure.
 
-This guide covers video encoding/decoding, audio processing, and real-world use cases.
+![Video processing workstation with multiple monitors showing editing timelines](https://images.unsplash.com/photo-1535016120720-40c646be5580?w=800&h=400&fit=crop)
 
-![Media processing](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+Before Web Codecs, developers who needed granular control over media processing had to rely on workarounds like decoding video by drawing frames to a canvas and reading pixels back, or sending video to a server for processing. These approaches were slow, inefficient, and limited. The Web Codecs API changes the equation entirely by exposing the same hardware-accelerated encoders and decoders that the browser uses internally for `<video>` and `<audio>` playback, giving web applications native-level media processing performance.
+
+This guide covers every aspect of the Web Codecs API — from the core architecture and individual class interfaces to real-world implementation patterns for video transcoding, screen recording, real-time effects processing, and WebRTC integration. You will also learn about codec selection strategies, memory management best practices, container format handling, and browser compatibility considerations.
 
 ## Architecture Overview
 
-### Web Codecs Pipeline
+The Web Codecs API is built around a clean pipeline architecture that separates concerns between raw media data, encoded (compressed) media data, and the encoders/decoders that transform between them.
+
+### The Processing Pipeline
+
+Every Web Codecs application follows the same fundamental pattern: source → decode → process → encode → output. The source can be a camera feed via `getUserMedia`, a video file read through a demuxing library, or frames generated programmatically. The output can be a rendered canvas, a recorded file, a live stream, or anything else that consumes encoded or raw media data.
 
 ```
-┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
-│ Camera/  │────>│ Video    │────>│ Process  │────>│ Video    │──> Output
-│ File     │     │ Decoder  │     │ Frames   │     │ Encoder  │
-└──────────┘     └──────────┘     └──────────┘     └──────────┘
+┌────────────┐     ┌──────────────┐     ┌────────────┐     ┌──────────────┐
+│ Media      │────>│ Video/Audio  │────>│ Process    │────>│ Video/Audio  │──> Output
+│ Source     │     │ Decoder      │     │ (optional) │     │ Encoder      │
+└────────────┘     └──────────────┘     └────────────┘     └────────────┘
 ```
 
-### Key Classes
+### Core Class Hierarchy
 
-| Class | Purpose |
-|-------|---------|
-| `VideoDecoder` | Decode compressed video to raw frames |
-| `VideoEncoder` | Encode raw frames to compressed video |
-| `AudioDecoder` | Decode compressed audio to raw PCM |
-| `AudioEncoder` | Encode raw PCM to compressed audio |
-| `VideoFrame` | Raw video frame data |
-| `AudioData` | Raw audio sample data |
-| `EncodedVideoChunk` | Compressed video data |
-| `EncodedAudioChunk` | Compressed audio data |
+The API introduces eight primary classes organized into two parallel hierarchies — one for video and one for audio:
 
-## Video Decoding
+| Class | Purpose | Data Type |
+|-------|---------|-----------|
+| `VideoFrame` | Raw video frame with pixel data and metadata | Pixels in GPU memory |
+| `EncodedVideoChunk` | Compressed video frame data | Binary buffer |
+| `VideoDecoder` | Transforms `EncodedVideoChunk` → `VideoFrame` | — |
+| `VideoEncoder` | Transforms `VideoFrame` → `EncodedVideoChunk` | — |
+| `AudioData` | Raw audio samples (PCM) | Float32/Int16 arrays |
+| `EncodedAudioChunk` | Compressed audio data | Binary buffer |
+| `AudioDecoder` | Transforms `EncodedAudioChunk` → `AudioData` | — |
+| `AudioEncoder` | Transforms `AudioData` → `EncodedAudioChunk` | — |
 
-### Decode Video Frames
+There is typically a 1:1 correspondence between raw and encoded representations. Decoding N encoded chunks yields exactly N raw frames or audio data objects.
+
+### Asynchronous Processing Model
+
+Each encoder and decoder maintains an internal processing queue. Methods like `configure()`, `encode()`, `decode()`, and `flush()` are asynchronous — they append control messages to the queue and return immediately. The actual work happens in the background, potentially on a dedicated hardware thread. Methods named `reset()` and `close()` are synchronous: `reset()` aborts pending work and allows reconfiguration, while `close()` permanently shuts down the instance and releases all resources.
+
+```typescript
+// The processing model in action
+encoder.configure({ codec: 'avc1.64001E', width: 1920, height: 1080, bitrate: 5_000_000 });
+encoder.encode(frame1);  // Queued — returns immediately
+encoder.encode(frame2);  // Queued — returns immediately
+await encoder.flush();   // Waits for both frames to be encoded
+```
+
+Understanding this queue-based model is critical for managing backpressure. If you queue frames faster than the encoder can process them, the internal queue grows unbounded. Production applications must implement flow control, typically by checking `encoder.encodeQueueSize` before encoding more frames.
+
+![Abstract representation of data flow and processing pipelines](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
+
+## Supported Codecs
+
+The Web Codecs API supports a carefully curated set of industry-standard codecs. However, actual availability depends on the browser and underlying hardware. Always verify codec support at runtime using the `isConfigSupported()` static methods.
+
+### Video Codecs
+
+**H.264 (AVC)** is the most universally supported video codec. Nearly every device with hardware video acceleration can encode and decode H.264. Codec strings follow the pattern `avc1.{profile}{level}`, such as `avc1.64001E` for High Profile Level 3.0 or `avc1.4d001f` for Main Profile Level 3.1.
+
+**VP9** is an open-source codec developed by Google that offers better compression than H.264 at equivalent quality. It is widely used on YouTube and in WebM containers. Codec strings use the pattern `vp09.{profile}.{level}.{bitDepth}.{chromaSubsampling}`, such as `vp09.00.40.08` for Profile 0, Level 4.0, 8-bit.
+
+**AV1** is the newest open-source codec, offering 30-50% better compression than H.264 and 20-30% better than VP9. Hardware decoder support is broad, but hardware encoder support is still limited to newer GPUs. Codec strings follow `av01.{profile}.{level}.{tier}.{bitDepth}`, such as `av01.0.08M.08` for Main Profile, Main Tier, 8-bit.
+
+**H.265 (HEVC)** offers better compression than H.264 but has limited browser support outside Apple's Safari and WebKit-based browsers due to patent licensing concerns. Codec strings use `hev1.{profile}.{level}` or `hvc1.{profile}.{level}`.
+
+### Audio Codecs
+
+**Opus** is the recommended codec for most Web Codecs audio use cases. It provides excellent quality at low bitrates with very low latency, making it ideal for real-time communication and streaming.
+
+**AAC** (Advanced Audio Coding) is widely supported and commonly found in MP4 containers. The codec string `mp4a.40.2` refers to AAC-LC (Low Complexity).
+
+**PCM** (Pulse Code Modulation) represents uncompressed audio with no quality loss but very large file sizes. Useful as an intermediate format during processing.
+
+**FLAC** (Free Lossless Audio Codec) provides lossless compression. Useful for archival quality audio processing.
+
+### Checking Codec Support at Runtime
+
+Never assume a codec is available. Always verify before creating encoders or decoders:
+
+```typescript
+async function checkVideoCodecSupport(): Promise<Map<string, boolean>> {
+  const codecs = [
+    'avc1.64001E',           // H.264 High Profile
+    'vp09.00.10.08',         // VP9 Profile 0
+    'av01.0.04M.08',         // AV1 Main Profile
+  ];
+
+  const support = new Map<string, boolean>();
+
+  for (const codec of codecs) {
+    try {
+      const result = await VideoDecoder.isConfigSupported({
+        codec,
+        codedWidth: 1920,
+        codedHeight: 1080,
+      });
+      support.set(codec, result.supported);
+    } catch {
+      support.set(codec, false);
+    }
+  }
+
+  return support;
+}
+
+async function checkAudioCodecSupport(): Promise<Map<string, boolean>> {
+  const codecs = ['opus', 'mp4a.40.2', 'flac'];
+  const support = new Map<string, boolean>();
+
+  for (const codec of codecs) {
+    try {
+      const result = await AudioEncoder.isConfigSupported({
+        codec,
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bitrate: 128_000,
+      });
+      support.set(codec, result.supported);
+    } catch {
+      support.set(codec, false);
+    }
+  }
+
+  return support;
+}
+```
+
+## Video Decoding in Depth
+
+The `VideoDecoder` transforms compressed video chunks into raw pixel data that you can render, analyze, or process. Understanding the decoder's behavior is essential for building reliable media applications.
+
+### Configuring the Decoder
+
+The decoder must be configured before it can accept input. The configuration object requires at minimum a codec string and the coded dimensions. Optional parameters include description data (required for some codecs like VP9 and AV1, typically extracted from the container's codec-specific header), display dimensions, and color space information.
 
 ```typescript
 const decoder = new VideoDecoder({
   output: (frame: VideoFrame) => {
-    // Process each decoded frame
-    console.log('Frame:', frame.timestamp, frame.displayWidth, frame.displayHeight);
-    
-    // Draw to canvas
+    // Each decoded frame arrives here asynchronously
+    console.log(`Decoded frame at ${frame.timestamp}μs`);
+    console.log(`  Dimensions: ${frame.displayWidth}×${frame.displayHeight}`);
+    console.log(`  Format: ${frame.format}`);          // e.g., "I420", "NV12", "RGBA"
+    console.log(`  Duration: ${frame.duration}μs`);
+
+    // Render to canvas
     const canvas = document.querySelector('canvas')!;
     const ctx = canvas.getContext('2d')!;
+    canvas.width = frame.displayWidth;
+    canvas.height = frame.displayHeight;
     ctx.drawImage(frame, 0, 0);
-    frame.close(); // Release memory
+
+    // CRITICAL: Release GPU memory held by this frame
+    frame.close();
   },
   error: (e: DOMException) => {
-    console.error('Decode error:', e);
+    console.error('Decoder error:', e.message);
+    // Common errors: NotSupportedError, DataError, InvalidStateError
   },
 });
 
 decoder.configure({
-  codec: 'avc1.64001E', // H.264 High Profile
+  codec: 'avc1.64001E',
   codedWidth: 1920,
   codedHeight: 1080,
+  // Optional: hardwareAcceleration: 'prefer-hardware',
 });
-
-// Feed encoded chunks
-const chunk = new EncodedVideoChunk({
-  type: 'key',
-  timestamp: 0,
-  data: encodedData,
-});
-decoder.decode(chunk);
 ```
 
-## Video Encoding
+### Feeding Encoded Data to the Decoder
 
-### Encode Raw Frames
+Once configured, you create `EncodedVideoChunk` objects and pass them to the decoder's `decode()` method. Each chunk must specify whether it is a key frame (`type: 'key'`) or a delta frame (`type: 'delta'`), along with a timestamp in microseconds and the raw encoded data.
 
 ```typescript
-const encoder = new VideoEncoder({
-  output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => {
-    // Process encoded chunk
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
-    
-    // Send to server or write to file
-    sendToServer(data, chunk.timestamp, chunk.type);
-  },
-  error: (e: DOMException) => {
-    console.error('Encode error:', e);
-  },
-});
+// When reading from a demuxed file:
+for (const packet of demuxedPackets) {
+  const chunk = new EncodedVideoChunk({
+    type: packet.isKeyFrame ? 'key' : 'delta',
+    timestamp: packet.timestamp,       // In microseconds
+    duration: packet.duration,
+    data: packet.data,
+  });
+  decoder.decode(chunk);
+}
 
-encoder.configure({
+// Important: flush to ensure all frames are output
+await decoder.flush();
+decoder.close();
+```
+
+The decoder requires a key frame as the first chunk after configuration or after a flush. Delta frames reference the previous frame's data and cannot be decoded independently. If the decoder receives a delta frame before a key frame, it will throw a `DataError`.
+
+![Close-up of video editing timeline with multiple tracks](https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?w=800&h=400&fit=crop)
+
+## Video Encoding in Depth
+
+The `VideoEncoder` transforms raw video frames into compressed chunks suitable for storage or transmission. Encoder configuration has a significant impact on output quality, file size, and encoding speed.
+
+### Encoder Configuration Strategies
+
+```typescript
+// Configuration for high-quality recording (offline encoding)
+const recordingConfig: VideoEncoderConfig = {
   codec: 'avc1.64001E',
+  width: 1920,
+  height: 1080,
+  bitrate: 8_000_000,        // 8 Mbps for high quality
+  framerate: 30,
+  latencyMode: 'quality',    // Optimize for quality over latency
+  // avc: { format: 'avc' }, // For raw AVC access
+};
+
+// Configuration for real-time streaming (low latency)
+const streamingConfig: VideoEncoderConfig = {
+  codec: 'avc1.42001f',       // Constrained Baseline for max compatibility
+  width: 1280,
+  height: 720,
+  bitrate: 2_500_000,         // 2.5 Mbps for 720p
+  framerate: 30,
+  latencyMode: 'realtime',    // Optimize for speed over quality
+  bitrateMode: 'variable',    // VBR for better quality in static scenes
+};
+
+// Configuration for adaptive bitrate streaming
+const abrConfig: VideoEncoderConfig = {
+  codec: 'vp09.00.10.08',
   width: 1920,
   height: 1080,
   bitrate: 5_000_000,
   framerate: 30,
-});
-
-// Encode frames from canvas
-const canvas = document.querySelector('canvas')!;
-const frame = new VideoFrame(canvas, { timestamp: performance.now() * 1000 });
-encoder.encode(frame, { keyFrame: true });
-frame.close();
+  scalabilityMode: 'L1T3',   // Temporal scalability for ABR
+};
 ```
 
-## Audio Processing
-
-### Decode Audio
+### Encoding Frames with Key Frame Control
 
 ```typescript
-const audioDecoder = new AudioDecoder({
-  output: (data: AudioData) => {
-    // Process audio samples
-    const samples = new Float32Array(data.numberOfFrames);
-    data.copyTo(samples, { planeIndex: 0 });
-    
-    // Play through Web Audio API
-    const audioCtx = new AudioContext();
-    const buffer = audioCtx.createBuffer(
-      data.numberOfChannels,
-      data.numberOfFrames,
-      data.sampleRate
-    );
-    // Copy data to buffer...
-    data.close();
+const encoder = new VideoEncoder({
+  output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => {
+    const data = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(data);
+
+    // The metadata may contain codec-specific data (e.g., SPS/PPS for H.264)
+    if (metadata?.decoderConfig) {
+      console.log('Decoder config updated:', metadata.decoderConfig);
+      // Store or transmit the decoder config alongside the chunk
+    }
+
+    // Transmit or store the encoded data
+    muxer.addChunk(chunk, data);
   },
-  error: console.error,
+  error: (e: DOMException) => {
+    console.error('Encoder error:', e.message);
+  },
 });
 
-audioDecoder.configure({
-  codec: 'mp4a.40.2',
-  sampleRate: 44100,
-  numberOfChannels: 2,
-});
+encoder.configure(recordingConfig);
+
+let frameCount = 0;
+const keyFrameInterval = 150; // Force key frame every 5 seconds at 30fps
+
+function encodeVideoFrame(source: CanvasImageSource, timestamp: number) {
+  const frame = new VideoFrame(source, { timestamp });
+
+  // Force key frames at regular intervals for seeking support
+  const isKeyFrame = frameCount % keyFrameInterval === 0;
+  encoder.encode(frame, { keyFrame: isKeyFrame });
+  frame.close(); // Release the source frame immediately
+
+  frameCount++;
+
+  // Monitor queue pressure
+  if (encoder.encodeQueueSize > 10) {
+    console.warn('Encoder queue backing up, consider throttling input');
+  }
+}
 ```
 
-### Encode Audio
+### Monitoring and Managing the Encode Queue
+
+The `encodeQueueSize` property tells you how many frames are waiting to be processed. If this number grows, your pipeline is producing frames faster than the encoder can consume them:
+
+```typescript
+function shouldEncodeMore(): boolean {
+  const queueSize = encoder.encodeQueueSize;
+  if (queueSize > 5) return false;  // Backpressure — stop feeding frames
+  if (queueSize > 2) return true;   // Catching up
+  return true;                       // Normal — keep going
+}
+```
+
+## Audio Encoding and Decoding
+
+The audio interfaces mirror the video ones but work with PCM sample data instead of pixel data.
+
+### Audio Encoding with Opus
 
 ```typescript
 const audioEncoder = new AudioEncoder({
-  output: (chunk: EncodedAudioChunk) => {
+  output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => {
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
-    sendToServer(data);
+
+    // Send to muxer or network
+    audioMuxer.write(chunk, data);
   },
-  error: console.error,
+  error: (e: DOMException) => console.error('Audio encoder error:', e),
 });
 
 audioEncoder.configure({
   codec: 'opus',
   sampleRate: 48000,
   numberOfChannels: 1,
-  bitrate: 128_000,
+  bitrate: 128_000,            // 128 kbps for speech, 256k for music
+  // opus: { complexity: 10 }, // Max quality (0-10)
 });
-```
 
-## Real-World Use Cases
+// Encode audio from microphone capture
+async function encodeMicrophoneAudio() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const audioContext = new AudioContext({ sampleRate: 48000 });
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-### Screen Recording
+  source.connect(processor);
+  processor.connect(audioContext.destination);
 
-```typescript
-async function startScreenRecording() {
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { width: 1920, height: 1080 },
-  });
+  let timestamp = 0;
+  const frameDuration = 4096 / 48000; // ~85ms per chunk
 
-  const track = stream.getVideoTracks()[0];
-  const reader = track.getReader();
+  processor.onaudioprocess = (event) => {
+    const inputBuffer = event.inputBuffer;
+    const samples = inputBuffer.getChannelData(0);
 
-  const encoder = new VideoEncoder({
-    output: (chunk) => {
-      // Accumulate chunks for final file
-      chunks.push(chunk);
-    },
-    error: console.error,
-  });
-
-  encoder.configure({
-    codec: 'avc1.64001E',
-    width: 1920,
-    height: 1080,
-    bitrate: 8_000_000,
-  });
-
-  // Process frames
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const frame = new VideoFrame(value, {
-      timestamp: performance.now() * 1000,
+    const audioData = new AudioData({
+      format: 'f32',
+      sampleRate: 48000,
+      numberOfFrames: inputBuffer.length,
+      numberOfChannels: 1,
+      timestamp: timestamp * 1_000_000, // Convert to microseconds
+      data: samples,
     });
-    encoder.encode(frame);
-    frame.close();
-  }
 
-  await encoder.flush();
-  encoder.close();
+    audioEncoder.encode(audioData);
+    audioData.close();
+    timestamp += frameDuration;
+  };
 }
 ```
 
-### Real-Time Video Filter
+### Audio Decoding and Playback
 
 ```typescript
-async function applyFilter(source: HTMLVideoElement, canvas: HTMLCanvasElement) {
-  const ctx = canvas.getContext('2d')!;
+const audioDecoder = new AudioDecoder({
+  output: (audioData: AudioData) => {
+    // Extract raw PCM samples
+    const samples = new Float32Array(audioData.numberOfFrames);
+    audioData.copyTo(samples, { planeIndex: 0 });
+
+    // Play through Web Audio API
+    const audioCtx = new AudioContext({ sampleRate: audioData.sampleRate });
+    const buffer = audioCtx.createBuffer(
+      audioData.numberOfChannels,
+      audioData.numberOfFrames,
+      audioData.sampleRate
+    );
+
+    for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
+      const channelData = new Float32Array(audioData.numberOfFrames);
+      audioData.copyTo(channelData, { planeIndex: ch, format: 'f32' });
+      buffer.copyToChannel(channelData, ch);
+    }
+
+    const bufferSource = audioCtx.createBufferSource();
+    bufferSource.buffer = buffer;
+    bufferSource.connect(audioCtx.destination);
+    bufferSource.start();
+
+    audioData.close();
+  },
+  error: (e: DOMException) => console.error('Audio decoder error:', e),
+});
+
+audioDecoder.configure({
+  codec: 'opus',
+  sampleRate: 48000,
+  numberOfChannels: 1,
+});
+```
+
+## Muxing and Demuxing: Working with Container Formats
+
+The Web Codecs API only handles encoding and decoding — it has no concept of container formats like MP4, WebM, or MKV. To read encoded chunks from a video file, you need a **demuxing** library. To write encoded chunks to a playable file, you need a **muxing** library.
+
+### Demuxing MP4 Files for Decoding
+
+```typescript
+import { Mp4Demuxer } from './mp4-demuxer'; // Using a demuxing library
+
+async function decodeVideoFile(file: File) {
+  const buffer = await file.arrayBuffer();
+
+  const demuxer = new Mp4Demuxer(buffer);
+
   const decoder = new VideoDecoder({
     output: (frame) => {
-      // Draw and apply filter
-      ctx.drawImage(frame, 0, 0);
-      ctx.fillStyle = 'rgba(0, 0, 255, 0.3)';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      renderFrameToCanvas(frame);
       frame.close();
     },
     error: console.error,
   });
 
-  // Use MediaStreamTrackProcessor for live video
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  const track = stream.getVideoTracks()[0];
-  const processor = new MediaStreamTrackProcessor({ track });
-  const reader = processor.readable.getReader();
+  // Configure decoder from the demuxer's track info
+  const videoTrack = demuxer.getVideoTrack();
+  decoder.configure({
+    codec: videoTrack.codec,
+    codedWidth: videoTrack.width,
+    codedHeight: videoTrack.height,
+    description: videoTrack.description, // Codec-specific init data
+  });
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    
-    const frame = new VideoFrame(value, {
-      timestamp: performance.now() * 1000,
-    });
-    // Process frame...
+  // Decode all chunks from the file
+  for (const chunk of demuxer.getChunks()) {
+    decoder.decode(chunk);
+  }
+
+  await decoder.flush();
+  decoder.close();
+}
+```
+
+### Muxing Encoded Chunks into WebM
+
+```typescript
+import { WebMMuxer } from 'webm-muxer';
+
+async function encodeAndMuxToWebM(
+  canvas: HTMLCanvasElement,
+  durationSeconds: number
+) {
+  const muxer = new WebMMuxer({
+    target: 'buffer',
+    video: { codec: 'V_VP9', width: canvas.width, height: canvas.height },
+  });
+
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      muxer.addVideoChunk(chunk, metadata);
+    },
+    error: console.error,
+  });
+
+  encoder.configure({
+    codec: 'vp09.00.10.08',
+    width: canvas.width,
+    height: canvas.height,
+    bitrate: 5_000_000,
+    framerate: 30,
+  });
+
+  // Encode frames from canvas
+  for (let i = 0; i < durationSeconds * 30; i++) {
+    const timestamp = (i / 30) * 1_000_000; // Microseconds
+    const frame = new VideoFrame(canvas, { timestamp });
+    encoder.encode(frame, { keyFrame: i % 90 === 0 });
     frame.close();
-    value.close();
+  }
+
+  await encoder.flush();
+  encoder.close();
+
+  const buffer = muxer.finalize();
+  // buffer now contains a valid WebM file
+  downloadBlob(new Blob([buffer], { type: 'video/webm' }), 'output.webm');
+}
+```
+
+![Professional video production studio with camera equipment](https://images.unsplash.com/photo-1574717024653-61fd2cf4d44d?w=800&h=400&fit=crop)
+
+## Real-World Use Case: Screen Recording Application
+
+A complete screen recording application demonstrates how the Web Codecs APIs work together. This example captures the screen, encodes video with H.264, encodes system audio with Opus, and produces a downloadable WebM file.
+
+```typescript
+class ScreenRecorder {
+  private videoEncoder: VideoEncoder;
+  private audioEncoder: AudioEncoder;
+  private muxer: any; // WebM or MP4 muxer
+  private isRecording = false;
+  private frameCount = 0;
+
+  constructor(private outputCanvas?: HTMLCanvasElement) {
+    this.setupEncoder();
+  }
+
+  private setupEncoder() {
+    this.videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => this.muxer.addVideoChunk(chunk, meta),
+      error: (e) => console.error('Video encoder error:', e),
+    });
+
+    this.audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => this.muxer.addAudioChunk(chunk, meta),
+      error: (e) => console.error('Audio encoder error:', e),
+    });
+  }
+
+  async start() {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: 1920, height: 1080, frameRate: 30 },
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        sampleRate: 48000,
+      },
+    });
+
+    // Configure encoders
+    this.videoEncoder.configure({
+      codec: 'avc1.64001E',
+      width: 1920,
+      height: 1080,
+      bitrate: 8_000_000,
+      framerate: 30,
+      latencyMode: 'realtime',
+    });
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length > 0) {
+      this.audioEncoder.configure({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bitrate: 128_000,
+      });
+    }
+
+    this.isRecording = true;
+    this.frameCount = 0;
+
+    // Process video frames using MediaStreamTrackProcessor
+    const videoTrack = stream.getVideoTracks()[0];
+    const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+    const reader = processor.readable.getReader();
+
+    // Process audio if available
+    if (audioTracks.length > 0) {
+      this.processAudio(audioTracks[0]);
+    }
+
+    // Video processing loop
+    while (this.isRecording) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const frame = new VideoFrame(value, {
+        timestamp: performance.now() * 1000,
+      });
+
+      // Optional: render to canvas for preview or processing
+      if (this.outputCanvas) {
+        const ctx = this.outputCanvas.getContext('2d')!;
+        ctx.drawImage(frame, 0, 0);
+      }
+
+      const isKeyFrame = this.frameCount % 90 === 0; // Every 3 seconds
+      this.videoEncoder.encode(frame, { keyFrame: isKeyFrame });
+      frame.close();
+      value.close();
+      this.frameCount++;
+    }
+
+    await this.videoEncoder.flush();
+    await this.audioEncoder.flush();
+    this.videoEncoder.close();
+    this.audioEncoder.close();
+    stream.getTracks().forEach(t => t.stop());
+  }
+
+  stop() {
+    this.isRecording = false;
   }
 }
 ```
 
-## Browser Support
+## Real-Time Video Effects Pipeline
 
-| API | Chrome | Edge | Firefox | Safari |
-|-----|--------|------|---------|--------|
-| VideoDecoder | 94+ | 94+ | 113+ | 16.4+ |
-| VideoEncoder | 94+ | 94+ | 113+ | 16.4+ |
-| AudioDecoder | 94+ | 94+ | 113+ | ❌ |
-| AudioEncoder | 94+ | 94+ | 113+ | ❌ |
+Combining Web Codecs with Canvas and WebGL enables real-time video effects processing entirely in the browser. This pattern is useful for video conferencing filters, AR overlays, and live production tools.
 
-## Best Practices
+```typescript
+class VideoEffectsProcessor {
+  private gl: WebGLRenderingContext;
+  private program: WebGLProgram;
 
-1. **Always close frames**: `frame.close()` releases memory
-2. **Check codec support**: Use `VideoDecoder.isConfigSupported()`
-3. **Handle errors**: Decoders/encoders can fail
-4. **Manage memory**: Process frames in batches
-5. **Use hardware acceleration**: Browser uses GPU when available
+  constructor(private canvas: HTMLCanvasElement) {
+    this.gl = canvas.getContext('webgl')!;
+    this.setupShaders();
+  }
 
-## Common Pitfalls
+  private setupShaders() {
+    // Vertex shader: pass-through
+    const vsSource = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+      }
+    `;
+
+    // Fragment shader: color manipulation effect
+    const fsSource = `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_image;
+      uniform float u_time;
+
+      void main() {
+        vec4 color = texture2D(u_image, v_texCoord);
+        // Apply a subtle color grading effect
+        color.r = pow(color.r, 0.9);
+        color.b = pow(color.b, 1.1);
+        // Add a vignette
+        float dist = distance(v_texCoord, vec2(0.5, 0.5));
+        color.rgb *= smoothstep(0.8, 0.3, dist);
+        gl_FragColor = color;
+      }
+    `;
+
+    // Compile and link shader program...
+  }
+
+  async processStream(stream: MediaStream) {
+    const track = stream.getVideoTracks()[0];
+    const processor = new MediaStreamTrackProcessor({ track });
+    const reader = processor.readable.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const frame = new VideoFrame(value, {
+        timestamp: performance.now() * 1000,
+      });
+
+      // Upload frame texture to WebGL
+      this.gl.texImage2D(
+        this.gl.TEXTURE_2D, 0, this.gl.RGBA,
+        this.gl.RGBA, this.gl.UNSIGNED_BYTE, frame
+      );
+
+      // Draw with effect shader
+      this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
+
+      // Create output frame from canvas
+      const outputFrame = new VideoFrame(this.canvas, {
+        timestamp: frame.timestamp,
+      });
+
+      // Pass to encoder or display
+      frame.close();
+      value.close();
+    }
+  }
+}
+```
+
+## WebRTC Integration
+
+The Web Codecs API integrates naturally with WebRTC for real-time communication, giving you fine-grained control over encoding parameters that the standard WebRTC API does not expose.
+
+```typescript
+// Use WebCodecs encoder for custom WebRTC sender
+async function setupCustomWebRTCSender(pc: RTCPeerConnection, stream: MediaStream) {
+  const videoTrack = stream.getVideoTracks()[0];
+  const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+  const reader = processor.readable.getReader();
+
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      // Create an EncodedVideoChunk and send via RTCRtpSender
+      const sender = pc.getSenders().find(s => s.track === videoTrack);
+      if (sender) {
+        // Use insertable streams or encoded transform
+        // for direct encoded frame injection
+      }
+    },
+    error: console.error,
+  });
+
+  encoder.configure({
+    codec: 'avc1.42001f',    // Baseline for max WebRTC compatibility
+    width: 640,
+    height: 480,
+    bitrate: 1_000_000,
+    framerate: 30,
+    latencyMode: 'realtime',
+  });
+
+  // Adaptive bitrate based on network conditions
+  function adjustBitrate(availableBandwidth: number) {
+    encoder.configure({
+      codec: 'avc1.42001f',
+      width: 640,
+      height: 480,
+      bitrate: Math.min(availableBandwidth * 0.8, 2_500_000),
+      framerate: 30,
+      latencyMode: 'realtime',
+    });
+  }
+}
+```
+
+## Memory Management Best Practices
+
+The Web Codecs API deals with large binary buffers and GPU-backed frame data. Improper memory management leads to memory leaks that degrade performance and can crash the application.
+
+### The Golden Rule: Always Close Resources
+
+Every `VideoFrame`, `AudioData`, `EncodedVideoChunk`, and `EncodedAudioChunk` holds a reference to an underlying buffer. These resources must be explicitly released:
+
+```typescript
+// WRONG: Memory leak — frames accumulate
+const frames: VideoFrame[] = [];
+decoder.configure({ codec: 'avc1.64001E', codedWidth: 1920, codedHeight: 1080 });
+// ... decode many frames into array without closing
+
+// CORRECT: Close each frame after processing
+const decoder = new VideoDecoder({
+  output: (frame: VideoFrame) => {
+    try {
+      processFrame(frame);
+    } finally {
+      frame.close(); // Always close, even if processing fails
+    }
+  },
+  error: console.error,
+});
+```
+
+### Handling Backpressure
+
+When processing cannot keep up with the input rate, implement flow control:
+
+```typescript
+class BackpressureAwareDecoder {
+  private decoder: VideoDecoder;
+  private pendingFrames = 0;
+  private maxPending = 3;
+
+  constructor() {
+    this.decoder = new VideoDecoder({
+      output: (frame) => {
+        this.pendingFrames--;
+        this.processAndClose(frame);
+      },
+      error: console.error,
+    });
+  }
+
+  async decode(chunk: EncodedVideoChunk) {
+    // Wait if too many frames are pending
+    while (this.pendingFrames >= this.maxPending) {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
+    this.pendingFrames++;
+    this.decoder.decode(chunk);
+  }
+
+  private processAndClose(frame: VideoFrame) {
+    try {
+      // Process the frame...
+    } finally {
+      frame.close();
+    }
+  }
+}
+```
+
+## Browser Compatibility
+
+The Web Codecs API has broad support across modern browsers, though audio support lags behind video support on some platforms:
+
+| Feature | Chrome | Edge | Firefox | Safari |
+|---------|--------|------|---------|--------|
+| `VideoDecoder` | 94+ | 94+ | 113+ | 16.4+ |
+| `VideoEncoder` | 94+ | 94+ | 113+ | 16.4+ |
+| `AudioDecoder` | 94+ | 94+ | 113+ | ❌ |
+| `AudioEncoder` | 94+ | 94+ | 113+ | ❌ |
+| `VideoFrame` | 94+ | 94+ | 113+ | 16.4+ |
+| `AudioData` | 94+ | 94+ | 113+ | ❌ |
+| Hardware acceleration | ✅ | ✅ | Partial | ✅ |
+
+### Feature Detection and Fallbacks
+
+```typescript
+function isWebCodecsSupported(): boolean {
+  return (
+    typeof VideoEncoder !== 'undefined' &&
+    typeof VideoDecoder !== 'undefined' &&
+    typeof VideoFrame !== 'undefined'
+  );
+}
+
+function getMediaProcessingStrategy() {
+  if (isWebCodecsSupported()) {
+    return 'webcodecs'; // Best: frame-level control with hardware acceleration
+  }
+
+  if (typeof MediaRecorder !== 'undefined') {
+    return 'mediarecorder'; // Good: simple API but less control
+  }
+
+  if (typeof MediaSource !== 'undefined') {
+    return 'mediasource'; // Fallback: MSE for streaming
+  }
+
+  return 'server'; // Last resort: send to server for processing
+}
+```
+
+## Performance Considerations
+
+### Hardware vs. Software Encoding
+
+Browsers automatically choose between hardware (GPU) and software (CPU) encoding based on the configuration and available hardware. Hardware encoding is significantly faster but may produce slightly lower quality at the same bitrate. Force hardware preference when latency matters:
+
+```typescript
+encoder.configure({
+  codec: 'avc1.64001E',
+  width: 1920,
+  height: 1080,
+  bitrate: 5_000_000,
+  hardwareAcceleration: 'prefer-hardware', // 'prefer-software' | 'no-preference'
+});
+```
+
+### OffscreenCanvas for Worker-Based Processing
+
+Move expensive frame processing off the main thread using `OffscreenCanvas` in a Web Worker:
+
+```typescript
+// In a Web Worker
+self.onmessage = async (event) => {
+  const { frame, width, height } = event.data;
+
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(frame, 0, 0);
+
+  // Apply pixel-level processing
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const pixels = imageData.data;
+
+  // Example: Convert to grayscale
+  for (let i = 0; i < pixels.length; i += 4) {
+    const gray = pixels[i] * 0.299 + pixels[i+1] * 0.587 + pixels[i+2] * 0.114;
+    pixels[i] = pixels[i+1] = pixels[i+2] = gray;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+
+  // Return processed frame
+  const outputFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
+  frame.close();
+  self.postMessage({ frame: outputFrame }, [outputFrame]);
+};
+```
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Not closing frames | Memory leak | Always call close() |
-| Unsupported codec | Decode fails | Check isConfigSupported() |
-| Buffer overflow | Frames dropped | Process fast enough |
-| Missing timestamp | Sync issues | Always set timestamp |
-
-### Browser Support and Fallbacks
-
-The Web Codecs API is available in Chromium-based browsers including Chrome, Edge, and Opera. Firefox has partial support with ongoing development. Safari added support in version sixteen point four. For browsers that do not support Web Codecs, implement fallback strategies using MediaSource Extensions or server-side transcoding. Use feature detection to check for the availability of VideoEncoder and VideoDecoder before using them. Provide a degraded experience for unsupported browsers rather than failing completely, such as using pre-transcoded video files instead of real-time encoding.
-
-### Encoding and Decoding Pipelines
-
-The Web Codecs API provides separate interfaces for encoding and decoding audio and video. VideoDecoder takes encoded video chunks and produces raw video frames in formats like I420 or NV12. VideoEncoder takes raw video frames and produces encoded chunks in formats like VP8, VP9, H.264, or AV1. AudioDecoder and AudioEncoder work similarly for audio data. You chain these components together to build processing pipelines. For example, read encoded video from a file, decode it to raw frames, apply transformations using WebGL or Canvas, re-encode the transformed frames, and write the result to a new file. This pipeline approach gives you complete control over each stage of the processing.
-
-### Real-Time Processing
-
-The Web Codecs API enables real-time video processing for applications like video conferencing, live streaming, and augmented reality. Capture video from a camera using getUserMedia, feed the frames into a VideoEncoder for real-time compression, and transmit the encoded chunks over WebRTC or WebTransport. On the receiving end, decode the chunks and display them using a canvas element or video element. The key to real-time performance is managing the encoding latency by configuring the encoder with appropriate bitrate, framerate, and latency mode settings. Use hardware acceleration when available to ensure that encoding and decoding do not consume excessive CPU resources.
-
-### Working with Canvas
-
-The Web Codecs API integrates closely with the Canvas API for video frame manipulation. Create a VideoFrame from a canvas element using the VideoFrame constructor with the canvas as the source. Draw a VideoFrame onto a canvas using the drawImage method. This integration enables powerful video processing workflows like adding overlays, applying filters, compositing multiple video streams, and generating thumbnails. Use OffscreenCanvas in web workers to perform these operations without blocking the main thread. The combination of Web Codecs and Canvas provides a complete video processing toolkit that runs entirely in the browser.
-
-### Audio Processing
-
-The Web Codecs API includes AudioEncoder and AudioDecoder for processing audio data. AudioEncoder takes raw audio data in PCM format and produces encoded audio chunks in formats like Opus, AAC, or FLAC. AudioDecoder reverses the process, producing raw audio from encoded chunks. Use AudioData objects to represent raw audio with specific sample formats, sample rates, and channel configurations. Process audio captured from the microphone by encoding it in real-time for transmission over WebRTC or WebTransport. Decode received audio chunks and play them using the Web Audio API. The Web Codecs audio interfaces provide lower latency and more control than the older MediaStream Recording API.
-
-### Codec Configuration
-
-Configuring encoders and decoders correctly is essential for achieving the desired quality and performance. For video encoding, specify the codec string, dimensions, bitrate, framerate, and latency mode. Hardware encoder configurations may differ from software encoders, so check the isConfigSupported method before creating the encoder. For audio encoding, specify the codec, sample rate, number of channels, and bitrate. Use the ABR (Adaptive Bitrate) encoder mode for streaming applications where the available bandwidth may change. Configure decoders with the codec string and any codec-specific configuration data extracted from the container format. Properly configured codecs produce higher quality output with lower latency and fewer artifacts.
-
-### File Format Integration
-
-The Web Codecs API works with raw encoded chunks and does not handle container formats like MP4, WebM, or MKV directly. Use the MP4Box.js library to demux MP4 files into individual video and audio chunks for decoding. Use the WebM muxer library to combine encoded chunks into WebM files for export. For real-time streaming, the encoded chunks are transmitted directly over WebRTC or WebTransport without container wrapping. Understanding the distinction between codecs and containers is important because the Web Codecs API handles the codec layer while you need additional libraries for container format handling. This separation provides flexibility to work with any combination of codec and container format.
-
-### WebRTC Integration
-
-The Web Codecs API integrates naturally with WebRTC for real-time communication applications. Use VideoEncoder to encode camera frames with low-latency settings optimized for real-time transmission. Pass the encoded chunks to the WebRTC sender for transmission over the peer connection. On the receiving end, use VideoDecoder to decode the received chunks and display them. This integration gives you fine-grained control over the encoding parameters, allowing you to adapt quality based on network conditions. Implement simulcast by encoding the same input at multiple resolutions and bitrates, allowing the receiver to select the appropriate quality stream based on their bandwidth and display size.
-
-### Screen Recording and Capture
-
-Building screen recording applications is straightforward with the Web Codecs API. Use the getDisplayMedia API to capture the screen, then feed the captured frames into a VideoEncoder for efficient compression. Combine the encoded video chunks with encoded audio from the microphone to create a complete recording. Use a MediaRecorder alternative built on Web Codecs for more control over encoding quality, format, and file size. Store the encoded chunks in IndexedDB for long recordings that exceed available memory, then combine them into a final file when the recording is complete. This approach produces higher quality recordings with smaller file sizes compared to the default MediaRecorder.
-
-### Accessibility and Media Processing
-
-The Web Codecs API enables accessibility features that improve the experience for users with disabilities. Generate real-time captions by processing audio through a speech recognition model running in a Web Worker. Create audio descriptions for video content by analyzing video frames and generating descriptive text. Implement sign language overlays by compositing a sign language video stream onto the main video. Adjust video playback speed, contrast, and color balance using frame processing before display. These accessibility enhancements can be implemented entirely client-side using the Web Codecs API, reducing the need for server-side processing and enabling real-time adaptation to user preferences.
-
-The Web Codecs API continues to evolve with new codec support and improved performance characteristics. Browser vendors are actively working on AV1 encoding support which promises better compression efficiency than H.264 for video conferencing and streaming applications.
-
-The WebCodecs API unlocks hardware-accelerated media processing directly in the browser, enabling applications like video editors and real-time streaming tools.
+| Not calling `frame.close()` | GPU memory leak, eventual crash | Always close in a `finally` block |
+| Missing key frames at start | Decoder error, no output | Send key frame first after `configure()` |
+| Using unsupported codec string | `NotSupportedError` | Call `isConfigSupported()` first |
+| Queue overflow | Frames dropped, OOM | Monitor `encodeQueueSize`, implement backpressure |
+| Wrong timestamp units | Audio/video desync | Web Codecs uses **microseconds**, not milliseconds |
+| Ignoring `decoderConfig` in metadata | Cannot reconstruct file | Store `decoderConfig` with encoded chunks |
+| Calling `flush()` too frequently | Degrades encode quality | Only flush at natural boundaries |
+| Mixing pixel formats | Garbled output | Ensure `VideoFrame.format` matches encoder expectations |
 
 ## Conclusion
 
-The Web Codecs API unlocks professional-grade media processing in the browser. From video editing to real-time streaming, it provides the low-level primitives needed for complex media applications.
+The Web Codecs API is a transformative technology that brings native-grade media processing capabilities to the browser. By exposing hardware-accelerated encoders and decoders at the frame level, it enables a new class of web applications — from browser-based video editors and real-time streaming tools to AI-powered computer vision pipelines and custom transcoding services.
 
-Key takeaways:
+Key takeaways from this guide:
 
-1. **Frame-level access** to video and audio data
-2. **Hardware-accelerated** encoding and decoding
-3. **Enables custom media pipelines** in the browser
-4. **Always close frames** to prevent memory leaks
-5. **Check browser support** — relatively new API
+1. **Frame-level control** — Process individual video frames and audio samples with pixel-perfect precision, enabling effects, analysis, and transformations that were previously impossible in the browser.
+2. **Hardware acceleration** — The API leverages GPU encoders and decoders automatically, delivering performance comparable to native applications without requiring plugins or server-side processing.
+3. **Codec flexibility** — Support for H.264, VP9, AV1, Opus, AAC, and more gives you the freedom to choose the right codec for your use case, whether prioritizing compatibility, quality, or compression efficiency.
+4. **Memory discipline is mandatory** — Every `VideoFrame` and `AudioData` must be explicitly closed. Build cleanup into your processing pipelines from the start, using `try/finally` patterns and backpressure management.
+5. **Container formats require external libraries** — Web Codecs handles encoding and decoding only. For reading and writing MP4 or WebM files, use dedicated muxing and demuxing libraries like Mediabunny or webm-muxer.
+6. **Feature detection is essential** — Browser support varies, especially for audio codecs. Always check `isConfigSupported()` and provide graceful fallbacks for unsupported environments.
+
+The ecosystem around Web Codecs continues to mature rapidly, with growing library support for container formats, improving hardware encoder availability for AV1, and expanding Safari support for audio interfaces. For any application that needs low-level media processing in the browser, Web Codecs is the foundation to build on.
