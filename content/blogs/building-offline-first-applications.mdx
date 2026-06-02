@@ -9,54 +9,588 @@ author: "MinhVo"
 
 ## Introduction
 
-Building Offline-First Applications is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+The offline-first design philosophy flips the traditional web development assumption on its head. Instead of treating the network as always available and offline as an edge case, offline-first applications assume the network is unreliable and design for a seamless experience regardless of connectivity. When the network is available, data syncs in the background. When it is not, the application continues to function fully, queuing changes for later synchronization.
 
-## Key Concepts
+This approach is not just for mobile apps in areas with poor connectivity. Even in well-connected environments, users experience momentary network interruptions — switching between WiFi and cellular, entering elevators, boarding airplanes, or simply encountering a spotty connection. Traditional web applications break catastrophically in these moments: forms fail to submit, data disappears, and the user sees a blank "You are offline" page. Offline-first applications handle these moments gracefully, preserving user work and maintaining functionality.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+Building an offline-first application requires three fundamental capabilities: a client-side storage layer (IndexedDB), a background synchronization mechanism (Service Workers), and a conflict resolution strategy for when the same data is modified both offline and online. In this guide, we will implement each of these from scratch, integrate them into a React application, and discuss the patterns that make offline-first applications production-ready.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Mobile device showing offline-capable application](https://images.unsplash.com/photo-1512941937669-90a1b58e7e9c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Offline-First: Core Concepts
 
-Let's look at a practical example:
+### The Offline-First Spectrum
+
+Offline-first is not binary — it is a spectrum of capabilities. At the simplest level, your application can cache static assets (HTML, CSS, JavaScript) so the shell loads offline. At the next level, it can cache API responses so previously loaded data is available offline. At the most sophisticated level, it provides full read-write offline capability with background synchronization and conflict resolution.
+
+Most applications benefit from the first two levels with minimal effort. Service Workers and the Cache API make caching static assets and API responses straightforward. Full read-write offline capability requires significantly more architecture but delivers the best user experience.
+
+### The Service Worker Lifecycle
+
+A Service Worker is a JavaScript file that runs in the background, separate from the web page. It acts as a programmable network proxy, intercepting every HTTP request made by the application. The Service Worker lifecycle has three phases: registration (the browser installs the Service Worker script), activation (the Service Worker takes control of the page), and fetch interception (the Service Worker intercepts network requests and decides how to handle each one).
+
+Understanding the lifecycle is critical because Service Workers have strict update rules. A new Service Worker does not activate until all tabs using the old version are closed. This prevents disruptive updates but requires careful versioning and cache management to ensure users get the latest code.
+
+### IndexedDB for Client-Side Storage
+
+IndexedDB is the browser's built-in database for storing structured data. Unlike localStorage (which is synchronous, limited to 5-10MB, and stores only strings), IndexedDB is asynchronous, supports much larger storage (typically 50MB+ with user permission), stores structured data (objects, arrays, binary data), and supports indexes for efficient querying.
+
+For offline-first applications, IndexedDB serves as the primary data store. All reads come from IndexedDB (fast, always available). Writes go to IndexedDB first, then sync to the server in the background. This architecture ensures the application is always responsive regardless of network conditions.
+
+### Conflict Resolution Strategies
+
+When the same data is modified both offline (on the client) and online (by another user or system), a conflict occurs. The three main resolution strategies are: last-write-wins (the most recent change overwrites older ones, simple but can lose data), manual resolution (prompt the user to choose between conflicting versions, accurate but burdensome), and operational transformation (merge changes automatically using algorithms like CRDTs, complex but provides the best experience).
+
+## Architecture and Design Patterns
+
+### The Sync Engine Pattern
+
+The heart of an offline-first application is the sync engine. It manages a queue of pending changes, detects network availability, and synchronizes changes with the server when the network is available:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  UI Layer     │ ←→  │  Local DB     │ ←→  │  Sync Engine  │
+│  (React)      │     │  (IndexedDB)  │     │  (Background) │
+└──────────────┘     └──────────────┘     └───────┬──────┘
+                                                   │
+                                            ┌──────▼──────┐
+                                            │  Remote API   │
+                                            │  (Server)     │
+                                            └─────────────┘
+```
+
+### The Outbox Pattern
+
+Instead of syncing immediately, offline-first applications use an outbox pattern. When the user makes a change, the change is applied to the local database and an entry is added to an outbox table. The sync engine processes the outbox in order, sending each change to the server. When the server confirms a change, the outbox entry is removed. This ensures no changes are lost and provides a clear audit trail.
+
+### Optimistic Updates
+
+Show the user the result of their action immediately, before the server confirms. When a user creates a task, display it in the UI instantly (from the local database) and sync to the server in the background. If the server rejects the change (validation error, permission denied), roll back the local change and notify the user. This makes the application feel fast even on slow connections.
+
+## Step-by-Step Implementation
+
+### Setting Up IndexedDB with Dexie.js
+
+Dexie.js provides a clean, Promise-based API for IndexedDB:
+
+```bash
+npm install dexie dexie-react-hooks
+```
+
+Define the database schema:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import Dexie, { type Table } from 'dexie';
+
+export interface Task {
+  id?: string;
+  title: string;
+  description: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  createdAt: Date;
+  updatedAt: Date;
+  _syncStatus: 'synced' | 'pending' | 'conflict';
+  _version: number;
+}
+
+export interface SyncRecord {
+  id?: number;
+  table: string;
+  recordId: string;
+  operation: 'create' | 'update' | 'delete';
+  data: any;
+  timestamp: Date;
+  retryCount: number;
+}
+
+class OfflineDatabase extends Dexie {
+  tasks!: Table<Task>;
+  syncQueue!: Table<SyncRecord>;
+
+  constructor() {
+    super('OfflineAppDB');
+    this.version(1).stores({
+      tasks: 'id, status, _syncStatus, updatedAt',
+      syncQueue: '++id, table, recordId, operation, timestamp',
+    });
+  }
+}
+
+export const db = new OfflineDatabase();
+```
+
+### Creating the Sync Engine
+
+Build a sync engine that processes the outbox and handles conflicts:
+
+```typescript
+class SyncEngine {
+  private isSyncing = false;
+  private listeners: Set<(status: SyncStatus) => void> = new Set();
+
+  async sync(): Promise<void> {
+    if (this.isSyncing || !navigator.onLine) return;
+    this.isSyncing = true;
+    this.notifyListeners({ status: 'syncing' });
+
+    try {
+      const pending = await db.syncQueue
+        .orderBy('timestamp')
+        .toArray();
+
+      for (const record of pending) {
+        try {
+          await this.processRecord(record);
+          await db.syncQueue.delete(record.id!);
+        } catch (error: any) {
+          if (error.status === 409) {
+            await this.handleConflict(record, error.serverVersion);
+          } else {
+            await db.syncQueue.update(record.id!, {
+              retryCount: record.retryCount + 1,
+            });
+            if (record.retryCount >= 3) {
+              this.notifyListeners({
+                status: 'error',
+                message: `Failed to sync ${record.table}/${record.recordId}`,
+              });
+            }
+          }
+        }
+      }
+      this.notifyListeners({ status: 'synced' });
+    } catch (error) {
+      this.notifyListeners({ status: 'error', message: String(error) });
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  private async processRecord(record: SyncRecord): Promise<void> {
+    const url = `/api/${record.table}/${record.recordId}`;
+    const method = record.operation === 'create' ? 'POST'
+      : record.operation === 'update' ? 'PUT'
+      : 'DELETE';
+
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'If-Match': `"${record.data._version}"`,
+      },
+      body: record.operation !== 'delete'
+        ? JSON.stringify(record.data)
+        : undefined,
+    });
+
+    if (!response.ok) {
+      const error: any = new Error(`Sync failed: ${response.status}`);
+      error.status = response.status;
+      if (response.status === 409) {
+        error.serverVersion = await response.json();
+      }
+      throw error;
+    }
+  }
+
+  private async handleConflict(
+    record: SyncRecord,
+    serverVersion: any
+  ): Promise<void> {
+    const localData = record.data;
+    const merged = this.mergeChanges(localData, serverVersion);
+
+    if (merged.conflict) {
+      await db[record.table].update(record.recordId, {
+        _syncStatus: 'conflict',
+      });
+      this.notifyListeners({
+        status: 'conflict',
+        table: record.table,
+        recordId: record.recordId,
+      });
+    } else {
+      await db[record.table].update(record.recordId, merged.resolved);
+      await db.syncQueue.delete(record.id!);
+      // Re-queue with merged data
+      await this.addToQueue(record.table, record.recordId, 'update', merged.resolved);
+    }
+  }
+
+  private mergeChanges(local: any, server: any): MergedResult {
+    // Field-level merge: take the newer value for each field
+    const merged = { ...server };
+    let hasConflict = false;
+
+    for (const key of Object.keys(local)) {
+      if (key.startsWith('_')) continue;
+      if (local.updatedAt > server.updatedAt) {
+        merged[key] = local[key];
+      } else if (local[key] !== server[key]) {
+        hasConflict = true;
+      }
+    }
+
+    merged._version = server._version + 1;
+    return { resolved: merged, conflict: hasConflict };
+  }
+
+  async addToQueue(
+    table: string,
+    recordId: string,
+    operation: 'create' | 'update' | 'delete',
+    data: any
+  ): Promise<void> {
+    await db.syncQueue.add({
+      table,
+      recordId,
+      operation,
+      data,
+      timestamp: new Date(),
+      retryCount: 0,
+    });
+  }
+
+  onStatusChange(listener: (status: SyncStatus) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notifyListeners(status: SyncStatus): void {
+    this.listeners.forEach(l => l(status));
+  }
+}
+
+export const syncEngine = new SyncEngine();
+```
+
+### Service Worker for Asset Caching
+
+Register a Service Worker to cache application assets and API responses:
+
+```typescript
+// service-worker.ts
+const CACHE_NAME = 'app-v1';
+const STATIC_ASSETS = [
+  '/',
+  '/index.html',
+  '/static/js/main.js',
+  '/static/css/main.css',
+  '/manifest.json',
+];
+
+self.addEventListener('install', (event: ExtendableEvent) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS))
+  );
+});
+
+self.addEventListener('activate', (event: ExtendableEvent) => {
+  event.waitUntil(
+    caches.keys().then(names =>
+      Promise.all(
+        names
+          .filter(name => name !== CACHE_NAME)
+          .map(name => caches.delete(name))
+      )
+    )
+  );
+});
+
+self.addEventListener('fetch', (event: FetchEvent) => {
+  const { request } = event;
+  const url = new URL(request.url);
+
+  // API requests: network-first with cache fallback
+  if (url.pathname.startsWith('/api/')) {
+    event.respondWith(
+      fetch(request)
+        .then(response => {
+          const cloned = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(request, cloned));
+          return response;
+        })
+        .catch(() => caches.match(request) as Promise<Response>)
+    );
+    return;
+  }
+
+  // Static assets: cache-first
+  event.respondWith(
+    caches.match(request).then(cached => cached || fetch(request))
+  );
+});
+```
+
+![Service Worker caching architecture](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+### React Integration with Hooks
+
+Create React hooks that abstract the offline-first data layer:
+
+```typescript
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db, type Task } from './database';
+import { syncEngine } from './sync-engine';
+import { v4 as uuid } from 'uuid';
+
+export function useTasks(status?: Task['status']) {
+  return useLiveQuery(
+    () => status
+      ? db.tasks.where('status').equals(status).toArray()
+      : db.tasks.orderBy('updatedAt').reverse().toArray(),
+    [status]
+  ) ?? [];
+}
+
+export function useTaskMutations() {
+  const createTask = async (data: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | '_syncStatus' | '_version'>) => {
+    const id = uuid();
+    const task: Task = {
+      ...data,
+      id,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      _syncStatus: 'pending',
+      _version: 1,
+    };
+
+    await db.tasks.add(task);
+    await syncEngine.addToQueue('tasks', id, 'create', task);
+    syncEngine.sync(); // Trigger background sync
+    return id;
+  };
+
+  const updateTask = async (id: string, changes: Partial<Task>) => {
+    const task = await db.tasks.get(id);
+    if (!task) return;
+
+    const updated = {
+      ...task,
+      ...changes,
+      updatedAt: new Date(),
+      _syncStatus: 'pending' as const,
+      _version: task._version + 1,
+    };
+
+    await db.tasks.put(updated);
+    await syncEngine.addToQueue('tasks', id, 'update', updated);
+    syncEngine.sync();
+  };
+
+  const deleteTask = async (id: string) => {
+    await db.tasks.delete(id);
+    await syncEngine.addToQueue('tasks', id, 'delete', { id });
+    syncEngine.sync();
+  };
+
+  return { createTask, updateTask, deleteTask };
+}
+
+export function useSyncStatus() {
+  const [status, setStatus] = useState<SyncStatus>({ status: 'idle' });
+
+  useEffect(() => {
+    const unsubscribe = syncEngine.onStatusChange(setStatus);
+    // Initial sync when coming online
+    const handleOnline = () => syncEngine.sync();
+    window.addEventListener('online', handleOnline);
+    return () => {
+      unsubscribe();
+      window.removeEventListener('online', handleOnline);
+    };
+  }, []);
+
+  return status;
 }
 ```
 
-This pattern demonstrates the core approach to implementing Offline-First solutions in production environments.
+## Real-World Use Cases
 
-## Best Practices
+### Note-Taking Applications
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+Note-taking apps like Notion, Obsidian, and Bear are natural offline-first candidates. Users create and edit notes throughout the day, often in locations with poor connectivity (coffee shops, airplanes, rural areas). The offline-first architecture ensures notes are always available and editable, with changes syncing seamlessly when connectivity returns. Conflict resolution is typically straightforward because notes are rarely edited simultaneously by multiple users.
 
-## Common Pitfalls
+### Field Service and Inspection Tools
+
+Workers in construction, utilities, and healthcare use mobile applications to collect data in the field, often in areas with no cellular connectivity. These applications must capture form data, photos, signatures, and GPS coordinates offline and sync everything when the worker returns to an area with connectivity. The outbox pattern is critical here — losing a completed inspection form because of a network error is unacceptable.
+
+### Collaborative Task Management
+
+Project management tools like Trello, Asana, and Linear need offline support for users who check and update tasks during commutes or in meetings. The challenge is higher here because multiple users may modify the same task. CRDT-based conflict resolution (as used by Linear and Notion) provides the best experience by automatically merging non-conflicting changes and presenting conflicting changes for manual resolution.
+
+### E-Commerce and Point of Sale
+
+Retail applications that process transactions offline and sync when connectivity returns. This is essential for pop-up shops, farmers markets, food trucks, and retail stores in buildings with poor cellular reception. The application must maintain inventory counts, process payments (or queue them), and generate receipts without a network connection.
+
+## Best Practices for Production
+
+1. **Design the data model for offline first**: Every record should have a `_syncStatus` field (synced, pending, conflict), a `_version` field for optimistic concurrency control, and an `updatedAt` timestamp for conflict detection. These fields are essential infrastructure, not optional metadata.
+
+2. **Use the outbox pattern, not direct sync**: Never attempt to sync changes directly from the mutation function. Always write to the local database and queue a sync record. This decouples the UI from network reliability and ensures no changes are lost if the sync fails or the app is closed.
+
+3. **Implement exponential backoff for retries**: When sync fails, do not retry immediately. Use exponential backoff with jitter (1s, 2s, 4s, 8s, 16s with random jitter) to avoid thundering herd problems when many clients reconnect simultaneously after a network outage.
+
+4. **Show sync status in the UI**: Users need to know whether their changes have been synced. Display a subtle indicator (cloud icon, sync count badge) showing pending changes, active sync, conflicts, and last sync time. This builds trust and reduces "did my changes save?" anxiety.
+
+5. **Handle the "first online" scenario**: When a user first opens the app, they may have no cached data. Provide a meaningful loading state and download essential data for offline use. Do not show an empty screen with "no data" — instead, sync the most important data in the background while showing a skeleton UI.
+
+6. **Test with network throttling**: Use Chrome DevTools to simulate offline, slow 3G, and other network conditions during development and testing. Many offline bugs only manifest under specific timing conditions that do not occur on a fast connection.
+
+7. **Implement storage quota management**: Browsers limit how much data an application can store in IndexedDB (typically 50MB-10% of disk space). Monitor storage usage, implement data expiration policies, and prompt users when storage is running low. Use the Storage Manager API to check available quota.
+
+8. **Version your Service Worker and caches**: When you deploy a new version, the Service Worker and cache names must change. Implement a cache migration strategy that removes old caches and populates new ones. Use the Service Worker's `activate` event to clean up old caches.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Not handling Service Worker updates | Users stuck on old version, missing bug fixes | Implement update-on-reload during development; show "Update available" prompt in production |
+| IndexedDB version migration failures | App crashes on schema change after deployment | Use Dexie's version migration system; always add new versions, never modify existing ones |
+| Infinite sync loops | Server and client keep overwriting each other | Use version numbers for optimistic concurrency; reject stale updates with 409 Conflict |
+| Not clearing stale cache data | Storage fills up, old data served to users | Implement cache expiration policies; use LRU eviction for API response caches |
+| Race condition between sync and user edit | User's in-progress edit overwritten by sync | Lock records during sync; merge changes at field level rather than record level |
+| Missing network state detection | App does not sync when coming back online | Listen to `online`/`offline` events; also poll periodically as these events can be unreliable |
+
+## Performance Optimization
+
+### Incremental Sync
+
+Instead of syncing all data on every sync cycle, implement incremental sync that only transfers changes since the last successful sync. Use a `lastSyncedAt` timestamp or a sync token (like a vector clock or change sequence number) to request only deltas:
+
+```typescript
+async function incrementalSync(table: string): Promise<void> {
+  const lastSync = await getLastSyncToken(table);
+  const response = await fetch(`/api/${table}/changes?since=${lastSync}`);
+  const changes = await response.json();
+
+  await db.transaction('rw', db[table], async () => {
+    for (const change of changes) {
+      const local = await db[table].get(change.id);
+      if (!local || local._syncStatus === 'synced') {
+        await db[table].put({ ...change, _syncStatus: 'synced' });
+      } else if (local._syncStatus === 'pending') {
+        // Conflict: local has pending changes
+        await resolveConflict(local, change);
+      }
+    }
+  });
+
+  await setLastSyncToken(table, changes.syncToken);
+}
+```
+
+### Background Sync API
+
+Use the Background Sync API to trigger sync even when the user closes the browser tab:
+
+```typescript
+// In the Service Worker
+self.addEventListener('sync', (event: SyncEvent) => {
+  if (event.tag === 'sync-tasks') {
+    event.waitUntil(syncAllPendingChanges());
+  }
+});
+
+// In the main thread
+async function registerBackgroundSync() {
+  const registration = await navigator.serviceWorker.ready;
+  await registration.sync.register('sync-tasks');
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Offline-First + IndexedDB | Traditional (Server-Only) | Firebase/Supabase Realtime | CRDTs (Y.js, Automerge) |
+|---------|--------------------------|--------------------------|---------------------------|------------------------|
+| Offline read | Full | None | Limited cache | Full |
+| Offline write | Full with sync queue | None | Limited | Full with auto-merge |
+| Conflict resolution | Manual or field-level merge | N/A (server wins) | Last-write-wins | Automatic merge |
+| Complexity | High | Low | Moderate | Very high |
+| Data sovereignty | Full control | Full control | Vendor-managed | Full control |
+| Real-time collaboration | Requires additional work | Requires WebSocket | Built-in | Built-in |
+| Best for | Mobile-first, field apps | Simple web apps | Rapid prototyping | Collaborative editing |
+
+## Advanced Patterns
+
+### CRDT-Based Conflict Resolution
+
+For applications requiring automatic conflict resolution, integrate a CRDT library like Y.js:
+
+```typescript
+import * as Y from 'yjs';
+import { IndexeddbPersistence } from 'y-indexeddb';
+import { WebsocketProvider } from 'y-websocket';
+
+const doc = new Y.Doc();
+
+// Persist to IndexedDB for offline access
+const indexeddbProvider = new IndexeddbPersistence('my-doc', doc);
+
+// Sync via WebSocket when online
+const wsProvider = new WebsocketProvider(
+  'wss://my-server.com',
+  'my-doc',
+  doc
+);
+
+// Shared data structure
+const tasks = doc.getArray('tasks');
+
+// Observe changes from any source (local, remote, or IndexedDB)
+tasks.observe(event => {
+  // Update React state
+  setTasks(tasks.toArray());
+});
+```
+
+## Testing Strategies
+
+### Offline Transition Testing
+
+Test the full offline-online cycle:
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('create task offline and sync when online', async ({ page, context }) => {
+  await page.goto('/');
+  await page.waitForSelector('.task-list');
+
+  // Go offline
+  await context.setOffline(true);
+
+  // Create a task while offline
+  await page.fill('#task-input', 'Offline task');
+  await page.click('#add-task');
+  await expect(page.locator('.task')).toContainText('Offline task');
+  await expect(page.locator('.sync-status')).toContainText('1 pending');
+
+  // Go back online
+  await context.setOffline(false);
+
+  // Wait for sync
+  await expect(page.locator('.sync-status')).toContainText('Synced', {
+    timeout: 10000,
+  });
+});
+```
+
+## Future Outlook
+
+The offline-first ecosystem is maturing rapidly. The Storage Foundation API promises faster, more capable client-side storage than IndexedDB. The Background Fetch API enables downloading large files in the background. WebTransport provides a modern alternative to WebSockets for real-time sync.
+
+The rise of local-first software (championed by Ink & Switch) takes offline-first further by making the local database the primary source of truth, with sync as a peer-to-peer operation rather than client-server. Tools like Automerge and Y.js make this approach increasingly practical.
 
 ## Conclusion
 
-Building Offline-First Applications is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Building offline-first applications requires more upfront architecture but delivers a fundamentally better user experience. The key takeaways are:
+
+1. **Use IndexedDB (via Dexie.js) as your primary data store** — all reads and writes go to the local database first
+2. **Implement the outbox pattern** for reliable synchronization — queue changes locally, process them in order when online
+3. **Use Service Workers** to cache static assets and API responses — the application shell should always load instantly
+4. **Design for conflict resolution from the start** — add `_syncStatus`, `_version`, and `updatedAt` fields to every record
+5. **Show sync status in the UI** — users need to know their data is safe and synchronized
+6. **Test with network throttling** — offline bugs only appear under realistic network conditions
+
+Start with asset caching and read-only offline support (the first two levels), then add write capability and sync as your application matures. The offline-first architecture pays dividends in user trust, reliability, and perceived performance.
