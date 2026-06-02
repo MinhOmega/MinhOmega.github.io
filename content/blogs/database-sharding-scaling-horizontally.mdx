@@ -399,6 +399,79 @@ async function batchGetUsers(userIds: string[]): Promise<any[]> {
 | Consistency model | Your choice | Strong | Strong | Tunable |
 | Operational overhead | High | Medium | Low | Low |
 
+## Resharding Strategies
+
+Resharding—moving data from existing shards to new ones—is the most dangerous operation in a sharded system. Plan for it from day one.
+
+### Consistent Hashing with Virtual Nodes
+
+Simple modulo hashing (`hash(key) % num_shards`) means adding or removing a shard redistributes nearly all data. Consistent hashing minimizes data movement: when you add a shard, only keys from its neighboring shard need to move.
+
+```typescript
+class ConsistentHashRouter {
+  private ring: { hash: number; shardId: number }[] = [];
+  private virtualNodes: number;
+
+  constructor(shardConfigs: ShardConfig[], virtualNodes: number = 150) {
+    this.virtualNodes = virtualNodes;
+
+    for (const shard of shardConfigs) {
+      for (let i = 0; i < virtualNodes; i++) {
+        const hash = this.hash(`${shard.id}-${i}`);
+        this.ring.push({ hash, shardId: shard.id });
+      }
+    }
+
+    this.ring.sort((a, b) => a.hash - b.hash);
+  }
+
+  getShardId(key: string): number {
+    const hash = this.hash(key);
+    // Find the first shard with hash >= key hash (clockwise)
+    for (const node of this.ring) {
+      if (node.hash >= hash) return node.shardId;
+    }
+    return this.ring[0].shardId; // Wrap around
+  }
+
+  private hash(key: string): number {
+    const buffer = createHash('md5').update(key).digest();
+    return buffer.readUInt32BE(0);
+  }
+}
+```
+
+With consistent hashing and 150 virtual nodes per shard, adding a 5th shard to a 4-shard cluster moves only ~20% of keys (instead of ~80% with modulo hashing).
+
+### Dual-Write Migration
+
+During resharding, run old and new routing in parallel to verify correctness before cutting over:
+
+```typescript
+async function migrateWithDualWrite(key: string, sql: string, params: any[]) {
+  // Write to both old and new shard
+  const oldShardId = oldRouter.getShardId(key);
+  const newShardId = newRouter.getShardId(key);
+
+  const [oldResult, newResult] = await Promise.all([
+    oldRouter.query(key, sql, params),
+    newRouter.query(key, sql, params),
+  ]);
+
+  // Verify consistency
+  if (JSON.stringify(oldResult) !== JSON.stringify(newResult)) {
+    logger.error('Shard migration mismatch', { key, oldShardId, newShardId });
+    await alertOps({ type: 'migration_inconsistency', key });
+  }
+
+  return oldResult; // Still read from old during migration
+}
+```
+
+### Backfill and Cutover
+
+For large datasets, the migration follows a three-phase approach: backfill historical data to new shards (while dual-writing new data), verify consistency with checksums, then cut over reads to the new routing. The backfill runs as a background job that processes keys in batches, respecting rate limits to avoid overwhelming the database.
+
 ## Testing Strategies
 
 ```typescript
@@ -439,6 +512,114 @@ describe('Shard Router', () => {
 ## Future Outlook
 
 PostgreSQL 17+ continues improving declarative partitioning with better partition pruning and automatic partition creation. Cloud-native databases like PlanetScale (Vitess-based), CockroachDB, and YugabyteDB are making sharding transparent to applications. The trend is clear: the future belongs to databases that shard automatically.
+
+
+## Database Performance Tuning
+
+Database performance tuning is an iterative process that requires understanding your query patterns, data distribution, and access frequencies. Small improvements in query performance can have outsized impacts on application responsiveness, especially for frequently executed queries.
+
+### Query Plan Analysis
+
+Always analyze query execution plans before optimizing. In PostgreSQL, use `EXPLAIN ANALYZE` to see both the planned and actual execution statistics:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT u.name, COUNT(o.id) as order_count
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE u.created_at > '2024-01-01'
+GROUP BY u.id, u.name
+ORDER BY order_count DESC
+LIMIT 20;
+```
+
+Look for sequential scans on large tables (indicating missing indexes), high cost estimates for nested loops (suggesting join strategy issues), and excessive buffer reads (indicating insufficient memory allocation or poor data locality).
+
+### Index Optimization Strategy
+
+Creating the right indexes requires understanding your query patterns. Use `pg_stat_user_tables` and `pg_stat_user_indexes` to identify tables with high sequential scan ratios and unused indexes:
+
+```sql
+-- Find tables with high sequential scan ratio
+SELECT schemaname, relname, seq_scan, idx_scan,
+       CASE WHEN seq_scan + idx_scan > 0
+            THEN round(100.0 * idx_scan / (seq_scan + idx_scan), 1)
+            ELSE 0 END as idx_usage_pct
+FROM pg_stat_user_tables
+WHERE seq_scan + idx_scan > 100
+ORDER BY idx_usage_pct ASC;
+
+-- Find unused indexes consuming disk space
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes
+WHERE idx_scan < 10 AND indexrelname NOT LIKE '%pkey%'
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+### Connection Pooling Best Practices
+
+Proper connection pooling prevents connection exhaustion under load. Configure your pool size based on your CPU core count and query characteristics:
+
+```
+Optimal pool size = (CPU cores * 2) + effective_spindle_count
+```
+
+For modern SSD-based systems, this typically means a pool size of `2 * CPU_cores + 1`. Setting the pool too large wastes memory and increases context switching overhead, while setting it too small causes query queuing under load.
+
+## Community Resources and Further Learning
+
+The technology landscape evolves rapidly, making continuous learning essential for maintaining expertise. Building a systematic approach to staying current with developments in your technology stack ensures you can leverage new features and avoid deprecated patterns.
+
+### Curated Learning Pathways
+
+Rather than consuming content randomly, create structured learning pathways aligned with your current projects and career goals. Start with official documentation and specification documents, which provide the most accurate and comprehensive information. Follow this with hands-on tutorials and workshops that reinforce concepts through practical application.
+
+Technical blogs from framework maintainers and core team members often provide deeper insights into design decisions and upcoming features. Subscribe to the official blogs of your primary frameworks and libraries to stay ahead of breaking changes and deprecation timelines.
+
+### Contributing to Open Source
+
+Contributing to open-source projects in your technology stack provides unparalleled learning opportunities. Start with documentation improvements and bug reports, then progress to fixing small issues tagged as "good first issue" in your favorite projects. This direct engagement with maintainers and the codebase accelerates your understanding far beyond what passive learning can achieve.
+
+```bash
+# Setting up for contribution
+git clone https://github.com/project/repository.git
+cd repository
+git checkout -b fix/issue-description
+
+# Run the project's contribution setup
+npm run setup:dev
+npm run test  # Ensure tests pass before making changes
+
+# Make your changes, then run the full test suite
+npm run test:full
+npm run lint
+npm run build
+
+# Submit your contribution
+git add -A
+git commit -m "fix: description of the fix
+
+Closes #1234"
+git push origin fix/issue-description
+```
+
+### Building a Technical Knowledge Base
+
+Maintain a personal knowledge base that captures insights, solutions, and patterns you discover during your work. Tools like Obsidian, Notion, or even a simple Markdown repository can serve as an external memory that grows more valuable over time.
+
+Organize your notes by topic rather than chronologically, and include code examples, links to relevant documentation, and explanations of why certain approaches work better than others. When you encounter a particularly insightful article or conference talk, write a summary that captures the key takeaways and how they apply to your current projects.
+
+### Staying Current with Industry Trends
+
+Follow key conferences and their published talks to stay informed about emerging patterns and best practices. Many conferences publish recorded talks on YouTube within weeks of the event, making world-class technical content freely accessible.
+
+Join relevant Discord servers, Slack communities, and forums where practitioners discuss real-world challenges and solutions. These communities provide early warning about emerging issues and access to collective wisdom that isn't available through formal documentation.
+
+### Mentorship and Knowledge Sharing
+
+Teaching others is one of the most effective ways to deepen your own understanding. Consider writing technical blog posts, giving talks at local meetups, or mentoring junior developers. The process of explaining concepts to others forces you to organize your knowledge and identify gaps in your understanding.
+
+Pair programming sessions with colleagues of different experience levels create mutual learning opportunities. Senior developers gain fresh perspectives on problems they've solved the same way for years, while junior developers benefit from exposure to production-grade thinking and decision-making processes.
 
 ## Conclusion
 
