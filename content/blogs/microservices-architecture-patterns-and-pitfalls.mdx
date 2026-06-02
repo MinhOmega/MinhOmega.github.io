@@ -514,7 +514,7 @@ Start with a modular monolith for small teams. Extract microservices when you ne
 
 ### CQRS (Command Query Responsibility Segregation)
 
-Separate read and write models for complex domains:
+Separate read and write models for complex domains. The write side handles business logic and persists domain events, while the read side maintains denormalized projections optimized for queries. This pattern is particularly useful when read and write workloads have fundamentally different characteristics—such as an e-commerce system where product catalogs are read-heavy but orders are write-heavy.
 
 ```typescript
 // Command side: Write to event store
@@ -549,6 +549,140 @@ class OrderProjection {
             createdAt: event.timestamp,
         });
     }
+}
+```
+
+### Event Sourcing
+
+Event sourcing stores state changes as an immutable sequence of events rather than the current state. This provides a complete audit trail, enables temporal queries ("what was the state at time T?"), and supports event replay for rebuilding state or populating new read models.
+
+```python
+# Python event sourcing implementation
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Dict, Any
+import json
+
+@dataclass
+class Event:
+    aggregate_id: str
+    event_type: str
+    data: Dict[str, Any]
+    timestamp: datetime
+    version: int
+
+class EventStore:
+    def __init__(self, db_connection):
+        self.db = db_connection
+    
+    def append(self, aggregate_id: str, events: List[Event], expected_version: int):
+        """Append events with optimistic concurrency check."""
+        current_version = self._get_version(aggregate_id)
+        if current_version != expected_version:
+            raise ConcurrencyError(
+                f"Expected version {expected_version}, got {current_version}"
+            )
+        
+        for event in events:
+            self.db.execute(
+                "INSERT INTO events (aggregate_id, event_type, data, timestamp, version) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (event.aggregate_id, event.event_type, json.dumps(event.data),
+                 event.timestamp, event.version)
+            )
+    
+    def get_events(self, aggregate_id: str) -> List[Event]:
+        """Retrieve all events for an aggregate."""
+        rows = self.db.query(
+            "SELECT * FROM events WHERE aggregate_id = %s ORDER BY version",
+            (aggregate_id,)
+        )
+        return [Event(**row) for row in rows]
+
+class OrderAggregate:
+    def __init__(self, order_id: str):
+        self.id = order_id
+        self.status = "draft"
+        self.items = []
+        self.total = 0
+        self._version = 0
+        self._pending_events = []
+    
+    def add_item(self, sku: str, quantity: int, price: float):
+        event = Event(
+            aggregate_id=self.id,
+            event_type="ItemAdded",
+            data={"sku": sku, "quantity": quantity, "price": price},
+            timestamp=datetime.utcnow(),
+            version=self._version + 1
+        )
+        self._apply(event)
+        self._pending_events.append(event)
+    
+    def _apply(self, event: Event):
+        if event.event_type == "ItemAdded":
+            self.items.append(event.data)
+            self.total += event.data["price"] * event.data["quantity"]
+        self._version = event.version
+```
+
+### Distributed Tracing with OpenTelemetry
+
+Implementing distributed tracing is essential for debugging issues across microservices. OpenTelemetry provides vendor-neutral instrumentation that exports traces to backends like Jaeger, Zipkin, or Datadog.
+
+```go
+// Go: OpenTelemetry instrumentation
+package main
+
+import (
+    "context"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+    "go.opentelemetry.io/otel/trace"
+)
+
+func initTracer(serviceName string) (*sdktrace.TracerProvider, error) {
+    exporter, err := otlptracegrpc.New(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceName(serviceName),
+        )),
+    )
+    otel.SetTracerProvider(tp)
+    return tp, nil
+}
+
+func processOrder(ctx context.Context, orderID string) error {
+    tracer := otel.Tracer("order-service")
+    ctx, span := tracer.Start(ctx, "processOrder",
+        trace.WithAttributes(
+            semconv.OrderID(orderID),
+        ),
+    )
+    defer span.End()
+    
+    // Call inventory service - trace context propagates automatically
+    if err := reserveInventory(ctx, orderID); err != nil {
+        span.RecordError(err)
+        return err
+    }
+    
+    // Call payment service
+    if err := processPayment(ctx, orderID); err != nil {
+        span.RecordError(err)
+        return err
+    }
+    
+    return nil
 }
 ```
 
@@ -633,6 +767,8 @@ describe('Order Service Integration', () => {
 });
 ```
 
+![Microservices patterns](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
 ## Future Outlook
 
 Microservices are evolving toward serverless microservices with platforms like AWS Lambda and Knative, reducing operational overhead. Service mesh technologies like Istio and Linkerd provide transparent networking, security, and observability. WebAssembly (WASM) is emerging as a lightweight alternative to containers for microservice deployment. Event-driven architectures are becoming the default, with event brokers like Apache Pulsar and cloud-native event buses simplifying inter-service communication.
@@ -644,7 +780,3 @@ Microservices architecture enables independent scaling, deployment, and team aut
 Key takeaways: start with a modular monolith and extract services when needed. Use events for inter-service communication, implement circuit breakers for resilience, and invest in observability from day one. Define clear service boundaries, version your APIs, and automate deployments. The complexity of microservices is only justified when the organizational benefits outweigh the technical costs.
 
 For further reading, consult Sam Newman's "Building Microservices," Chris Richardson's "Microservices Patterns," and the Microsoft Cloud Architecture Center for production-ready patterns.
-
----
-
-![Microservices patterns](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
