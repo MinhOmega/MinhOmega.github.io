@@ -9,54 +9,447 @@ author: "MinhVo"
 
 ## Introduction
 
-PostgreSQL Full-Text Search: Beyond LIKE Queries is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Every application that handles user-generated content eventually needs search. Users type a few words into a search box and expect relevant results ranked by relevance, with support for word variations, phrase matching, and boolean operators. The instinctive approach—using `LIKE '%term%'` in SQL—falls apart almost immediately. LIKE queries cannot use B-tree indexes (they always perform full table scans), they do not understand linguistic concepts like stemming (matching "running" to "run"), they cannot rank results by relevance, and they become impossibly slow as the dataset grows beyond a few thousand rows.
 
-## Key Concepts
+PostgreSQL's full-text search (TS) provides a built-in, production-ready solution that addresses all of these limitations. It converts text into searchable vectors (`tsvector`), supports sophisticated query expressions (`tsquery`), ranks results by relevance using multiple algorithms, and leverages GIN and GiST indexes for sub-second search across millions of rows. For many applications, PostgreSQL full-text search eliminates the need for a dedicated search engine like Elasticsearch, simplifying the architecture and reducing operational complexity.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers the complete implementation of full-text search in PostgreSQL, from understanding the fundamental data types and operators to building production-grade search features with ranking, highlighting, multilingual support, and performance optimization.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Search Engine Architecture](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Full-Text Search: Core Concepts
 
-Let's look at a practical example:
+### The Two Core Data Types
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
-}
+PostgreSQL full-text search revolves around two specialized data types that work together:
+
+**`tsvector`** represents a document as a sorted list of distinct lexemes (normalized words). When you convert text to a tsvector, PostgreSQL performs several normalization steps: it converts text to lowercase, removes stop words (common words like "the", "a", "is" that don't contribute to search relevance), and applies stemming rules to reduce words to their root form. For example, the sentence "The quick brown fox is running through the forest" becomes the tsvector `'brown':2 'forest':9 'fox':4 'quick':1 'run':6`. Notice that "running" was stemmed to "run", "the" was removed as a stop word, and each lexeme is tagged with its position in the original text.
+
+**`tsquery`** represents a search query as a boolean expression of lexemes with operators. You can combine terms with `&` (AND), `|` (OR), and `!` (NOT), and use `<->` (followed by) for phrase matching. For example, `'quick & fox'` matches documents containing both "quick" and "fox", while `'quick <-> fox'` matches documents where "quick" is immediately followed by "fox".
+
+### Text Search Configurations
+
+A text search configuration defines how text is parsed and normalized. It specifies which parser to use (which identifies words, numbers, URLs, etc.), which dictionary to apply (which handles stemming and stop words for a specific language), and what normalization rules to follow.
+
+PostgreSQL ships with built-in configurations for many languages: `english`, `spanish`, `german`, `french`, `russian`, `arabic`, `chinese`, `japanese`, and more. Each configuration uses language-specific stemming rules and stop word lists. The `english` configuration, for example, uses the Snowball stemmer and removes common English stop words.
+
+```sql
+-- Check available text search configurations
+SELECT cfgname FROM pg_ts_config;
+
+-- See how a specific configuration processes text
+SELECT * FROM ts_debug('english', 'The PostgreSQL database handles full-text search efficiently');
+-- Returns: alias, description, token, dictionaries, dictionary, lexemes
 ```
 
-This pattern demonstrates the core approach to implementing PostgreSQL solutions in production environments.
+### Ranking Functions
 
-## Best Practices
+PostgreSQL provides two built-in ranking functions that measure how relevant a document is to a query:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+**`ts_rank()`** computes relevance based on the frequency of matching terms in the document and the query. Documents with more occurrences of query terms receive higher scores. It also considers term weights based on document structure—words that appear in titles or headers (if you define weighted fields) score higher than words in body text.
 
-## Common Pitfalls
+**`ts_rank_cd()`** computes cover density ranking, which measures how closely matching terms appear together in the document. If you search for "database performance", a document where these words appear in the same sentence scores higher than one where they appear in different paragraphs.
+
+Both functions accept normalization arguments that control how document length affects ranking. A long document naturally contains more word occurrences, so without normalization, longer documents would always rank higher. The normalization options include `1` (divide by document length), `2` (divide by number of unique words), `4` (divide by logarithm of document length), and combinations thereof.
+
+![Full-Text Search Pipeline](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### The Search Pipeline Architecture
+
+A typical PostgreSQL full-text search implementation follows a pipeline:
+
+1. **Indexing phase** (at write time): When text is inserted or updated, it is converted to a `tsvector` and stored alongside the original text. This conversion applies stemming, stop word removal, and normalization.
+
+2. **Query phase** (at read time): When a user searches, the search terms are converted to a `tsquery`. The tsquery is matched against stored tsvector values using the `@@` match operator.
+
+3. **Ranking phase**: Matching results are scored using `ts_rank()` or `ts_rank_cd()` and returned in order of relevance.
+
+4. **Highlighting phase**: Matching terms in the original text are wrapped with HTML tags for display using `ts_headline()`.
+
+### Denormalized vs. Normalized Storage
+
+You have two choices for storing tsvector data:
+
+**Denormalized**: Add a `tsvector` column to the table and populate it with a trigger or generated column. This is the most common approach for simple schemas:
+
+```sql
+ALTER TABLE articles ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body, '')), 'B')
+  ) STORED;
+```
+
+**Normalized**: Create a separate search table with foreign key references. This approach is better when you have multiple text fields across related tables that should be searchable together:
+
+```sql
+CREATE TABLE article_search (
+  article_id INT PRIMARY KEY REFERENCES articles(id),
+  search_vector tsvector,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+The generated column approach (denormalized) is simpler and automatically stays in sync with the data. The separate table approach gives you more control over indexing and maintenance operations.
+
+### Multi-Field Weighted Search
+
+Real applications search across multiple fields with different importance. A blog post's title is more important than its body, and tags are more important than footnotes. PostgreSQL supports this through weighted tsvector concatenation:
+
+```sql
+-- A = 1.0 weight, B = 0.4, C = 0.2, D = 0.1
+search_vector =
+  setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+  setweight(to_tsvector('english', coalesce(body, '')), 'B') ||
+  setweight(to_tsvector('english', coalesce(tags::text, '')), 'C')
+```
+
+When you rank results, `ts_rank()` automatically factors in these weights, so matches in the title (weight A) contribute more to the score than matches in the body (weight B).
+
+## Step-by-Step Implementation
+
+### Setting Up Full-Text Search
+
+Start by creating a table with a tsvector column and populating it:
+
+```sql
+CREATE TABLE articles (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  author TEXT NOT NULL,
+  tags TEXT[] DEFAULT '{}',
+  published_at TIMESTAMPTZ DEFAULT now(),
+  search_vector tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body, '')), 'B') ||
+    setweight(to_tsvector('english', array_to_string(tags, ' ')), 'C')
+  ) STORED
+);
+
+-- Create a GIN index for fast full-text search
+CREATE INDEX idx_articles_search ON articles USING GIN (search_vector);
+```
+
+### Basic Search Queries
+
+Perform full-text searches using the `@@` match operator:
+
+```sql
+-- Simple keyword search
+SELECT id, title, ts_rank(search_vector, query) AS rank
+FROM articles, to_tsquery('english', 'postgresql & performance') AS query
+WHERE search_vector @@ query
+ORDER BY rank DESC;
+
+-- Phrase search: words must appear adjacent
+SELECT id, title
+FROM articles, to_tsquery('english', 'full <-> text <-> search') AS query
+WHERE search_vector @@ query;
+
+-- Prefix search: match words starting with a prefix
+SELECT id, title
+FROM articles, to_tsquery('english', 'data:*') AS query
+WHERE search_vector @@ query;
+-- Matches: database, dataset, dataframe, etc.
+
+-- Boolean combinations
+SELECT id, title
+FROM articles, to_tsquery('english', '(postgresql | mysql) & !nosql') AS query
+WHERE search_vector @@ query;
+```
+
+### User-Friendly Search with plainto_tsquery and websearch_to_tsquery
+
+`plainto_tsquery()` converts plain text into a tsquery with implicit AND operators:
+
+```sql
+-- "database performance tuning" becomes 'databas' & 'perform' & 'tune'
+SELECT plainto_tsquery('english', 'database performance tuning');
+```
+
+`websearch_to_tsquery()` (PostgreSQL 11+) converts web-style search syntax:
+
+```sql
+-- Supports: "exact phrase", OR, -exclude, plain AND
+SELECT websearch_to_tsquery('english', '"full text" search -elasticsearch');
+-- Result: 'full' <-> 'text' & 'search' & !'elasticsearch'
+```
+
+### Ranking and Highlighting Results
+
+```sql
+-- Search with ranking and highlighting
+SELECT
+  id,
+  title,
+  ts_rank(search_vector, query) AS relevance,
+  ts_headline(
+    'english',
+    body,
+    query,
+    'StartSel=<mark>, StopSel=</mark>, MaxWords=50, MinWords=20, MaxFragments=3'
+  ) AS snippet
+FROM articles, websearch_to_tsquery('english', 'postgresql indexing strategies') AS query
+WHERE search_vector @@ query
+ORDER BY relevance DESC
+LIMIT 10;
+```
+
+The `ts_headline()` function wraps matching terms in configurable tags and returns a snippet with context around the matches. The `MaxFragments` option controls how many separate matching sections are included in the snippet.
+
+### Dynamic Search with Weighted Relevance
+
+Implement a search function that accepts user input and returns ranked results:
+
+```sql
+CREATE OR REPLACE FUNCTION search_articles(
+  search_text TEXT,
+  result_limit INT DEFAULT 20,
+  result_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+  id INT,
+  title TEXT,
+  author TEXT,
+  relevance REAL,
+  snippet TEXT
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    a.id,
+    a.title,
+    a.author,
+    ts_rank_cd(a.search_vector, q, 32)::REAL AS relevance,
+    ts_headline('english', a.body, q,
+      'MaxWords=35, MinWords=15, MaxFragments=2, StartSel=<b>, StopSel=</b>'
+    ) AS snippet
+  FROM articles a, websearch_to_tsquery('english', search_text) AS q
+  WHERE a.search_vector @@ q
+    AND a.published_at <= now()
+  ORDER BY relevance DESC
+  OFFSET result_offset
+  LIMIT result_limit;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Usage
+SELECT * FROM search_articles('postgres performance tuning tips');
+```
+
+![Search Results with Relevance](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Real-World Use Cases and Case Studies
+
+### Use Case 1: Blog Search Engine
+
+A blog platform with 100,000 articles uses PostgreSQL full-text search instead of Elasticsearch. The search vector combines the title (weight A), body (weight B), and tags (weight C). Users can search with natural language queries, and results are displayed with highlighted snippets. The GIN index on the search vector column handles queries in under 50ms even with 100K articles. This eliminates the need to sync data to Elasticsearch, reducing operational complexity and the risk of index staleness.
+
+### Use Case 2: Product Catalog Search
+
+An e-commerce site stores product names, descriptions, categories, and specifications in a products table. The search implementation uses prefix matching to handle partial queries (typing "lap" finds "laptop") and synonym dictionaries to match equivalent terms. A custom thesaurus dictionary maps "mobile" to "phone|smartphone|cellphone", ensuring users find relevant products regardless of which term they use.
+
+### Use Case 3: Documentation Search
+
+A developer documentation site indexes API references, guides, and tutorials using PostgreSQL full-text search with a custom configuration that handles code snippets, technical terms, and version numbers. The search is configured to recognize programming language keywords as valid terms rather than stop words, and uses custom dictionaries to handle domain-specific terminology.
+
+## Best Practices for Production
+
+1. **Always use GIN indexes for tsvector columns**: GIN (Generalized Inverted Index) is optimized for full-text search and provides the best performance for `@@` queries. GiST indexes are smaller but slower for search queries.
+
+2. **Use generated columns for automatic tsvector maintenance**: PostgreSQL 12+ supports stored generated columns that automatically update the tsvector when the source text changes. This eliminates the need for triggers and ensures the search index is always in sync.
+
+3. **Normalize at write time, not query time**: Convert text to tsvector during insertion or update, not during search. Storing the pre-computed tsvector avoids expensive text processing during queries.
+
+4. **Use `websearch_to_tsquery` for user-facing search**: It converts intuitive search syntax (phrases in quotes, minus for exclusion, OR operator) into proper tsquery, providing a familiar search experience for users.
+
+5. **Combine full-text search with traditional indexes**: Use a CTE or subquery to first filter by other criteria (date range, category, status) with B-tree indexes, then apply full-text search within the filtered set.
+
+6. **Tune `ts_rank` normalization for your use case**: Experiment with normalization flags. For mixed-length documents, use normalization flag `1` (divide by document length) or `4` (divide by log of length) to prevent long documents from dominating results.
+
+7. **Use custom dictionaries for domain-specific terminology**: Create thesaurus dictionaries for industry jargon, abbreviations, and synonyms. This dramatically improves search quality for specialized content.
+
+8. **Monitor index size and maintenance**: GIN indexes on large tables can be several times larger than the original data. Schedule `REINDEX CONCURRENTLY` during maintenance windows to keep the index performant.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Using LIKE instead of full-text search | Full table scans, no stemming, no ranking | Migrate to tsvector/tsquery with GIN indexes |
+| Not using weights for multi-field search | Irrelevant results from body text matches | Use setweight() to assign A/B/C/D weights to different fields |
+| Forgetting to update tsvector on data changes | Stale search results | Use generated columns or triggers for automatic updates |
+| Searching without an index | Slow queries on large tables | Always create a GIN index on tsvector columns |
+| Using the wrong text search configuration | Poor stemming and stop word handling | Use the correct language configuration; test with ts_debug() |
+| Ignoring query result ranking | Random order of results | Always use ts_rank() or ts_rank_cd() with ORDER BY |
+
+## Performance Optimization
+
+### GIN Index Configuration
+
+Tune GIN index parameters for your workload:
+
+```sql
+-- Increase pending list size for write-heavy workloads
+ALTER TABLE articles SET (gin_pending_list_limit = 256);
+
+-- For read-heavy workloads, disable the pending list entirely
+CREATE INDEX idx_articles_search ON articles USING GIN (search_vector)
+  WITH (fastupdate = off);
+```
+
+### Partial Search Indexes
+
+Create indexes that cover only the rows users search:
+
+```sql
+-- Only index published articles
+CREATE INDEX idx_published_search ON articles USING GIN (search_vector)
+  WHERE published_at <= now();
+
+-- Only index articles from the last year
+CREATE INDEX idx_recent_search ON articles USING GIN (search_vector)
+  WHERE published_at >= now() - interval '1 year';
+```
+
+### Concurrent Search Performance
+
+```sql
+-- Use a materialized view for expensive search aggregations
+CREATE MATERIALIZED VIEW search_suggestions AS
+SELECT
+  lexeme,
+  ndoc AS frequency
+FROM ts_stat('SELECT search_vector FROM articles')
+ORDER BY ndoc DESC
+LIMIT 1000;
+
+-- Refresh periodically
+REFRESH MATERIALIZED VIEW CONCURRENTLY search_suggestions;
+```
+
+## Comparison with Alternatives
+
+| Feature | PostgreSQL FTS | Elasticsearch | Meilisearch | Algolia |
+|---------|---------------|---------------|-------------|---------|
+| Setup Complexity | None (built-in) | Separate service | Separate service | SaaS |
+| Data Sync | Automatic | Manual pipeline | Manual pipeline | Manual pipeline |
+| Ranking | ts_rank, ts_rank_cd | BM25, custom | Proprietary | Proprietary |
+| Stemming | Language-specific | Language analyzers | Language-specific | Automatic |
+| Faceted Search | Manual implementation | Built-in | Built-in | Built-in |
+| Query Language | tsquery (SQL-integrated) | Query DSL (JSON) | Simple syntax | Simple syntax |
+| Latency (100K docs) | 10-50ms | 5-20ms | 5-30ms | 5-15ms |
+| Scaling | Vertical | Horizontal | Horizontal | Managed |
+| Cost | Free (included) | Free + cloud pricing | Free + cloud pricing | Per-search pricing |
+
+## Advanced Patterns and Techniques
+
+### Trigram Search with pg_trgm
+
+For fuzzy matching and autocomplete, combine full-text search with the `pg_trgm` extension:
+
+```sql
+CREATE EXTENSION pg_trgm;
+
+-- Create a trigram GIN index for similarity search
+CREATE INDEX idx_articles_title_trgm ON articles USING GIN (title gin_trgm_ops);
+
+-- Fuzzy search: find titles similar to a misspelled query
+SELECT title, similarity(title, 'postgrs performnce') AS score
+FROM articles
+WHERE title % 'postgrs performnce'
+ORDER BY score DESC
+LIMIT 5;
+```
+
+### Custom Text Search Configuration
+
+Create a custom configuration for technical content:
+
+```sql
+-- Create a custom configuration that inherits from English
+CREATE TEXT SEARCH CONFIGURATION tech (COPY = english);
+
+-- Add programming terms that should not be stemmed
+ALTER TEXT SEARCH CONFIGURATION tech
+  ALTER MAPPING FOR asciiword, asciihword, hword_asciipart
+  WITH english_stem, simple;
+
+-- Test the custom configuration
+SELECT to_tsvector('tech', 'TypeScript and PostgreSQL are excellent tools');
+```
+
+### Search with Synonym Support
+
+Create a thesaurus dictionary for domain-specific synonyms:
+
+```sql
+-- Create a synonym file
+-- /usr/share/postgresql/17/tsearch_data/synonyms.ths
+-- postgresql pg: postgres
+-- js javascript: javascript
+-- k8s kubernetes: kubernetes
+
+CREATE TEXT SEARCH DICTIONARY tech_synonyms (
+  TEMPLATE = synonym,
+  SYNONYMS = synonyms
+);
+
+-- Add it to a text search configuration
+ALTER TEXT SEARCH CONFIGURATION tech
+  ALTER MAPPING FOR asciiword WITH tech_synonyms, english_stem;
+```
+
+## Testing Strategies
+
+Test your full-text search implementation:
+
+```sql
+-- Test tsvector generation
+SELECT to_tsvector('english', 'The PostgreSQL database is running smoothly');
+-- Expected: 'databas':4 'postgresql':2 'run':6 'smoothli':7
+
+-- Test tsquery matching
+SELECT to_tsquery('english', 'running') @@ to_tsvector('english', 'The PostgreSQL database is running smoothly');
+-- Expected: true (running -> run matches)
+
+-- Test ranking consistency
+CREATE FUNCTION test_search_ranking() RETURNS void AS $$
+DECLARE
+  result REAL;
+BEGIN
+  SELECT ts_rank(
+    to_tsvector('english', 'PostgreSQL database performance tuning guide'),
+    to_tsquery('english', 'postgresql & performance')
+  ) INTO result;
+
+  ASSERT result > 0, 'Expected positive rank for matching document';
+  RAISE NOTICE 'Rank: %', result;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## Future Outlook
+
+PostgreSQL's full-text search continues to improve with each release. Recent improvements include better handling of ICU collations for multilingual search, improved phrase search performance, and better integration with JSON data types. The `pg_vector` extension is adding semantic search capabilities that combine traditional keyword-based full-text search with vector embeddings for similarity search.
+
+For many applications, PostgreSQL full-text search is the right choice—it provides excellent search quality with zero additional infrastructure. Only when you need features like distributed search, real-time faceting, or handling billions of documents do you need to consider dedicated search engines.
 
 ## Conclusion
 
-PostgreSQL Full-Text Search: Beyond LIKE Queries is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+PostgreSQL full-text search provides a powerful, built-in solution for implementing search features without external dependencies. The combination of tsvector/tsquery types, GIN indexes, and ranking functions delivers production-quality search performance and relevance.
+
+Key takeaways:
+
+1. Use tsvector and tsquery instead of LIKE for text search—they support stemming, stop words, and boolean operators
+2. Always create GIN indexes on tsvector columns for sub-second search performance
+3. Use setweight() to assign different importance levels to different text fields
+4. Use websearch_to_tsquery() for user-facing search with intuitive syntax
+5. Combine full-text search with traditional indexes for filtered search
+6. Use ts_rank() or ts_rank_cd() to return results ordered by relevance
+7. Use ts_headline() to display highlighted search snippets
+8. Consider pg_trgm for fuzzy matching and autocomplete alongside FTS
+
+For applications that need good search quality without the operational complexity of Elasticsearch, PostgreSQL full-text search is an excellent choice that keeps your architecture simple while delivering results that users expect.

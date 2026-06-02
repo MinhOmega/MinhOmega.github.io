@@ -9,54 +9,665 @@ author: "MinhVo"
 
 ## Introduction
 
-SQLite for Applications: When and How to Use It is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+SQLite is the most widely deployed database engine in the world. It runs on every smartphone, every web browser, every Python installation, and inside countless embedded systems. Yet most web developers overlook it for server-side applications, defaulting to PostgreSQL or MySQL without considering whether their use case actually requires a client-server database.
 
-## Key Concepts
+The truth is that SQLite handles the majority of web application workloads remarkably well. For applications with moderate write concurrency, single-server deployments, and read-heavy traffic patterns, SQLite eliminates an entire class of operational complexity: no database server to manage, no connection pools to tune, no network latency between your application and its data, no password rotation, no backup agents.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers everything you need to use SQLite effectively in production applications. We will explore WAL mode for concurrent access, FTS5 for full-text search, the JSON extension for document-style queries, and patterns for testing, migrations, and performance optimization. By the end, you will know exactly when SQLite is the right choice and how to use it without surprises.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Embedded Database Architecture](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding SQLite for Applications: Core Concepts
 
-Let's look at a practical example:
+SQLite's design philosophy is radically different from client-server databases. There is no server process — your application talks directly to the database file through function calls. This means zero network latency, zero connection overhead, and zero configuration. The trade-off is that all access must happen from the same machine (or through a network filesystem, which is strongly discouraged).
+
+### WAL Mode: The Key to Concurrency
+
+The default journal mode (`DELETE`) locks the entire database during writes, blocking all readers. WAL (Write-Ahead Logging) mode changes this fundamentally: writes go to a separate WAL file, and readers continue accessing the main database file without blocking. This enables concurrent reads during writes.
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA wal_autocheckpoint = 1000;  -- Checkpoint every 1000 pages
+```
+
+WAL mode is not just a performance optimization — it is a requirement for any production application that handles concurrent requests. Without it, your application serializes all database access, creating a severe bottleneck under even moderate load.
+
+### The Busy Timeout Problem
+
+When two connections contend for a write lock, SQLite returns `SQLITE_BUSY` by default. This is the single most common source of SQLite errors in production. The fix is simple:
+
+```sql
+PRAGMA busy_timeout = 5000;  -- Wait up to 5 seconds for locks
+```
+
+With WAL mode and busy_timeout, SQLite handles dozens of concurrent readers and a single writer gracefully. For most web applications — where reads vastly outnumber writes — this is sufficient.
+
+### Strict Tables
+
+SQLite's type system is famously flexible (you can store a string in an INTEGER column). SQLite 3.37.0 introduced STRICT tables that enforce column types:
+
+```sql
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  age INTEGER CHECK(age >= 0),
+  created_at TEXT DEFAULT (datetime('now'))
+) STRICT;
+```
+
+STRICT tables reject type mismatches at insert time, preventing the subtle bugs that arise from SQLite's flexible typing.
+
+## Architecture and Design Patterns
+
+### Application-Embedded Database
+
+The most common pattern is embedding SQLite directly in your application:
+
+```text
+┌──────────────────────┐
+│   Web Application     │
+│   ┌────────────────┐ │
+│   │  Business Logic  │ │
+│   └───────┬────────┘ │
+│           │           │
+│   ┌───────▼────────┐ │
+│   │  SQLite Driver   │ │
+│   │  (better-sqlite3)│ │
+│   └───────┬────────┘ │
+│           │           │
+│   ┌───────▼────────┐ │
+│   │  data.db + WAL   │ │
+│   └────────────────┘ │
+└──────────────────────┘
+```
+
+No network hop. No connection pool. The database is a file in your application directory.
+
+### The Write-Ahead Log Structure
+
+WAL mode creates two additional files alongside your database:
+
+```text
+data.db          -- Main database file
+data.db-wal      -- Write-ahead log (active writes)
+data.db-shm      -- Shared memory index (for concurrent access)
+```
+
+The WAL file accumulates changes until a checkpoint transfers them to the main database. Readers check both the main file and the WAL to get the latest state. This is why WAL mode enables concurrent reads: readers see a consistent snapshot without blocking writers.
+
+### Migration Strategy
+
+SQLite does not support transactional schema changes (ALTER TABLE cannot be rolled back). A safe migration pattern:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import Database from 'better-sqlite3';
+
+function migrate(db: Database.Database) {
+  db.pragma('journal_mode = WAL');
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS migrations (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  const applied = db.prepare('SELECT name FROM migrations').all().map(r => r.name);
+
+  const migrations = [
+    {
+      name: '001_create_users',
+      sql: `CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      ) STRICT`,
+    },
+    {
+      name: '002_add_user_bio',
+      sql: `ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''`,
+    },
+  ];
+
+  for (const migration of migrations) {
+    if (!applied.includes(migration.name)) {
+      db.exec(migration.sql);
+      db.prepare('INSERT INTO migrations (name) VALUES (?)').run(migration.name);
+    }
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing SQLite solutions in production environments.
+![Database Design](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-## Best Practices
+## Step-by-Step Implementation
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+### Setting Up better-sqlite3
 
-## Common Pitfalls
+better-sqlite3 is the fastest and most reliable Node.js SQLite driver. Unlike async drivers, it uses synchronous operations that match SQLite's in-process nature:
+
+```bash
+npm install better-sqlite3
+```
+
+```typescript
+import Database from 'better-sqlite3';
+import path from 'path';
+
+const dbPath = path.join(process.cwd(), 'data', 'app.db');
+const db = new Database(dbPath, { verbose: console.log });
+
+// Essential pragmas for production
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -64000');       // 64MB cache
+db.pragma('foreign_keys = ON');
+db.pragma('temp_store = MEMORY');
+db.pragma('mmap_size = 268435456');     // 256MB memory-mapped I/O
+```
+
+### Full-Text Search with FTS5
+
+FTS5 is SQLite's built-in full-text search engine. It provides ranking, phrase matching, and boolean operators without any external dependencies:
+
+```sql
+-- Create FTS5 virtual table
+CREATE VIRTUAL TABLE articles_fts USING fts5(
+  title,
+  content,
+  tags,
+  tokenize='porter unicode61'
+);
+```
+
+```typescript
+// Insert with FTS sync
+const insertArticle = db.prepare(
+  'INSERT INTO articles (title, content, tags) VALUES (?, ?, ?)'
+);
+const insertFts = db.prepare(
+  'INSERT INTO articles_fts (rowid, title, content, tags) VALUES (?, ?, ?, ?)'
+);
+
+const createArticle = db.transaction((title: string, content: string, tags: string) => {
+  const { lastInsertRowid } = insertArticle.run(title, content, tags);
+  insertFts.run(lastInsertRowid, title, content, tags);
+});
+
+createArticle(
+  'Getting Started with SQLite',
+  'SQLite is an embedded database that requires zero configuration...',
+  'database sqlite tutorial'
+);
+
+// Search with ranking
+const search = db.prepare(`
+  SELECT articles.*, rank
+  FROM articles_fts
+  JOIN articles ON articles.rowid = articles_fts.rowid
+  WHERE articles_fts MATCH ?
+  ORDER BY rank
+  LIMIT 20
+`);
+
+const results = search.all('sqlite database');
+```
+
+FTS5 supports advanced queries:
+
+```typescript
+// Phrase search
+search.all('"zero configuration"');
+
+// Boolean operators
+search.all('sqlite OR postgresql');
+
+// Prefix search
+search.all('data*');
+
+// Column-specific search
+search.all('title:tutorial AND content:sqlite');
+
+// NEAR operator (words within 10 tokens of each other)
+search.all('NEAR(sqlite performance, 10)');
+```
+
+### JSON Support
+
+SQLite's JSON extension enables document-style queries within your relational database:
+
+```sql
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  payload TEXT NOT NULL,  -- JSON string
+  created_at TEXT DEFAULT (datetime('now'))
+) STRICT;
+```
+
+```typescript
+// Insert JSON data
+const insertEvent = db.prepare(
+  "INSERT INTO events (event_type, payload) VALUES (?, json(?))"
+);
+
+insertEvent.run('user_signup', JSON.stringify({
+  userId: 'abc123',
+  email: 'user@example.com',
+  plan: 'pro',
+  metadata: { referrer: 'google', campaign: 'summer2024' }
+}));
+
+// Query JSON fields
+const proUsers = db.prepare(`
+  SELECT
+    id,
+    event_type,
+    json_extract(payload, '$.email') AS email,
+    json_extract(payload, '$.plan') AS plan,
+    json_extract(payload, '$.metadata.referrer') AS referrer
+  FROM events
+  WHERE event_type = 'user_signup'
+    AND json_extract(payload, '$.plan') = ?
+`).all('pro');
+
+// Aggregate with JSON
+const planCounts = db.prepare(`
+  SELECT
+    json_extract(payload, '$.plan') AS plan,
+    COUNT(*) AS count
+  FROM events
+  WHERE event_type = 'user_signup'
+  GROUP BY json_extract(payload, '$.plan')
+`).all();
+```
+
+### Prepared Statement Caching
+
+better-sqlite3 caches prepared statements automatically, but explicit caching gives you control:
+
+```typescript
+class UserRepository {
+  private insertStmt: Database.Statement;
+  private findByIdStmt: Database.Statement;
+  private findByEmailStmt: Database.Statement;
+
+  constructor(private db: Database.Database) {
+    this.insertStmt = db.prepare(
+      'INSERT INTO users (email, name) VALUES (?, ?)'
+    );
+    this.findByIdStmt = db.prepare(
+      'SELECT * FROM users WHERE id = ?'
+    );
+    this.findByEmailStmt = db.prepare(
+      'SELECT * FROM users WHERE email = ?'
+    );
+  }
+
+  create(email: string, name: string) {
+    return this.insertStmt.run(email, name);
+  }
+
+  findById(id: number) {
+    return this.findByIdStmt.get(id);
+  }
+
+  findByEmail(email: string) {
+    return this.findByEmailStmt.get(email);
+  }
+}
+```
+
+![Implementation Pattern](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### Use Case 1: CLI Application Data Storage
+
+CLI tools benefit from SQLite's zero-dependency nature:
+
+```typescript
+import Database from 'better-sqlite3';
+import os from 'os';
+import path from 'path';
+
+const configDir = path.join(os.homedir(), '.mycli');
+const db = new Database(path.join(configDir, 'data.db'));
+
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    tags TEXT DEFAULT '[]',
+    created_at TEXT DEFAULT (datetime('now'))
+  ) STRICT
+`);
+
+export function addBookmark(name: string, url: string, tags: string[] = []) {
+  db.prepare('INSERT OR REPLACE INTO bookmarks (name, url, tags) VALUES (?, ?, ?)')
+    .run(name, url, JSON.stringify(tags));
+}
+
+export function searchBookmarks(query: string) {
+  return db.prepare(`
+    SELECT * FROM bookmarks
+    WHERE name LIKE ? OR url LIKE ? OR tags LIKE ?
+    ORDER BY created_at DESC
+  `).all(`%${query}%`, `%${query}%`, `%${query}%`);
+}
+```
+
+### Use Case 2: Application Cache Layer
+
+SQLite serves as an excellent local cache with TTL support:
+
+```typescript
+const cache = new Database(':memory:');
+cache.exec(`
+  CREATE TABLE cache (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  ) STRICT
+`);
+
+const getStmt = cache.prepare(
+  "SELECT value FROM cache WHERE key = ? AND expires_at > strftime('%s', 'now')"
+);
+const setStmt = cache.prepare(
+  'INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)'
+);
+const purgeStmt = cache.prepare(
+  "DELETE FROM cache WHERE expires_at <= strftime('%s', 'now')"
+);
+
+export function cacheGet(key: string): string | null {
+  const row = getStmt.get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function cacheSet(key: string, value: string, ttlSeconds: number) {
+  const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+  setStmt.run(key, value, expiresAt);
+}
+
+// Periodic purge
+setInterval(() => purgeStmt.run(), 60_000);
+```
+
+### Use Case 3: Testing with In-Memory SQLite
+
+In-memory SQLite databases are perfect for tests — fast, isolated, and disposable:
+
+```typescript
+import Database from 'better-sqlite3';
+import { beforeEach, test, expect } from 'vitest';
+
+let db: Database.Database;
+
+beforeEach(() => {
+  db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  db.exec(`
+    CREATE TABLE users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL
+    ) STRICT
+  `);
+});
+
+test('creates and retrieves a user', () => {
+  db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('test@example.com', 'Test');
+
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get('test@example.com');
+  expect(user).toEqual({ id: 1, email: 'test@example.com', name: 'Test' });
+});
+
+test('enforces unique email constraint', () => {
+  db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('dup@example.com', 'First');
+
+  expect(() => {
+    db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('dup@example.com', 'Second');
+  }).toThrow(/UNIQUE constraint/);
+});
+```
+
+## Best Practices for Production
+
+1. **Always enable WAL mode**: Set `PRAGMA journal_mode = WAL` immediately after opening the database. This is non-negotiable for production applications handling concurrent requests.
+
+2. **Set busy_timeout to at least 5000ms**: This prevents SQLITE_BUSY errors under concurrent load. In high-contention scenarios, increase to 30000ms.
+
+3. **Enable foreign keys explicitly**: SQLite has foreign key support but it is off by default. Always run `PRAGMA foreign_keys = ON` on every connection.
+
+4. **Use STRICT tables for new schemas**: STRICT tables enforce type constraints at the database level, preventing the subtle bugs from SQLite's flexible typing system.
+
+5. **Batch writes in transactions**: Individual inserts without explicit transactions are 50-100x slower. Always wrap multiple writes in a single transaction.
+
+6. **Set synchronous = NORMAL with WAL**: The default `synchronous = FULL` with WAL mode is overly cautious. `NORMAL` provides excellent durability with better write performance.
+
+7. **Back up with the backup API or Litestream**: Never copy the database file directly while it is in use. Use SQLite's `VACUUM INTO` command or Litestream for safe backups.
+
+8. **Monitor database size and vacuum periodically**: SQLite does not reclaim space from deleted rows automatically. Run `VACUUM` periodically or enable auto-vacuum mode.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Not enabling WAL mode | Serialized read/write access | Set `PRAGMA journal_mode = WAL` on startup |
+| Missing busy_timeout | SQLITE_BUSY errors under load | Set `PRAGMA busy_timeout = 5000` minimum |
+| Single INSERT without transaction | 50-100x slower batch inserts | Wrap multiple writes in `db.transaction()` |
+| Copying DB file while in use | Corrupt backup | Use `VACUUM INTO` or Litestream |
+| Forgetting foreign_keys = ON | Orphaned records, data integrity issues | Set `PRAGMA foreign_keys = ON` on every connection |
+| Using async driver for in-process DB | Unnecessary overhead | Use better-sqlite3 (synchronous) for server apps |
+
+## Performance Optimization
+
+SQLite performance is primarily determined by pragmas, indexing, and transaction batching:
+
+```typescript
+import Database from 'better-sqlite3';
+
+const db = new Database('app.db');
+
+// Performance-critical pragmas
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -64000');
+db.pragma('mmap_size = 268435456');
+db.pragma('temp_store = MEMORY');
+db.pragma('busy_timeout = 5000');
+
+// Analyze tables for query optimizer
+db.pragma('optimize');
+
+// Benchmark: transaction batching
+console.time('individual inserts');
+for (let i = 0; i < 10000; i++) {
+  db.prepare('INSERT INTO bench (value) VALUES (?)').run(`item-${i}`);
+}
+console.timeEnd('individual inserts'); // ~2000ms
+
+console.time('batched inserts');
+const batch = db.transaction((count: number) => {
+  const stmt = db.prepare('INSERT INTO bench (value) VALUES (?)');
+  for (let i = 0; i < count; i++) {
+    stmt.run(`item-${i}`);
+  }
+});
+batch(10000);
+console.timeEnd('batched inserts'); // ~30ms
+```
+
+Index strategy for common query patterns:
+
+```sql
+-- Composite index for filtered, sorted queries
+CREATE INDEX idx_posts_author_date ON posts (author_id, published_at DESC);
+
+-- Covering index to avoid table lookups
+CREATE INDEX idx_users_email_name ON users (email) INCLUDE (name, created_at);
+
+-- Partial index for active records only
+CREATE INDEX idx_active_sessions ON sessions (user_id) WHERE expires_at > datetime('now');
+```
+
+## Comparison with Alternatives
+
+| Feature | SQLite | PostgreSQL | MySQL | Redis |
+|---------|--------|-----------|-------|-------|
+| Setup complexity | Zero | Moderate | Moderate | Low |
+| Configuration | None | Many settings | Many settings | Few settings |
+| Network overhead | None | TCP connection | TCP connection | TCP connection |
+| Concurrent writes | Single writer | Multiple writers | Multiple writers | Single thread |
+| Full-text search | FTS5 (built-in) | tsvector (built-in) | Full-text index | RediSearch module |
+| JSON support | json extension | jsonb (native) | JSON type | N/A |
+| Backup complexity | File copy/Litestream | pg_dump/WAL archiving | mysqldump | RDB/AOF |
+| Best for | Embedded, single-server, edge | Complex queries, multi-writer | Web apps, CMS | Caching, queues |
+
+## Advanced Patterns
+
+### Using SQLite as a Job Queue
+
+SQLite can replace Redis for simple job queues:
+
+```typescript
+const queue = new Database('jobs.db');
+queue.pragma('journal_mode = WAL');
+
+queue.exec(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'done', 'failed')),
+    attempts INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+  ) STRICT
+`);
+
+function enqueue(type: string, payload: object) {
+  queue.prepare('INSERT INTO jobs (type, payload) VALUES (?, ?)')
+    .run(type, JSON.stringify(payload));
+}
+
+function dequeue(): any {
+  return queue.transaction(() => {
+    const job = queue.prepare(`
+      SELECT * FROM jobs
+      WHERE status = 'pending'
+      ORDER BY created_at
+      LIMIT 1
+      FOR UPDATE
+    `).get();
+
+    if (job) {
+      queue.prepare(`
+        UPDATE jobs SET status = 'processing', started_at = datetime('now'), attempts = attempts + 1
+        WHERE id = ?
+      `).run(job.id);
+    }
+
+    return job;
+  })();
+}
+```
+
+### Recursive CTEs for Hierarchical Data
+
+```sql
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  parent_id INTEGER REFERENCES categories(id)
+) STRICT;
+
+-- Get full category tree
+WITH RECURSIVE tree AS (
+  SELECT id, name, parent_id, 0 AS depth, name AS path
+  FROM categories WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.id, c.name, c.parent_id, t.depth + 1, t.path || ' > ' || c.name
+  FROM categories c
+  JOIN tree t ON c.parent_id = t.id
+)
+SELECT * FROM tree ORDER BY path;
+```
+
+## Testing Strategies
+
+SQLite's in-memory databases make testing fast and isolated:
+
+```typescript
+import Database from 'better-sqlite3';
+import { describe, test, expect, beforeEach } from 'vitest';
+
+function createTestDb(): Database.Database {
+  const db = new Database(':memory:');
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  return db;
+}
+
+describe('UserRepository', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = createTestDb();
+    db.exec(`
+      CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL
+      ) STRICT
+    `);
+  });
+
+  test('enforces unique email', () => {
+    db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('a@b.com', 'A');
+    expect(() => {
+      db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('a@b.com', 'B');
+    }).toThrow(/UNIQUE/);
+  });
+
+  test('cascading deletes with foreign keys', () => {
+    db.exec('CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE) STRICT');
+    db.prepare('INSERT INTO users (email, name) VALUES (?, ?)').run('a@b.com', 'A');
+    db.prepare('INSERT INTO posts (user_id) VALUES (?)').run(1);
+    db.prepare('DELETE FROM users WHERE id = 1').run();
+    const posts = db.prepare('SELECT * FROM posts WHERE user_id = 1').all();
+    expect(posts).toHaveLength(0);
+  });
+});
+```
+
+## Future Outlook
+
+SQLite continues to evolve rapidly. Recent additions include STRICT tables, generated columns, and the `RIGHT JOIN` and `FULL OUTER JOIN` operators. The JSON extension is increasingly powerful, blurring the line between relational and document databases.
+
+The rise of edge computing (Cloudflare Workers, Deno Deploy, Bun) positions SQLite as the natural database for edge-first applications. Projects like libSQL (Turso's fork), cr-sqlite (CRDT-based multi-writer), and sqlite-vec (vector search) extend SQLite into new territory.
+
+SQLite's commitment to backwards compatibility and stability means your investment in SQLite skills and schemas will remain valid for decades. No other database engine offers this combination of longevity, simplicity, and performance.
 
 ## Conclusion
 
-SQLite for Applications: When and How to Use It is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+SQLite is a serious production database for applications that match its strengths. The key takeaways are:
+
+1. Enable WAL mode and set busy_timeout for any production application
+2. FTS5 provides powerful full-text search without external dependencies
+3. The JSON extension enables flexible document-style queries within a relational database
+4. better-sqlite3 (synchronous) is the right choice for server-side Node.js applications
+5. Batch writes in transactions for 50-100x performance improvement
+6. In-memory databases are perfect for fast, isolated testing
+7. Use STRICT tables to enforce type safety at the database level
+
+Choose SQLite when you want simplicity, embedded deployment, single-server architecture, or edge computing. Choose PostgreSQL when you need multi-writer concurrency, complex analytical queries, or a mature extension ecosystem. The right database depends on your specific constraints, not on industry default assumptions.
