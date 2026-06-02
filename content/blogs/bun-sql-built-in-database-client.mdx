@@ -1,62 +1,529 @@
 ---
 title: "Bun SQL: Built-in Database Client"
 date: "2024-03-30"
-description: "Query databases with Bun's built-in SQL client: connection pooling, prepared statements."
-tags: ["Bun", "SQL", "Database", "Runtime"]
+description: "Use Bun's built-in SQL client for PostgreSQL, MySQL, and SQLite with zero dependencies."
+tags: ["Bun", "SQL", "Database", "PostgreSQL", "JavaScript"]
 published: true
 author: "MinhVo"
 ---
 
 ## Introduction
 
-Bun SQL: Built-in Database Client is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Database access is one of the most fundamental requirements for server-side applications, yet the JavaScript ecosystem has long relied on third-party packages to connect to databases. Developers install `pg` for PostgreSQL, `mysql2` for MySQL, `better-sqlite3` for SQLite, and often add an ORM like Prisma or Drizzle on top. Each dependency adds bundle size, potential security vulnerabilities, and compatibility concerns with the runtime environment.
 
-## Key Concepts
+Bun SQL changes this equation entirely. Starting with Bun v1.2, the runtime includes a built-in SQL client that supports PostgreSQL, MySQL, and SQLite without requiring any external dependencies. The client is implemented in Zig, providing native-level performance while exposing a clean JavaScript API. You can connect to a database with a single import statement and a connection string — no `npm install` required.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Database Architecture](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+This article explores Bun SQL's architecture, API design, performance characteristics, and practical patterns for building production applications with zero-dependency database access.
 
-## Practical Implementation
+## Understanding Bun SQL: Core Concepts
 
-Let's look at a practical example:
+### Connection and Configuration
+
+Bun SQL uses a connection string to establish database connections. The URL scheme determines which database driver to use:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import { SQL } from "bun";
+
+// PostgreSQL connection
+const pg = new SQL("postgres://user:password@localhost:5432/mydb");
+
+// MySQL connection
+const mysql = new SQL("mysql://user:password@localhost:3306/mydb");
+
+// SQLite connection (file-based)
+const sqlite = new SQL("sqlite:///path/to/database.db");
+
+// SQLite in-memory
+const memSqlite = new SQL("sqlite::memory:");
+```
+
+The `SQL` constructor accepts a URL string and optional configuration object. Connection pooling is handled automatically — Bun maintains a pool of connections and distributes queries across them, reusing connections when they become available.
+
+### Tagged Template Literal Queries
+
+Like Bun Shell, Bun SQL uses tagged template literals for query execution. This provides automatic parameter binding that prevents SQL injection:
+
+```typescript
+import { SQL } from "bun";
+
+const db = new SQL(process.env.DATABASE_URL!);
+
+// Parameterized query (safe from SQL injection)
+const userId = 42;
+const users = await db`SELECT * FROM users WHERE id = ${userId}`;
+
+// Multiple parameters
+const minAge = 18;
+const city = "New York";
+const adults = await db`
+  SELECT name, email FROM users
+  WHERE age >= ${minAge} AND city = ${city}
+  ORDER BY name
+`;
+```
+
+Each interpolated value becomes a bound parameter in the prepared statement. The database driver handles escaping and type conversion automatically, eliminating the SQL injection vulnerabilities that plague string-concatenated queries.
+
+### Result Handling
+
+Query results are returned as arrays of objects where column names become property keys:
+
+```typescript
+const users = await db`SELECT id, name, email FROM users LIMIT 5`;
+
+// users is an array of objects:
+// [{ id: 1, name: "Alice", email: "alice@example.com" }, ...]
+
+for (const user of users) {
+  console.log(`${user.name}: ${user.email}`);
 }
 ```
 
-This pattern demonstrates the core approach to implementing Bun solutions in production environments.
+For queries that return no rows (INSERT, UPDATE, DELETE), Bun SQL returns an empty array. To get the number of affected rows, use the `rowCount` property on the result.
 
-## Best Practices
+![Query Execution Flow](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+## Architecture and Design Patterns
 
-## Common Pitfalls
+### Connection Pooling Internals
+
+Bun SQL implements connection pooling at the native level. When you create a `SQL` instance, Bun opens a configurable number of connections (default: 10) to the database server. Each query is assigned to an available connection from the pool. If all connections are busy, the query waits in a queue until one becomes available.
+
+The pool automatically handles connection lifecycle: idle connections are recycled, broken connections are replaced, and connections are properly closed when the `SQL` instance is garbage collected or explicitly closed.
+
+### Transaction Support
+
+Bun SQL provides first-class transaction support:
+
+```typescript
+import { SQL } from "bun";
+
+const db = new SQL(process.env.DATABASE_URL!);
+
+// Automatic transaction with rollback on error
+await db.begin(async (tx) => {
+  await tx`INSERT INTO accounts (user_id, balance) VALUES (${1}, ${1000})`;
+  await tx`UPDATE accounts SET balance = balance - ${200} WHERE user_id = ${2}`;
+  await tx`UPDATE accounts SET balance = balance + ${200} WHERE user_id = ${1}`;
+});
+// Transaction is committed if the callback completes successfully
+// Transaction is rolled back if the callback throws an error
+```
+
+The `begin` method starts a transaction and provides a transaction-scoped `SQL` instance. If the callback throws, the transaction is automatically rolled back. This prevents partial updates that could leave the database in an inconsistent state.
+
+### Prepared Statements
+
+For queries that are executed frequently with different parameters, Bun SQL can prepare statements for better performance:
+
+```typescript
+const db = new SQL(process.env.DATABASE_URL!);
+
+// Prepare a statement once
+const getUserById = db.prepare("SELECT * FROM users WHERE id = $1");
+
+// Execute with different parameters
+const user1 = await getUserById(1);
+const user2 = await getUserById(2);
+const user3 = await getUserById(3);
+```
+
+Prepared statements are parsed and planned by the database server once, then executed multiple times with different parameter values. This eliminates the overhead of query parsing and planning on each execution.
+
+## Step-by-Step Implementation
+
+### User Management Service
+
+```typescript
+import { SQL } from "bun";
+
+interface User {
+  id: number;
+  name: string;
+  email: string;
+  created_at: Date;
+}
+
+class UserService {
+  private db: SQL;
+
+  constructor(connectionString: string) {
+    this.db = new SQL(connectionString);
+  }
+
+  async create(name: string, email: string): Promise<User> {
+    const [user] = await this.db`
+      INSERT INTO users (name, email)
+      VALUES (${name}, ${email})
+      RETURNING *
+    `;
+    return user as User;
+  }
+
+  async findById(id: number): Promise<User | null> {
+    const [user] = await this.db`SELECT * FROM users WHERE id = ${id}`;
+    return (user as User) ?? null;
+  }
+
+  async findByEmail(email: string): Promise<User | null> {
+    const [user] = await this.db`SELECT * FROM users WHERE email = ${email}`;
+    return (user as User) ?? null;
+  }
+
+  async update(id: number, data: Partial<Pick<User, "name" | "email">>): Promise<User> {
+    const [user] = await this.db`
+      UPDATE users SET
+        name = COALESCE(${data.name ?? null}, name),
+        email = COALESCE(${data.email ?? null}, email)
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    return user as User;
+  }
+
+  async delete(id: number): Promise<boolean> {
+    const result = await this.db`DELETE FROM users WHERE id = ${id}`;
+    return result.length > 0;
+  }
+
+  async search(query: string, limit = 20, offset = 0): Promise<User[]> {
+    const results = await this.db`
+      SELECT * FROM users
+      WHERE name ILIKE ${`%${query}%`} OR email ILIKE ${`%${query}%`}
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    return results as User[];
+  }
+}
+```
+
+### Database Migration System
+
+```typescript
+import { SQL } from "bun";
+import { readdir } from "fs/promises";
+import { join } from "path";
+
+async function migrate(connectionString: string, migrationsDir: string) {
+  const db = new SQL(connectionString);
+
+  // Ensure migrations table exists
+  await db`
+    CREATE TABLE IF NOT EXISTS migrations (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL UNIQUE,
+      applied_at TIMESTAMP DEFAULT NOW()
+    )
+  `;
+
+  // Get applied migrations
+  const applied = await db`SELECT name FROM migrations ORDER BY id`;
+  const appliedNames = new Set(applied.map((m: any) => m.name));
+
+  // Get migration files
+  const files = (await readdir(migrationsDir))
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
+
+  // Apply pending migrations
+  for (const file of files) {
+    if (appliedNames.has(file)) continue;
+
+    console.log(`Applying migration: ${file}`);
+    const sql = await Bun.file(join(migrationsDir, file)).text();
+
+    await db.begin(async (tx) => {
+      // Execute migration SQL
+      for (const statement of sql.split(";").filter((s) => s.trim())) {
+        await tx.unsafe(statement);
+      }
+      // Record migration
+      await tx`INSERT INTO migrations (name) VALUES (${file})`;
+    });
+
+    console.log(`Applied: ${file}`);
+  }
+
+  console.log("All migrations applied");
+}
+```
+
+### Batch Insert with Transaction
+
+```typescript
+import { SQL } from "bun";
+
+async function importUsers(db: SQL, users: Array<{ name: string; email: string }>) {
+  const batchSize = 1000;
+  let imported = 0;
+
+  for (let i = 0; i < users.length; i += batchSize) {
+    const batch = users.slice(i, i + batchSize);
+
+    await db.begin(async (tx) => {
+      for (const user of batch) {
+        await tx`
+          INSERT INTO users (name, email)
+          VALUES (${user.name}, ${user.email})
+          ON CONFLICT (email) DO NOTHING
+        `;
+      }
+    });
+
+    imported += batch.length;
+    console.log(`Imported ${imported}/${users.length} users`);
+  }
+
+  return imported;
+}
+```
+
+### Query Builder Pattern
+
+```typescript
+import { SQL } from "bun";
+
+class QueryBuilder {
+  private conditions: string[] = [];
+  private params: any[] = [];
+  private paramIndex = 1;
+
+  where(column: string, operator: string, value: any): this {
+    this.conditions.push(`${column} ${operator} $${this.paramIndex}`);
+    this.params.push(value);
+    this.paramIndex++;
+    return this;
+  }
+
+  whereLike(column: string, pattern: string): this {
+    return this.where(column, "ILIKE", pattern);
+  }
+
+  whereIn(column: string, values: any[]): this {
+    const placeholders = values.map((_, i) => `$${this.paramIndex + i}`);
+    this.conditions.push(`${column} IN (${placeholders.join(", ")})`);
+    this.params.push(...values);
+    this.paramIndex += values.length;
+    return this;
+  }
+
+  build(table: string, columns = "*"): { query: string; params: any[] } {
+    const where = this.conditions.length > 0
+      ? `WHERE ${this.conditions.join(" AND ")}`
+      : "";
+    return {
+      query: `SELECT ${columns} FROM ${table} ${where}`,
+      params: this.params,
+    };
+  }
+}
+
+// Usage
+const db = new SQL(process.env.DATABASE_URL!);
+const builder = new QueryBuilder()
+  .where("age", ">=", 18)
+  .whereLike("name", "%john%")
+  .whereIn("status", ["active", "pending"]);
+
+const { query, params } = builder.build("users");
+const results = await db.unsafe(query, ...params);
+```
+
+![Performance Metrics](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Real-World Use Cases
+
+### API Backend with Database
+
+Build a REST API with Bun's built-in HTTP server and Bun SQL for data persistence. The zero-dependency approach means your entire backend — HTTP server, routing, database access, and business logic — runs with just Bun installed. No `node_modules` directory, no dependency management, no security audits of third-party database drivers.
+
+### Data Migration Scripts
+
+Write data migration scripts that read from one database and write to another. Bun SQL's support for multiple database drivers means you can connect to PostgreSQL and SQLite in the same script, making cross-database migrations straightforward.
+
+### Analytics and Reporting
+
+Build analytics dashboards that query large datasets. Bun SQL's native implementation handles large result sets efficiently, and the tagged template literal syntax makes complex analytical queries readable and maintainable.
+
+### Real-Time Applications
+
+Build real-time applications that poll the database for changes. Bun SQL's connection pooling ensures that frequent queries don't exhaust database connections, and the native implementation minimizes latency.
+
+## Best Practices for Production
+
+1. **Use connection strings from environment variables**: Never hardcode database credentials. Use `process.env.DATABASE_URL` and configure connection strings in your deployment environment.
+
+2. **Leverage tagged template literals for all user input**: Always use `${value}` interpolation instead of string concatenation. This prevents SQL injection and ensures proper type handling.
+
+3. **Use transactions for multi-statement operations**: Wrap related operations in `db.begin()` to ensure atomicity. If any statement fails, the entire transaction is rolled back.
+
+4. **Close connections when shutting down**: Call `db.close()` when your application exits to properly release database connections. Register SIGINT/SIGTERM handlers for graceful shutdown.
+
+5. **Use prepared statements for repeated queries**: For queries executed in loops or with high frequency, prepare them once and execute multiple times to reduce parsing overhead.
+
+6. **Handle connection errors gracefully**: Database connections can fail due to network issues, server restarts, or connection limits. Implement retry logic with exponential backoff for transient failures.
+
+7. **Use `.unsafe()` for dynamic queries carefully**: When you need to construct queries dynamically (e.g., from user-defined filters), use `db.unsafe()` with proper parameter binding. Never interpolate user input directly into SQL strings.
+
+8. **Monitor connection pool health**: Track connection pool utilization to identify bottlenecks. If queries are frequently waiting for connections, increase the pool size or optimize query performance.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| String concatenation in queries | SQL injection vulnerability | Always use tagged template literal interpolation |
+| Not closing connections | Connection pool exhaustion | Close `SQL` instances on shutdown; use connection pooling |
+| Large result sets in memory | Out of memory errors | Use pagination with `LIMIT` and `OFFSET` |
+| Missing transaction rollback | Partial data corruption | Use `db.begin()` for multi-statement operations |
+| Ignoring connection errors | Silent failures | Implement error handling and retry logic |
+
+### Debugging Queries
+
+Bun SQL logs queries when the `DEBUG` environment variable is set:
+
+```bash
+DEBUG=bun:sql bun run server.ts
+```
+
+This outputs each query with its parameters and execution time, making it easy to identify slow queries and debugging issues.
+
+## Performance Optimization
+
+### Batch Operations
+
+```typescript
+import { SQL } from "bun";
+
+const db = new SQL(process.env.DATABASE_URL!);
+
+// Instead of individual inserts (slow)
+for (const item of items) {
+  await db`INSERT INTO items (data) VALUES (${item})`;
+}
+
+// Use batch insert (fast)
+await db.begin(async (tx) => {
+  for (const item of items) {
+    await tx`INSERT INTO items (data) VALUES (${item})`;
+  }
+});
+```
+
+### Connection Pool Tuning
+
+```typescript
+import { SQL } from "bun";
+
+// Configure pool size for high-traffic applications
+const db = new SQL({
+  url: process.env.DATABASE_URL!,
+  max: 20,        // Maximum connections in pool
+  idleTimeout: 30, // Close idle connections after 30 seconds
+  connectionTimeout: 5, // Fail if connection can't be established in 5 seconds
+});
+```
+
+## Comparison with Alternatives
+
+| Feature | Bun SQL | pg | mysql2 | better-sqlite3 | Prisma |
+|---------|---------|----|----|----------------|--------|
+| Built-in | Yes | No | No | No | No |
+| Dependencies | 0 | 1 | 1 | 1 | Many |
+| PostgreSQL | Yes | Yes | No | No | Yes |
+| MySQL | Yes | No | Yes | No | Yes |
+| SQLite | Yes | No | No | Yes | Yes |
+| Template literals | Yes | No | No | No | No |
+| Connection pooling | Yes | Yes | Yes | N/A | Yes |
+| Transactions | Yes | Yes | Yes | Yes | Yes |
+| TypeScript | Native | Types | Types | Types | Generated |
+| Bundle size | 0 KB | ~200 KB | ~150 KB | ~300 KB | ~2 MB |
+
+## Advanced Patterns
+
+### Multi-Database Applications
+
+```typescript
+import { SQL } from "bun";
+
+// Connect to multiple databases simultaneously
+const appDb = new SQL(process.env.APP_DATABASE_URL!);
+const analyticsDb = new SQL(process.env.ANALYTICS_DATABASE_URL!);
+
+// Query from both databases
+const user = await appDb`SELECT * FROM users WHERE id = ${userId}`;
+const activity = await analyticsDb`
+  SELECT * FROM events
+  WHERE user_id = ${userId}
+  ORDER BY created_at DESC LIMIT 10
+`;
+```
+
+### Database Health Check
+
+```typescript
+import { SQL } from "bun";
+
+async function checkDatabaseHealth(connectionString: string): Promise<boolean> {
+  try {
+    const db = new SQL(connectionString);
+    await db`SELECT 1`;
+    db.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+```
+
+## Testing Strategies
+
+### Testing Database Code
+
+```typescript
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { SQL } from "bun";
+
+let db: SQL;
+
+beforeAll(async () => {
+  db = new SQL("sqlite::memory:");
+  await db`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)`;
+});
+
+afterAll(() => {
+  db.close();
+});
+
+test("UserService.create inserts a user", async () => {
+  const [user] = await db`
+    INSERT INTO users (name, email)
+    VALUES (${"Alice"}, ${"alice@test.com"})
+    RETURNING *
+  `;
+  expect(user.name).toBe("Alice");
+  expect(user.email).toBe("alice@test.com");
+});
+```
+
+## Future Outlook
+
+Bun SQL is still in active development, with the Bun team adding support for more database features and improving performance. Future versions may include support for more database engines, streaming results for large queries, and deeper integration with Bun's ORM ecosystem.
+
+The zero-dependency approach aligns with Bun's philosophy of providing a complete runtime. As more applications adopt Bun, we can expect Bun SQL to become the default database access method for Bun projects, reducing the complexity of dependency management and improving security posture.
 
 ## Conclusion
 
-Bun SQL: Built-in Database Client is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Bun SQL eliminates the dependency overhead of database access in JavaScript applications. By providing a built-in, high-performance SQL client with support for PostgreSQL, MySQL, and SQLite, Bun simplifies application architecture while maintaining the flexibility developers need.
+
+Key takeaways:
+
+1. **Zero dependencies**: Bun SQL is built into the runtime, eliminating the need for third-party database drivers and reducing bundle size.
+2. **Tagged template literals**: Automatic parameter binding prevents SQL injection and provides a clean, readable query syntax.
+3. **Connection pooling**: Built-in connection management handles pool sizing, connection recycling, and error recovery automatically.
+4. **Transaction support**: First-class transaction API with automatic rollback ensures data consistency.
+5. **Native performance**: Zig implementation provides faster query execution than JavaScript-based alternatives.
+
+Start by connecting Bun SQL to your existing database and migrating one query at a time. The tagged template literal syntax is compatible with existing SQL, making adoption incremental and low-risk.
