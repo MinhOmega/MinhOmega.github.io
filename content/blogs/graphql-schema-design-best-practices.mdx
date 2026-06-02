@@ -399,7 +399,59 @@ A social network schema uses polymorphic types for different content types (post
 
 ## Performance Optimization
 
-Design your schema to minimize resolver execution. Use `@defer` and `@stream` for large responses, implement DataLoader for batching, and consider field-level caching for expensive computations:
+GraphQL's flexible querying means clients can request deeply nested data that triggers cascading resolver calls—the classic N+1 problem. Design your schema and resolvers to minimize database queries and computation.
+
+### DataLoader for Batching
+
+DataLoader batches multiple individual loads into a single request within a single tick of the event loop. Without it, fetching 50 posts and their authors results in 51 database queries. With DataLoader, it's 2:
+
+```typescript
+import DataLoader from "dataloader";
+
+const userLoader = new DataLoader(async (ids: string[]) => {
+  const users = await db.user.findMany({
+    where: { id: { in: ids } },
+  });
+  // DataLoader requires the return order to match the input order
+  const userMap = new Map(users.map((u) => [u.id, u]));
+  return ids.map((id) => userMap.get(id) ?? null);
+});
+
+const resolvers = {
+  Post: {
+    author: (post) => userLoader.load(post.authorId),
+  },
+};
+```
+
+Always scope DataLoader instances to the request lifecycle. A shared DataLoader across requests would cache stale data and leak information between users.
+
+### Query Complexity Analysis
+
+Prevent expensive queries from consuming server resources by analyzing query complexity before execution. Assign costs to fields and reject queries that exceed a threshold:
+
+```typescript
+import { createComplexityRule } from "graphql-query-complexity";
+
+const rule = createComplexityRule({
+  maximumComplexity: 1000,
+  estimators: [
+    simpleEstimator({ defaultComplexity: 1 }),
+    fieldExtensionsEstimator(),
+  ],
+  onComplete: (complexity) => {
+    if (complexity > 1000) {
+      throw new Error(`Query too complex: ${complexity}/1000`);
+    }
+  },
+});
+```
+
+Fields with pagination, nested relationships, or expensive computations should have higher complexity scores. This prevents a single malicious or poorly written query from degrading performance for everyone.
+
+### Field-Level Caching
+
+For computed fields like `readingTime`, `averageRating`, or `totalRevenue`, cache the result at the resolver level or use Apollo's `@cacheControl` directive to set HTTP-level cache headers:
 
 ```typescript
 const typePolicies = {
@@ -415,6 +467,90 @@ const typePolicies = {
   },
 };
 ```
+
+Pair resolver-level caching with response-level caching (CDN or Apollo Router cache) for frequently accessed fields. Public data like blog post content can be cached aggressively; user-specific data should not.
+
+## Input Validation with Union Return Types
+
+A common mistake is returning the entity type directly from mutations and hoping clients check the `errors` array. Instead, use **union return types** that force clients to handle every possible outcome:
+
+```graphql
+union CreatePostResult = CreatePostSuccess | ValidationError | AuthorizationError | NotFoundError
+
+type CreatePostSuccess {
+  post: Post!
+}
+
+type ValidationError {
+  field: String!
+  message: String!
+  code: String!
+}
+
+type AuthorizationError {
+  requiredRole: String!
+  message: String!
+}
+
+type NotFoundError {
+  resource: String!
+  id: ID!
+}
+```
+
+In the resolver, pattern-match on the result:
+
+```typescript
+const resolvers = {
+  CreatePostResult: {
+    __resolveType(obj) {
+      if (obj.post) return "CreatePostSuccess";
+      if (obj.field) return "ValidationError";
+      if (obj.requiredRole) return "AuthorizationError";
+      if (obj.resource) return "NotFoundError";
+      return null;
+    },
+  },
+
+  Mutation: {
+    createPost: async (_, { input }, { user, db }) => {
+      if (!user) {
+        return { requiredRole: "AUTHOR", message: "Must be logged in" };
+      }
+
+      const errors = validatePostInput(input);
+      if (errors.length > 0) return errors[0]; // Return first error
+
+      const category = await db.category.findUnique({ where: { id: input.categoryId } });
+      if (!category) {
+        return { resource: "Category", id: input.categoryId };
+      }
+
+      const post = await db.post.create({ data: { ...input, authorId: user.id } });
+      return { post };
+    },
+  },
+};
+```
+
+On the client, TypeScript code generation from your schema generates discriminated unions, so handling each case is type-safe:
+
+```typescript
+const result = await client.mutate({ mutation: CREATE_POST, variables: { input } });
+switch (result.data?.createPost.__typename) {
+  case "CreatePostSuccess":
+    navigate(`/posts/${result.data.createPost.post.slug}`);
+    break;
+  case "ValidationError":
+    showFieldError(result.data.createPost.field, result.data.createPost.message);
+    break;
+  case "AuthorizationError":
+    showLoginPrompt();
+    break;
+}
+```
+
+This pattern eliminates the ambiguity of "did the mutation succeed or fail?" and makes your API self-documenting about every possible outcome.
 
 ## Comparison with Alternatives
 
