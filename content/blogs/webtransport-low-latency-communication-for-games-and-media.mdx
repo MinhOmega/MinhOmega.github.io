@@ -17,6 +17,98 @@ This guide focuses on practical implementation for game developers and media eng
 
 ![Gaming and media](https://images.unsplash.com/photo-1538481199705-c710c4e965fc?w=800&h=400&fit=crop)
 
+## Why QUIC Changes Everything
+
+WebTransport is built on QUIC, the protocol that also powers HTTP/3. Understanding QUIC's design helps explain why WebTransport performs so well for real-time applications.
+
+### UDP Foundation Without the Drawbacks
+
+Raw UDP gives you speed but no reliability, ordering, or congestion control. QUIC adds these features at the transport layer while preserving UDP's key advantage: no head-of-line blocking between independent streams. In TCP, if packet 5 is lost, packets 6-100 are all blocked until packet 5 is retransmitted. In QUIC, each stream is independently reliable—a lost packet on stream A doesn't block stream B.
+
+For WebTransport, this means you can have multiple reliable bidirectional streams running simultaneously, and a loss on one stream won't affect the others. Combined with the unreliable datagram channel, you get the best of both worlds: ordered, reliable delivery where you need it (chat messages, game events) and fire-and-forget speed where you don't (position updates, voice data).
+
+### Connection Migration
+
+QUIC connections survive network changes. When a player switches from WiFi to cellular mid-game, the connection continues seamlessly because QUIC connections are identified by a connection ID, not by the IP address and port tuple that TCP uses. This is a massive improvement for mobile gaming, where network transitions are frequent.
+
+### 0-RTT Connection Establishment
+
+QUIC supports 0-RTT resumption for returning clients. The first connection requires a TLS 1.3 handshake (1 RTT), but subsequent connections can send data immediately (0 RTT). For games where players reconnect after brief disconnects, this means near-instant reconnection instead of the multi-second delay imposed by TCP + TLS.
+
+```javascript
+// Connection with 0-RTT support
+async function connectToGame(url) {
+  const transport = new WebTransport(url, {
+    // Enable 0-RTT for returning connections
+    serverCertificateHashes: [{
+      algorithm: 'sha-256',
+      value: await getServerCertHash(url),
+    }],
+  });
+
+  await transport.ready;
+  console.log(`Connected in ${transport.rtt}ms RTT`);
+  return transport;
+}
+```
+
+### Browser Support and Fallbacks
+
+WebTransport is supported in Chrome 97+, Edge 97+, and Firefox 114+. Safari support is in development. For browsers that don't support WebTransport, you need a fallback strategy:
+
+```javascript
+class RealTimeTransport {
+  constructor(url) {
+    this.url = url;
+  }
+
+  async connect() {
+    if (typeof WebTransport !== 'undefined') {
+      this.transport = new WebTransport(this.url);
+      await this.transport.ready;
+      this.mode = 'webtransport';
+    } else if (typeof WebSocket !== 'undefined') {
+      this.transport = new WebSocket(this.url.replace('https:', 'wss:'));
+      await new Promise((resolve, reject) => {
+        this.transport.onopen = resolve;
+        this.transport.onerror = reject;
+      });
+      this.mode = 'websocket';
+    }
+
+    return this;
+  }
+
+  async sendDatagram(data) {
+    if (this.mode === 'webtransport') {
+      const writer = this.transport.datagrams.writable.getWriter();
+      await writer.write(data);
+      writer.releaseLock();
+    } else {
+      // WebSocket fallback: prefix unreliable data with flag byte
+      const packet = new Uint8Array(data.length + 1);
+      packet[0] = 0x00; // unreliable flag
+      packet.set(data, 1);
+      this.transport.send(packet);
+    }
+  }
+
+  async sendReliable(data) {
+    if (this.mode === 'webtransport') {
+      const stream = await this.transport.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(data);
+      await writer.close();
+    } else {
+      const packet = new Uint8Array(data.length + 1);
+      packet[0] = 0x01; // reliable flag
+      packet.set(data, 1);
+      this.transport.send(packet);
+    }
+  }
+}
+```
+
 ## Understanding Latency in Real-Time Applications
 
 ### The Latency Budget
@@ -501,6 +593,157 @@ class AudioStreamReceiver {
 | No adaptive quality | Buffering under poor network | Monitor and adapt quality |
 | Buffering datagrams | Latency increase | Process datagrams immediately |
 | Missing keyframe requests | Video freezes after packet loss | Request keyframes on decode errors |
+
+## Connection Management and Error Handling
+
+WebTransport connections can fail for various reasons: network drops, server crashes, or graceful shutdowns. Robust applications need to handle all of these cases:
+
+```javascript
+class ManagedTransport {
+  constructor(url, options = {}) {
+    this.url = url;
+    this.reconnectDelay = options.reconnectDelay || 1000;
+    this.maxReconnectDelay = options.maxReconnectDelay || 30000;
+    this.listeners = new Map();
+    this.state = 'disconnected';
+  }
+
+  async connect() {
+    this.state = 'connecting';
+    try {
+      this.transport = new WebTransport(this.url);
+
+      // Monitor connection state
+      this.transport.closed.then((info) => {
+        console.log('Connection closed:', info.reason);
+        this.state = 'disconnected';
+        this.emit('disconnected', info);
+        this.scheduleReconnect();
+      }).catch((error) => {
+        console.error('Connection error:', error);
+        this.state = 'disconnected';
+        this.emit('error', error);
+        this.scheduleReconnect();
+      });
+
+      await this.transport.ready;
+      this.state = 'connected';
+      this.reconnectAttempt = 0;
+      this.emit('connected');
+    } catch (error) {
+      this.state = 'disconnected';
+      this.emit('error', error);
+      this.scheduleReconnect();
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.state === 'reconnecting') return;
+    this.state = 'reconnecting';
+
+    const delay = Math.min(
+      this.reconnectDelay * Math.pow(2, this.reconnectAttempt || 0),
+      this.maxReconnectDelay
+    );
+    this.reconnectAttempt = (this.reconnectAttempt || 0) + 1;
+
+    console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    setTimeout(() => this.connect(), delay);
+  }
+
+  async send(data, reliable = false) {
+    if (this.state !== 'connected') {
+      console.warn('Cannot send: not connected');
+      return false;
+    }
+
+    try {
+      if (reliable) {
+        const stream = await this.transport.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        await writer.write(data);
+        await writer.close();
+      } else {
+        const writer = this.transport.datagrams.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
+      }
+      return true;
+    } catch (error) {
+      console.error('Send error:', error);
+      return false;
+    }
+  }
+
+  on(event, callback) {
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push(callback);
+  }
+
+  emit(event, data) {
+    const callbacks = this.listeners.get(event) || [];
+    for (const cb of callbacks) cb(data);
+  }
+}
+```
+
+### Security Considerations
+
+WebTransport requires HTTPS in production. The connection is always encrypted via TLS 1.3, which is enforced at the protocol level. There are several security considerations for game and media applications:
+
+**Authentication**: Authenticate players during the initial connection handshake. Use the reliable stream to exchange tokens before allowing datagram access:
+
+```javascript
+async function authenticateSession(transport, token) {
+  const stream = await transport.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const reader = stream.readable.getReader();
+
+  // Send auth token
+  await writer.write(new TextEncoder().encode(JSON.stringify({
+    type: 'auth',
+    token: token,
+  })));
+
+  // Read auth response
+  const { value } = await reader.read();
+  const response = JSON.parse(new TextDecoder().decode(value));
+
+  if (!response.success) {
+    transport.close();
+    throw new Error('Authentication failed');
+  }
+
+  return response.playerId;
+}
+```
+
+**Rate Limiting**: Implement server-side rate limiting on datagram processing to prevent denial-of-service attacks. A malicious client could flood the server with datagrams at high frequency:
+
+```javascript
+class DatagramRateLimiter {
+  constructor(maxPerSecond = 120) {
+    this.maxPerSecond = maxPerSecond;
+    this.counters = new Map();
+  }
+
+  allow(playerId) {
+    const now = Math.floor(Date.now() / 1000);
+    const key = `${playerId}:${now}`;
+    const count = (this.counters.get(key) || 0) + 1;
+    this.counters.set(key, count);
+
+    // Clean old entries
+    for (const [k] of this.counters) {
+      if (!k.endsWith(`:${now}`)) this.counters.delete(k);
+    }
+
+    return count <= this.maxPerSecond;
+  }
+}
+```
+
+**Input Validation**: Never trust client-side data. Validate all datagram payloads on the server to prevent cheating and injection attacks. Check that position values are within bounds, input sequences are monotonically increasing, and packet sizes are within expected ranges.
 
 ## Conclusion
 

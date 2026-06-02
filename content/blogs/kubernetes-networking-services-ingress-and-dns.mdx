@@ -15,19 +15,858 @@ Understanding how Services, Ingress, and DNS work together is essential for anyo
 
 ![Kubernetes networking architecture overview](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-## Understanding Kubernetes Networking: Core Concepts
+## The Kubernetes Networking Model: Three Layers of Communication
 
-Kubernetes implements a flat networking model where every pod gets its own IP address, and any pod can communicate with any other pod without NAT. This model is achieved through the Container Network Interface (CNI), which handles pod-to-pod networking across nodes. Popular CNI implementations include Calico, Flannel, Cilium, and Weave, each offering different features like network policies, encryption, and observability.
+Kubernetes implements a flat networking model where every pod gets its own IP address, and any pod can communicate with any other pod without NAT. This model is achieved through the Container Network Interface (CNI), which handles pod-to-pod networking across nodes. The networking stack operates on three distinct layers, each solving a specific problem.
 
-The Kubernetes networking model has three primary concerns: container-to-container communication within a pod (handled by the pod's network namespace), pod-to-pod communication across nodes (handled by the CNI plugin), and external-to-internal communication (handled by Services and Ingress). Each layer builds on the previous one, creating a comprehensive networking stack.
+### Layer 1: Container-to-Container Communication
 
-Pods are assigned IP addresses from a pod CIDR range configured on each node. When a pod is deleted and rescheduled, it receives a new IP address. This ephemeral nature is precisely why Services exist—they provide stable virtual IPs that persist regardless of pod lifecycle events.
+Within a pod, containers share the same network namespace, meaning they share the same IP address and port space. Containers in the same pod can communicate via `localhost`, which is how sidecar patterns work. For example, an Envoy proxy sidecar can intercept traffic on port 8080 while the application container listens on port 8081, with the sidecar forwarding requests after applying policies.
+
+```yaml
+# Pod with sidecar proxy pattern
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-proxy
+spec:
+  containers:
+  - name: app
+    image: my-app:1.0
+    ports:
+    - containerPort: 8081
+  - name: envoy-sidecar
+    image: envoyproxy/envoy:v1.28-latest
+    ports:
+    - containerPort: 8080
+    volumeMounts:
+    - name: envoy-config
+      mountPath: /etc/envoy
+  volumes:
+  - name: envoy-config
+    configMap:
+      name: envoy-config
+```
+
+### Layer 2: Pod-to-Pod Communication Across Nodes
+
+The Container Network Interface (CNI) plugin is responsible for pod-to-pod networking across nodes. Popular CNI implementations include Calico, Flannel, Cilium, and Weave, each offering different features like network policies, encryption, and observability.
+
+**Calico** uses BGP (Border Gateway Protocol) for routing and supports rich network policies. It's the default CNI for many managed Kubernetes services and offers excellent performance through eBPF-based dataplane options.
+
+**Flannel** is the simplest CNI, providing basic overlay networking using VXLAN or host-gw backends. It doesn't support network policies natively, making it suitable only for development clusters.
+
+**Cilium** is the most advanced CNI, leveraging eBPF for高性能 networking, observability, and security. It replaces kube-proxy entirely and provides Hubble for network visibility. Cilium supports advanced features like bandwidth manager, host-level firewalling, and multi-cluster networking.
+
+```bash
+# Check your cluster's CNI plugin
+kubectl get daemonset -n kube-system | grep -E "calico|flannel|cilium|weave"
+
+# View CNI configuration on a node
+ls /etc/cni/net.d/
+
+# Check pod CIDR ranges
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+```
+
+### Layer 3: External-to-Internal Communication
+
+Services and Ingress handle external traffic entering the cluster. Services provide stable virtual IPs at Layer 4 (TCP/UDP), while Ingress provides HTTP/HTTPS routing at Layer 7. This layered approach allows you to expose applications securely without exposing pod IPs directly.
 
 The kube-proxy component runs on every node and maintains network rules that allow communication to Services. It operates in three modes: iptables (default), IPVS, and userspace. Iptables mode uses kernel-level packet filtering for efficient routing, while IPVS mode provides better performance for large-scale deployments with thousands of Services through hash-table-based lookups instead of linear rule scanning.
 
-DNS resolution in Kubernetes is handled by CoreDNS, which runs as a Deployment in the kube-system namespace. CoreDNS watches the Kubernetes API for new Services and Pods, automatically creating DNS records that enable service discovery by name rather than IP address. This DNS-based discovery is the primary mechanism applications use to find and communicate with other services in the cluster.
-
 ![Kubernetes cluster networking diagram](https://images.unsplash.com/photo-1667372393119-3d4c48d07fc9?w=800&h=400&fit=crop)
+
+## Service Types: The Foundation of Kubernetes Networking
+
+Kubernetes offers four Service types, each designed for specific networking scenarios. Understanding when to use each type is crucial for proper application architecture.
+
+### ClusterIP: Internal Service Discovery
+
+ClusterIP is the default Service type and provides internal-only access within the cluster. When you create a ClusterIP Service, Kubernetes assigns a virtual IP from the Service CIDR range, and kube-proxy programs rules to route traffic from that IP to the backing pods.
+
+```yaml
+# ClusterIP Service with session affinity
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  labels:
+    app: api-server
+spec:
+  type: ClusterIP
+  selector:
+    app: api-server
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 1800
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+```
+
+ClusterIP Services are ideal for internal microservices that don't need external access. The virtual IP remains stable even as pods scale up/down or get rescheduled, providing reliable service discovery.
+
+### NodePort: Direct Node Access
+
+NodePort builds on ClusterIP by opening a specific port (30000-32767) on every node in the cluster. External traffic can reach the Service by hitting any node's IP on that port. NodePort is useful for development and testing but is rarely used in production because it requires managing port assignments and doesn't integrate with load balancers or SSL termination.
+
+```yaml
+# NodePort Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080
+    protocol: TCP
+```
+
+### LoadBalancer: Cloud Provider Integration
+
+LoadBalancer extends NodePort by provisioning an external load balancer through your cloud provider. When you create a LoadBalancer Service, the cloud controller manager creates a load balancer (like an AWS ELB or GCP Load Balancer) that routes traffic to the NodePort, which then routes to your pods.
+
+```yaml
+# LoadBalancer Service with health checks
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+  annotations:
+    # AWS-specific annotations
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: web
+  externalTrafficPolicy: Local
+  ports:
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+```
+
+**Important**: Each LoadBalancer Service provisions a separate external load balancer, which can be expensive. Use a single Ingress controller with multiple Ingress resources to consolidate external access points.
+
+### ExternalName: DNS CNAME Mapping
+
+ExternalName maps a Service to a DNS name using a CNAME record. It doesn't use selectors or define ports—it simply returns a CNAME record pointing to an external service.
+
+```yaml
+# ExternalName Service for external database
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-database
+spec:
+  type: ExternalName
+  externalName: database.prod.example.com
+```
+
+This is useful for integrating external services into your Kubernetes service discovery without proxying traffic through the cluster.
+
+## CoreDNS: The Service Discovery Backbone
+
+DNS resolution in Kubernetes is handled by CoreDNS, which runs as a Deployment in the kube-system namespace. CoreDNS watches the Kubernetes API for new Services and Pods, automatically creating DNS records that enable service discovery by name rather than IP address.
+
+### DNS Naming Conventions
+
+Kubernetes DNS follows a predictable naming convention:
+
+- **Service**: `<service-name>.<namespace>.svc.cluster.local`
+- **Pod**: `<pod-ip-dashed>.<namespace>.pod.cluster.local`
+- **SRV records**: `_http._tcp.<service-name>.<namespace>.svc.cluster.local`
+
+Within the same namespace, you can use just `<service-name>`. Cross-namespace references require `<service-name>.<namespace>`.
+
+### Headless Services for StatefulSets
+
+Headless Services (those with `clusterIP: None`) create individual DNS A records for each pod backing the Service. This is essential for StatefulSets where clients need to connect to specific pod instances, such as database primaries versus replicas.
+
+```yaml
+# Headless Service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+```
+
+Each pod gets a DNS entry: `postgres-0.postgres.default.svc.cluster.local`, `postgres-1.postgres.default.svc.cluster.local`, etc. This allows application code to connect to specific instances for primary/replica routing.
+
+### DNS Debugging Techniques
+
+DNS issues are among the most common networking problems in Kubernetes. Here's how to debug them:
+
+```bash
+# Deploy a debug pod
+kubectl run dns-debug --image=busybox:1.36 --rm -it --restart=Never -- sh
+
+# Test DNS resolution
+nslookup api-server.default.svc.cluster.local
+nslookup kubernetes.default.svc.cluster.local
+
+# Check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100
+
+# Verify CoreDNS ConfigMap
+kubectl get configmap coredns -n kube-system -o yaml
+
+# Check if DNS is working for external domains
+nslookup google.com
+
+# Test SRV records
+nslookup -type=SRV _http._tcp.api-server.default.svc.cluster.local
+```
+
+Common DNS issues include:
+- **DNS timeout**: Usually indicates CoreDNS pods are unhealthy or network policies are blocking DNS traffic
+- **NXDOMAIN**: Service doesn't exist or wrong namespace
+- **SERVFAIL**: CoreDNS configuration error or upstream DNS issues
+
+## Ingress: Layer 7 HTTP Routing
+
+Ingress is a higher-level abstraction that provides HTTP and HTTPS routing to Services based on hostnames and URL paths. While Services operate at Layer 4 (TCP/UDP), Ingress operates at Layer 7 (HTTP/HTTPS), enabling advanced routing rules, SSL termination, and virtual hosting.
+
+### Ingress Controllers Compared
+
+An Ingress resource defines routing rules, but it requires an Ingress Controller to actually implement those rules. Here's a comparison of popular controllers:
+
+| Controller | Performance | Features | Best For |
+|-----------|-------------|----------|----------|
+| **NGINX Ingress** | High | Mature, extensive annotations | General purpose, complex routing |
+| **Traefik** | Very High | Auto-discovery, Let's Encrypt | Dynamic environments, microservices |
+| **HAProxy** | Highest | TCP/UDP support, connection draining | High-performance, low-latency |
+| **Istio Gateway** | High | Service mesh integration | Advanced traffic management |
+| **AWS ALB** | High | Native AWS integration | AWS workloads |
+| **Contour** | High | Envoy-based, Gateway API | Modern Kubernetes |
+
+### Ingress with Path-Based Routing
+
+A single domain can route to multiple backend services based on URL path:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: unified-api
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: platform.example.com
+    http:
+      paths:
+      - path: /auth
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port:
+              number: 80
+      - path: /users
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
+      - path: /orders
+        pathType: Prefix
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 80
+      - path: /notifications
+        pathType: Prefix
+        backend:
+          service:
+            name: notification-service
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - platform.example.com
+    secretName: platform-tls
+```
+
+### Configuring HTTPS with cert-manager
+
+For production deployments, you need SSL termination at the Ingress level. cert-manager automates certificate provisioning from Let's Encrypt:
+
+```yaml
+# ClusterIssuer for Let's Encrypt
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+---
+# Ingress with automatic TLS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: production-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-app
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: app-tls-cert
+```
+
+![Ingress controller routing traffic](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+## NetworkPolicies: Controlling Traffic Flow
+
+NetworkPolicies are Kubernetes' native mechanism for controlling pod-to-pod communication. By default, all pods can communicate with all other pods. NetworkPolicies allow you to restrict this based on labels, namespaces, and IP blocks.
+
+### Default Deny Policy
+
+Start with a default deny policy that blocks all ingress and egress traffic, then explicitly allow only what's needed:
+
+```yaml
+# Default deny all ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+---
+# Default deny all egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+```
+
+### Allow Specific Traffic Patterns
+
+```yaml
+# Allow frontend to backend communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+---
+# Allow backend to database communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-database
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: database
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: backend
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+### Namespace-Based Isolation
+
+For multi-tenant environments, isolate traffic between namespaces:
+
+```yaml
+# Allow traffic only from same namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: tenant-a
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector: {}
+---
+# Allow ingress from ingress controller namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: tenant-a
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+## Service Mesh Integration
+
+For advanced traffic management, mutual TLS, and observability, consider integrating a service mesh like Istio or Linkerd.
+
+### Linkerd: Lightweight Service Mesh
+
+Linkerd provides automatic mTLS, traffic splitting, and observability with minimal configuration:
+
+```yaml
+# Enable Linkerd on a namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  annotations:
+    linkerd.io/inject: enabled
+---
+# Traffic split for canary deployments
+apiVersion: split.smi-spec.io/v1alpha4
+kind: TrafficSplit
+metadata:
+  name: api-canary
+  namespace: production
+spec:
+  service: api-service
+  backends:
+  - service: api-service-stable
+    weight: 900
+  - service: api-service-canary
+    weight: 100
+```
+
+### Istio: Full-Featured Service Mesh
+
+Istio provides comprehensive traffic management, security, and observability:
+
+```yaml
+# VirtualService for traffic routing
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-routing
+spec:
+  hosts:
+  - api-service
+  http:
+  - match:
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: api-service
+        subset: canary
+  - route:
+    - destination:
+        host: api-service
+        subset: stable
+      weight: 90
+    - destination:
+        host: api-service
+        subset: canary
+      weight: 10
+---
+# DestinationRule for load balancing
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-destination
+spec:
+  host: api-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: DEFAULT
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+```
+
+## Performance Optimization
+
+Kubernetes networking introduces overhead at every layer. Understanding where latency accumulates helps you optimize effectively.
+
+### kube-proxy Mode Selection
+
+For high-throughput Services, IPVS mode outperforms iptables significantly. Switch kube-proxy to IPVS mode when you have more than 1,000 Services:
+
+```yaml
+# kube-proxy ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    mode: "ipvs"
+    ipvs:
+      scheduler: "rr"
+      minSyncPeriod: "0s"
+      syncPeriod: "30s"
+```
+
+### Connection Pooling
+
+Use connection pooling in your application code to reduce the overhead of establishing new connections through the Service proxy:
+
+```typescript
+// Connection pooling example with Kubernetes service discovery
+import { Agent } from 'undici';
+
+const pool = new Agent({
+  connections: 10,
+  pipelining: 1,
+  keepAliveTimeout: 60000,
+  keepAliveMaxTimeout: 600000,
+});
+
+async function callService(serviceName: string, path: string) {
+  const url = `http://${serviceName}.default.svc.cluster.local${path}`;
+  const response = await fetch(url, {
+    dispatcher: pool,
+  });
+  return response.json();
+}
+```
+
+### Topology-Aware Routing
+
+For latency-sensitive applications, use Topology Aware Routing to keep traffic within the same availability zone:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: latency-sensitive-api
+  annotations:
+    service.kubernetes.io/topology-mode: Auto
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+## Real-World Use Cases
+
+### Multi-Tenant SaaS Platform
+
+A SaaS platform serving multiple customers needs traffic isolation between tenants. Using namespace-based segmentation with NetworkPolicies and Ingress routing by subdomain provides clean isolation. Each tenant gets its own namespace, and Ingress routes `<tenant>.app.com` to the corresponding namespace's services. NetworkPolicies prevent cross-tenant traffic at the pod level, while ResourceQuotas ensure fair resource allocation.
+
+### Canary Deployments with Ingress
+
+Ingress controllers like NGINX support traffic splitting through annotations, enabling canary deployments:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-v2
+            port:
+              number: 80
+```
+
+### gRPC Service Integration
+
+gRPC services require HTTP/2 support. NGINX Ingress supports gRPC by setting the backend protocol annotation:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grpc-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: grpc.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grpc-service
+            port:
+              number: 50051
+  tls:
+  - hosts:
+    - grpc.example.com
+    secretName: grpc-tls
+```
+
+## Gateway API: The Future of Kubernetes Networking
+
+The Gateway API is the successor to Ingress, providing a more expressive, role-oriented model. It introduces three resource types:
+
+- **GatewayClass**: Defines the infrastructure provider (similar to StorageClass)
+- **Gateway**: Cluster operator configures which ports, protocols, and certificates to use
+- **HTTPRoute/GRPCRoute/TLSRoute/TCPRoute**: Application developers define routing rules
+
+```yaml
+# GatewayClass
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: istio
+spec:
+  controllerName: istio.io/gateway-controller
+---
+# Gateway
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: production-gateway
+  namespace: istio-system
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        name: wildcard-tls
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+# HTTPRoute
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: production
+spec:
+  parentRefs:
+  - name: production-gateway
+    namespace: istio-system
+  hostnames:
+  - "api.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    backendRefs:
+    - name: api-v1
+      port: 80
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v2
+    backendRefs:
+    - name: api-v2
+      port: 80
+```
+
+Gateway API offers several advantages over Ingress:
+- **Role separation**: Infrastructure team manages Gateways, application team manages Routes
+- **Protocol support**: Native support for gRPC, TCP, UDP, and TLS
+- **Header-based routing**: Match on headers, query params, and method
+- **Traffic splitting**: Built-in support for weighted backends
+- **Cross-namespace references**: Routes can reference Gateways in other namespaces
+
+## Testing and Validation
+
+Test your networking configuration before deploying to production:
+
+```bash
+# Deploy a debug pod
+kubectl run debug --image=busybox --rm -it --restart=Never -- sh
+
+# Inside the debug pod, test DNS resolution
+nslookup api-server.default.svc.cluster.local
+nslookup api-server
+
+# Test HTTP connectivity
+wget -qO- http://api-server/health
+
+# Check all endpoints for a Service
+kubectl get endpoints api-server
+
+# Verify NetworkPolicies
+kubectl get networkpolicies -n production
+kubectl describe networkpolicy allow-frontend-to-backend -n production
+
+# Test from a specific namespace
+kubectl run debug-prod --image=busybox --rm -it --restart=Never -n production -- sh
+nslookup api-server.production.svc.cluster.local
+```
+
+For automated testing, write integration tests that verify Service discovery and Ingress routing:
+
+```typescript
+import { describe, it, expect } from 'vitest';
+
+describe('Kubernetes Networking', () => {
+  it('should resolve service DNS within the same namespace', async () => {
+    const response = await fetch('http://api-server/health');
+    expect(response.status).toBe(200);
+  });
+
+  it('should resolve cross-namespace service DNS', async () => {
+    const response = await fetch('http://api-server.production.svc.cluster.local/health');
+    expect(response.status).toBe(200);
+  });
+
+  it('should route Ingress traffic based on host header', async () => {
+    const response = await fetch('http://INGRESS_IP/api/v1/status', {
+      headers: { Host: 'api.example.com' },
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it('should return 404 for unknown Ingress hosts', async () => {
+    const response = await fetch('http://INGRESS_IP/', {
+      headers: { Host: 'unknown.example.com' },
+    });
+    expect(response.status).toBe(404);
+  });
+});
+```
+
+## Common Pitfalls and Solutions
+
+| Pitfall | Impact | Solution |
+|---------|--------|----------|
+| Using `hostNetwork: true` on pods | Port conflicts and security exposure | Use Services and Ingress for external access |
+| Not setting `externalTrafficPolicy: Local` | Loss of client source IP | Set `externalTrafficPolicy: Local` on LoadBalancer Services |
+| Ingress without Ingress Controller | Ingress resources have no effect | Always install an Ingress Controller first |
+| DNS caching in applications | Stale endpoint resolution | Set appropriate TTL and use headless Services |
+| Missing NetworkPolicies | Unrestricted pod-to-pod communication | Implement default deny policies |
+| Overriding cluster DNS | Service discovery failures | Use `dnsPolicy: ClusterFirst` (default) |
+| Too many LoadBalancer Services | High cloud costs | Use Ingress to consolidate external access |
+| Ignoring CoreDNS performance | DNS resolution delays | Scale CoreDNS replicas for large clusters |
+
+## Best Practices Checklist
+
+1. **Use NetworkPolicies by default**: Define restrictive policies that only allow explicitly permitted traffic
+2. **Implement health checks**: Configure readiness and liveness probes on all pods
+3. **Set resource requests and limits**: Ingress controllers consume CPU and memory
+4. **Use cert-manager for TLS**: Automates issuance, renewal, and secret management
+5. **Monitor kube-proxy and CoreDNS**: Set up alerts for restarts and latency spikes
+6. **Prefer Ingress over LoadBalancer**: Consolidate external access points
+7. **Enable topology-aware routing**: Reduce cross-zone latency and costs
+8. **Document DNS naming conventions**: Maintain service discovery documentation
+9. **Use Gateway API for new deployments**: More expressive than Ingress
+10. **Implement service mesh gradually**: Start with mTLS, add traffic management as needed
+
+## Conclusion
+
+Kubernetes networking through Services, Ingress, and DNS forms the backbone of any production cluster. Services provide stable endpoints for ephemeral pods, Ingress enables HTTP routing with SSL termination, and DNS automates service discovery across namespaces.
+
+Key takeaways: use ClusterIP for internal services, Ingress for external HTTP access, and cert-manager for automated TLS. Implement NetworkPolicies from day one, monitor CoreDNS and kube-proxy health, and consider the Gateway API for new deployments. Start with the simplest networking configuration that meets your needs, and add complexity only when the trade-offs justify it.
+
+For further reading, consult the official Kubernetes networking documentation, the Gateway API specification, and your CNI plugin's documentation for advanced features like network policies and encryption.
+
+---
+
+![Kubernetes networking](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
 
 ## Architecture and Design Patterns
 
