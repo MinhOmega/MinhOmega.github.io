@@ -145,6 +145,85 @@ result = analyze_sentiment("This laptop is amazing for coding but the battery li
 # )
 ```
 
+### Anthropic Structured Output with Tool Use
+
+Anthropic's approach to structured output uses tool use (function calling) rather than a dedicated response format parameter. Define a tool with your desired schema and force the model to call it:
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+def extract_entities(text: str) -> dict:
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        tools=[{
+            "name": "extract_entities",
+            "description": "Extract named entities from text",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "people": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {
+                            "name": {"type": "string"},
+                            "role": {"type": "string"},
+                            "organization": {"type": "string"},
+                        }},
+                    },
+                    "locations": {"type": "array", "items": {"type": "string"}},
+                    "dates": {"type": "array", "items": {"type": "string"}},
+                    "organizations": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["people", "locations", "dates", "organizations"],
+            },
+        }],
+        tool_choice={"type": "tool", "name": "extract_entities"},
+        messages=[{"role": "user", "content": f"Extract entities from: {text}"}],
+    )
+
+    # The response contains a tool_use block with the structured data
+    for block in response.content:
+        if block.type == "tool_use":
+            return block.input
+    return {}
+```
+
+### Google Gemini Structured Output
+
+Google's Gemini API supports structured output through the `response_mime_type` and `response_schema` parameters:
+
+```python
+import google.generativeai as genai
+
+genai.configure(api_key="YOUR_API_KEY")
+
+schema = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "authors": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+        "key_findings": {"type": "array", "items": {"type": "string"}},
+        "methodology": {"type": "string", "enum": ["experimental", "observational", "review", "meta-analysis"]},
+        "confidence": {"type": "number"},
+    },
+    "required": ["title", "authors", "summary", "key_findings", "methodology"],
+}
+
+model = genai.GenerativeModel("gemini-pro")
+response = model.generate_content(
+    "Analyze this research paper abstract: ...",
+    generation_config=genai.GenerationConfig(
+        response_mime_type="application/json",
+        response_schema=schema,
+    ),
+)
+# response.text contains valid JSON matching the schema
+```
+
 ### Multi-Level Nested Schemas
 
 ```typescript
@@ -273,6 +352,53 @@ const CommentSchema: z.ZodType<Comment> = z.lazy(() => z.object({
 ### Progressive Extraction
 
 For complex documents, extract progressively — first get the document type, then extract type-specific fields in a follow-up request. This improves accuracy by narrowing the model's focus at each step.
+
+### Retry Strategies for Production Reliability
+
+Even with structured output, network errors and rate limits can cause failures. Implement exponential backoff with jitter and distinguish between retryable errors (rate limits, timeouts) and permanent errors (invalid schema, content policy violations):
+
+```typescript
+async function extractWithRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt === maxRetries) throw error;
+      if (error.status === 429 || error.status >= 500) {
+        const delay = Math.min(1000 * 2 ** attempt, 10000);
+        const jitter = Math.random() * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay + jitter));
+        continue;
+      }
+      throw error; // Non-retryable error
+    }
+  }
+  throw new Error('Unreachable');
+}
+```
+
+### Streaming with Structured Output
+
+For real-time applications, combine streaming with structured output to progressively populate fields as the model generates them. OpenAI's streaming API emits partial JSON that you can parse incrementally:
+
+```typescript
+const stream = await openai.beta.chat.completions.stream({
+  model: 'gpt-4o-2024-08-06',
+  messages: [{ role: 'user', content: text }],
+  response_format: zodResponseFormat(ContactInfo, 'contact'),
+});
+
+for await (const event of stream) {
+  const partial = event.choices[0]?.delta?.content;
+  if (partial) {
+    // Update UI with partial structured data
+    updateUI(JSON.parse(partial));
+  }
+}
+```
 
 ## Testing Strategies
 
