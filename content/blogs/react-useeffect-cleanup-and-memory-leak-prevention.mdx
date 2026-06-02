@@ -1,0 +1,365 @@
+---
+title: "React useEffect Cleanup and Memory Leak Prevention"
+date: "2019-02-15"
+description: "Master React useEffect cleanup: prevent memory leaks with proper cleanup functions, AbortController, and subscription patterns."
+tags: ["React", "Hooks", "JavaScript", "Performance"]
+published: true
+author: "MinhVo"
+---
+
+## Introduction
+
+The useEffect hook is one of React's most powerful and commonly used hooks, but its cleanup mechanism is often misunderstood or completely overlooked. When you return a cleanup function from useEffect, React calls it when the component unmounts or before the effect runs again due to dependency changes. This cleanup phase is critical for preventing memory leaks, canceling network requests, unsubscribing from event listeners, and clearing timers.
+
+Consider a component that subscribes to a WebSocket connection. Without proper cleanup, each time the component re-renders and the effect re-runs, a new WebSocket connection opens while the old one remains active. Over time, this creates dozens or even hundreds of orphaned connections, consuming memory and bandwidth. The cleanup function ensures that only one connection exists at any time.
+
+```jsx
+import { useEffect, useState } from 'react';
+
+function useWebSocket(url) {
+  const [messages, setMessages] = useState([]);
+  
+  useEffect(() => {
+    const ws = new WebSocket(url);
+    
+    ws.onmessage = (event) => {
+      setMessages(prev => [...prev, JSON.parse(event.data)]);
+    };
+    
+    // Cleanup: close the WebSocket when effect re-runs or component unmounts
+    return () => {
+      ws.close();
+    };
+  }, [url]); // Re-run only if url changes
+  
+  return messages;
+}
+```
+
+The dependency array plays a crucial role in determining when cleanup runs. If you omit the dependency array entirely, the effect runs after every render, and the cleanup runs before every re-render. If you provide an empty array, the effect runs once after mount, and cleanup runs once on unmount. With specific dependencies, cleanup runs before each re-execution triggered by dependency changes.
+
+Understanding this lifecycle is essential for building robust React applications. A common mistake is forgetting to include all reactive values in the dependency array, which leads to stale closures where the cleanup function references outdated values. The ESLint rule exhaustive-deps helps catch these issues during development.
+
+## Understanding the useEffect Lifecycle
+
+![frontend illustration](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+The useEffect hook is one of React's most powerful and commonly used hooks, but its cleanup mechanism is often misunderstood or completely overlooked. When you return a cleanup function from useEffect, React calls it when the component unmounts or before the effect runs again due to dependency changes. This cleanup phase is critical for preventing memory leaks, canceling network requests, unsubscribing from event listeners, and clearing timers.
+
+Consider a component that subscribes to a WebSocket connection. Without proper cleanup, each time the component re-renders and the effect re-runs, a new WebSocket connection opens while the old one remains active. Over time, this creates dozens or even hundreds of orphaned connections, consuming memory and bandwidth. The cleanup function ensures that only one connection exists at any time.
+
+```jsx
+import { useEffect, useState } from 'react';
+
+function useWebSocket(url) {
+  const [messages, setMessages] = useState([]);
+  
+  useEffect(() => {
+    const ws = new WebSocket(url);
+    
+    ws.onmessage = (event) => {
+      setMessages(prev => [...prev, JSON.parse(event.data)]);
+    };
+    
+    // Cleanup: close the WebSocket when effect re-runs or component unmounts
+    return () => {
+      ws.close();
+    };
+  }, [url]); // Re-run only if url changes
+  
+  return messages;
+}
+```
+
+The dependency array plays a crucial role in determining when cleanup runs. If you omit the dependency array entirely, the effect runs after every render, and the cleanup runs before every re-render. If you provide an empty array, the effect runs once after mount, and cleanup runs once on unmount. With specific dependencies, cleanup runs before each re-execution triggered by dependency changes.
+
+Understanding this lifecycle is essential for building robust React applications. A common mistake is forgetting to include all reactive values in the dependency array, which leads to stale closures where the cleanup function references outdated values. The ESLint rule exhaustive-deps helps catch these issues during development.
+
+## AbortController for Fetch Requests
+
+One of the most common sources of memory leaks in React applications is unmanaged fetch requests. When a user navigates away from a page while a fetch is still in progress, the component unmounts, but the fetch promise continues running. When it resolves, it tries to update state on an unmounted component, leading to the famous "Can't perform a React state update on an unmounted component" warning and potential memory leaks.
+
+The AbortController API provides a clean solution for canceling fetch requests. By creating an AbortController instance and passing its signal to the fetch options, you can abort the request when the component unmounts or when a new request should supersede the previous one.
+
+```jsx
+function useFetchData(url) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = controller.signal;
+
+    setLoading(true);
+    setError(null);
+
+    fetch(url, { signal })
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        if (!signal.aborted) {
+          setData(data);
+          setLoading(false);
+        }
+      })
+      .catch(err => {
+        if (err.name !== 'AbortError') {
+          setError(err.message);
+          setLoading(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [url]);
+
+  return { data, loading, error };
+}
+```
+
+Notice how we check `signal.aborted` before updating state and filter out `AbortError` from the catch block. This prevents the state-update-on-unmounted-component warning and ensures clean error handling. Modern libraries like Axios and TanStack Query also support AbortController natively.
+
+For more complex scenarios like search-as-you-type, where rapid input changes trigger many requests, AbortController prevents race conditions where an older, slower response overwrites a newer one. Each time the search term changes, the previous request is aborted before a new one begins.
+
+## Event Listener Cleanup Patterns
+
+Event listeners are another frequent source of memory leaks in React applications. When you add an event listener in useEffect but forget to remove it in the cleanup function, the listener persists even after the component unmounts. This keeps a reference to the component's closure in memory, preventing garbage collection of the entire component tree.
+
+The pattern for safe event listener management always follows the same structure: add the listener in the effect body, and remove it in the cleanup function. The function reference must be identical for both addEventListener and removeEventListener, which means you should define the handler as a named function rather than an inline arrow function.
+
+```jsx
+function useWindowSize() {
+  const [size, setSize] = useState({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
+
+  useEffect(() => {
+    function handleResize() {
+      setSize({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+    }
+
+    window.addEventListener('resize', handleResize);
+    
+    // Cleanup uses the exact same function reference
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []); // Empty deps: only run on mount/unmount
+
+  return size;
+}
+```
+
+For event listeners attached to DOM elements accessed via refs, the pattern is similar but requires the ref to be populated. Use a callback ref or ensure the ref is available before attaching listeners. When dealing with third-party libraries that have their own event subscription APIs, always check the documentation for unsubscribe or destroy methods, and call them in your cleanup function.
+
+Passive event listeners, specified via `{ passive: true }` in the options, improve scroll performance but don't affect cleanup semantics. You still need to remove them in the cleanup function. Some modern React patterns avoid manual event listeners entirely by using event handler props or libraries like @tanstack/react-query that manage subscriptions internally.
+
+## Timer and Interval Cleanup in React
+
+![frontend illustration](https://images.unsplash.com/photo-1517180102446-f3ece451e9d8?w=800&h=400&fit=crop)
+
+Timers created with setTimeout and setInterval are among the most overlooked sources of memory leaks. When a component sets up a timer in useEffect without clearing it in the cleanup function, the timer continues firing after the component unmounts. The callback function holds references to the component's closure, preventing garbage collection and potentially causing errors when it tries to update unmounted state.
+
+The cleanup pattern for timers is straightforward: store the timer ID returned by setTimeout or setInterval, and pass it to clearTimeout or clearInterval in the cleanup function. The timer ID is a numeric value that uniquely identifies the timer in the browser's timer queue.
+
+```jsx
+function useDebounce(value, delay) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timerId = setTimeout(() => {
+      setDebouncedValue(value);
+    }, delay);
+
+    return () => clearTimeout(timerId);
+  }, [value, delay]);
+
+  return debouncedValue;
+}
+```
+
+The debounce hook above demonstrates a clean pattern: each time `value` or `delay` changes, the previous timer is cleared and a new one is created. This ensures only the last value in a rapid sequence triggers the debounced update. Without cleanup, every keystroke would create a new timer, and all of them would eventually fire, causing a cascade of state updates.
+
+For setInterval, the cleanup is equally important. A common pattern is a polling mechanism that fetches data at regular intervals. The cleanup ensures that when the component unmounts or the polling URL changes, the old interval stops rather than continuing to fire requests to a stale endpoint.
+
+```jsx
+function usePolling(url, interval = 5000) {
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fetchData() {
+      const res = await fetch(url);
+      const json = await res.json();
+      if (!cancelled) setData(json);
+    }
+
+    fetchData(); // Initial fetch
+    const id = setInterval(fetchData, interval);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [url, interval]);
+
+  return data;
+}
+```
+
+## Subscription Cleanup and Observer Patterns
+
+Modern web applications frequently subscribe to observable data sources: RxJS streams, Firebase listeners, Supabase realtime channels, Redux stores, and browser APIs like IntersectionObserver and MutationObserver. Each subscription creates a reference from the external source back to your component, and without proper cleanup, these references persist indefinitely.
+
+The universal pattern for managing subscriptions in useEffect follows the subscribe-then-unsubscribe approach. The subscription call returns an unsubscribe function or an object with an unsubscribe method, which you store and call in the cleanup function.
+
+```jsx
+function useSupabaseRealtime(table, filter) {
+  const [records, setRecords] = useState([]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel(`realtime-${table}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table, filter },
+        (payload) => {
+          setRecords(prev => {
+            switch (payload.eventType) {
+              case 'INSERT':
+                return [...prev, payload.new];
+              case 'UPDATE':
+                return prev.map(r => r.id === payload.new.id ? payload.new : r);
+              case 'DELETE':
+                return prev.filter(r => r.id !== payload.old.id);
+              default:
+                return prev;
+            }
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [table, filter]);
+
+  return records;
+}
+```
+
+IntersectionObserver and MutationObserver follow a similar pattern but use a `disconnect()` method instead of `unsubscribe()`. The key insight is that you should always create the observer inside the effect body and disconnect it in the cleanup function, rather than creating a singleton observer outside the effect.
+
+When working with RxJS subscriptions, the cleanup pattern involves calling `subscription.unsubscribe()` or using the `takeUntil` operator with a destroy subject. The subject-based approach is particularly elegant because you can share a single destroy subject across multiple subscriptions in a component, unsubscribing from all of them simultaneously when the component unmounts.
+
+## Custom Hooks for Resource Cleanup
+
+Custom hooks encapsulate resource management logic and ensure consistent cleanup behavior across your application. By abstracting the subscribe-unsubscribe or create-destroy pattern into a reusable hook, you eliminate the risk of forgetting cleanup in individual components and create a single source of truth for resource management.
+
+A well-designed resource hook manages the full lifecycle: initialization, state synchronization, error handling, and cleanup. It handles edge cases like rapid remounting in React Strict Mode, where effects run twice during development, and it gracefully handles errors that occur during cleanup itself.
+
+```jsx
+function useAbortableEffect(effectFn, deps) {
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
+    async function run() {
+      try {
+        await effectFn(controller.signal, () => cancelled);
+      } catch (err) {
+        if (!cancelled && err.name !== 'AbortError') {
+          console.error('Effect error:', err);
+        }
+      }
+    }
+
+    run();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, deps);
+}
+```
+
+The pattern of combining a cancellation flag with an AbortController provides defense in depth. The AbortController handles network request cancellation, while the flag handles general cleanup logic that doesn't support abort signals. This dual approach ensures that no side effect persists after unmount regardless of the timing of asynchronous operations.
+
+For complex components with multiple resources, consider creating a composite cleanup hook that manages all resources together. This approach ensures a consistent cleanup order and makes it easy to reason about resource lifecycle. The composite hook can also expose a forceCleanup method for testing purposes, allowing tests to verify that cleanup handles all resources correctly without waiting for component unmount.
+
+## React Strict Mode and Double Effects
+
+![frontend illustration](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+
+React 18's Strict Mode intentionally double-invokes effects during development to help developers identify missing cleanup functions. This behavior simulates the effect of a component mounting, unmounting, and remounting in rapid succession, which happens in production during hot reloading, route transitions, and Suspense boundary fallbacks. If your effects don't clean up properly, Strict Mode exposes the issue immediately.
+
+The double-invocation pattern works as follows: React mounts the component, runs all effects, unmounts the component (running all cleanup functions), then immediately remounts and runs all effects again. This means your effect body runs twice and your cleanup runs once between the two executions. If any resource isn't properly cleaned up, you'll see duplicated subscriptions, doubled network requests, or stale state.
+
+```jsx
+// This component works correctly in Strict Mode
+function useDocumentTitle(title) {
+  useEffect(() => {
+    const previousTitle = document.title;
+    document.title = title;
+
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [title]);
+}
+```
+
+Without the cleanup that restores the previous title, Strict Mode would set the title, then the cleanup would not run between the two effect executions, and the second execution would set it again. While this specific case is benign, the pattern demonstrates why cleanup matters: in production, if a component remounts due to an error boundary recovery, the cleanup ensures no side effect persists from the previous mount.
+
+To make your effects Strict Mode compatible, always ensure that your effect can be cleanly torn down and re-established. Avoid side effects that cannot be undone, like incrementing a global counter or appending to a persistent array without corresponding decrement or removal in cleanup. If you must perform an irreversible side effect, use a ref to track whether the effect has already been executed and skip the irreversible part on re-execution.
+
+## Cleanup with React Router Navigation
+
+When users navigate between routes in a React Router application, components unmount and new ones mount. Any subscriptions, timers, or connections established in useEffect must be cleaned up during unmount, but the timing and behavior can be surprising if you're not careful with dependency arrays and router-specific patterns.
+
+A common issue occurs with data fetching tied to route parameters. When a user navigates from /users/1 to /users/2, the component doesn't unmount and remount—it re-renders with new params. The useEffect dependencies must include the route parameter to trigger cleanup and re-fetch. If the param is missing from the dependency array, the effect runs once and never re-fetches, showing stale data.
+
+```jsx
+function UserProfile() {
+  const { userId } = useParams();
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+
+    fetch(`/api/users/${userId}`, { signal: controller.signal })
+      .then(res => res.json())
+      .then(data => {
+        setUser(data);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (err.name !== 'AbortError') setLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [userId]); // userId in deps ensures re-fetch on navigation
+
+  if (loading) return <Spinner />;
+  return <Profile user={user} />;
+}
+```
+
+The AbortController cleanup is especially important here because route transitions happen quickly. If a user clicks through several user profiles rapidly, each navigation aborts the previous request, preventing race conditions where an older, slower response overwrites newer data. Without abort, the UI might flash between different users' data as responses arrive out of order.
+
+For WebSocket connections tied to routes, cleanup ensures the connection closes when navigating away. The connection should be established with the route parameter in the dependency array, and the cleanup function should close the socket. This pattern is common in real-time dashboards, chat rooms, and collaborative editing interfaces where each route represents a different room or document.
+
+## Conclusion
+
+The topics covered in this article represent important developments in modern software engineering. By understanding these concepts deeply and applying them in your projects, you can build more robust, scalable, and maintainable systems. Continue exploring, experimenting, and building — the technology landscape rewards those who stay curious and keep learning.

@@ -6,6 +6,7 @@ import { ArrowLeft } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { ScrollToTop } from "@/components/scroll-to-top";
 
 type BlogPageProps = {
   params: {
@@ -143,6 +144,7 @@ export default async function BlogPage({ params }: BlogPageProps) {
           </div>
         </article>
       </div>
+      <ScrollToTop />
     </main>
   );
 }
