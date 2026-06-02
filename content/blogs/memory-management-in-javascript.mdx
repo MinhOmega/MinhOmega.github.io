@@ -91,6 +91,32 @@ const different = { ...person };
 // Heap:  [new heap address] -> { name: 'Bob', age: 30 }
 ```
 
+### String Memory and Internalization
+
+JavaScript engines optimize string storage through a technique called string internalization (or interning). When the same string literal appears multiple times in code, the engine stores it once and shares the reference. This optimization is why comparing strings by reference (`===`) works for literals but may not work for dynamically constructed strings.
+
+```javascript
+// String internalization
+const a = "hello";
+const b = "hello";
+console.log(a === b); // true (same reference due to interning)
+
+// Dynamically constructed strings may not be interned
+const c = "hel" + "lo"; // Still interned (compile-time concatenation)
+const d = ["hel", "lo"].join("lo"); // Not interned
+console.log(a === c); // true
+console.log(a === d); // true (same value, different references)
+
+// String concatenation creates new strings
+let str = "";
+for (let i = 0; i < 10000; i++) {
+    str += "x"; // Creates a new string each iteration
+}
+// Better: use Array.join()
+const parts = new Array(10000).fill("x");
+const result = parts.join(""); // Single allocation
+```
+
 ## Garbage Collection
 
 ### Mark-and-Sweep Algorithm
@@ -119,9 +145,9 @@ result = null; // Now localVar is unreachable, eligible for GC
 
 V8 (Chrome, Node.js) uses generational garbage collection based on the observation that most objects die young (the "generational hypothesis"):
 
-**Young Generation**: New objects are allocated here. This space is small and collected frequently using the Scavenge algorithm, which is fast but has overhead. Objects that survive multiple minor GC cycles are promoted to the old generation.
+**Young Generation (Nursery)**: New objects are allocated here in one of two semi-spaces (From-Space and To-Space). This space is small (typically 1-8 MB) and collected frequently using the Scavenge algorithm. The Scavenge algorithm copies live objects from From-Space to To-Space, then swaps the spaces. Objects that survive two minor GC cycles are promoted to the old generation.
 
-**Old Generation**: Objects that survive multiple minor GC cycles are promoted here. This space is larger and collected less frequently using Mark-Sweep-Compact, which is slower but more thorough. Long-lived objects like caches and singletons end up here.
+**Old Generation**: Objects that survive multiple minor GC cycles are promoted here. This space is larger and collected less frequently using Mark-Sweep-Compact, which is slower but more thorough. Long-lived objects like caches, singletons, and module-level state end up here.
 
 ```javascript
 // Young generation (short-lived) - collected frequently
@@ -144,11 +170,27 @@ class ApplicationState {
 
 Modern garbage collectors use incremental and concurrent techniques to minimize pause times:
 
-**Incremental Collection**: Breaks the marking phase into smaller steps, interleaving them with application execution. This prevents long pauses that would freeze the UI.
+**Incremental Collection**: Breaks the marking phase into smaller steps, interleaving them with application execution. This prevents long pauses that would freeze the UI. V8 uses an incremental marker that processes a portion of the object graph per step.
 
-**Concurrent Collection**: Performs marking on background threads while the application continues running. Only short synchronization pauses are needed for specific operations.
+**Concurrent Collection**: Performs marking on background threads while the application continues running. Only short synchronization pauses are needed for specific operations like updating references. V8's concurrent marker uses multiple threads to parallelize the marking work.
 
-**Idle Collection**: Uses requestIdleCallback to perform garbage collection during idle periods, minimizing impact on user-visible performance.
+**Idle Collection**: Uses `requestIdleCallback` to perform garbage collection during idle periods, minimizing impact on user-visible performance. This is particularly effective for collecting objects in the old generation.
+
+**Parallel Collection**: The Scavenge algorithm in the young generation runs in parallel on multiple threads, reducing the time spent in minor GC pauses. On a 4-core machine, this can reduce minor GC time by 60-70%.
+
+```javascript
+// Monitor GC pauses in Node.js
+const { PerformanceObserver } = require('perf_hooks');
+
+const obs = new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+        if (entry.entryType === 'gc') {
+            console.log(`GC ${entry.kind}: ${entry.duration.toFixed(2)}ms`);
+        }
+    }
+});
+obs.observe({ entryTypes: ['gc'] });
+```
 
 ## Common Memory Leak Patterns
 
@@ -178,11 +220,11 @@ class Component {
         this.handleClick = this.handleClick.bind(this);
         document.addEventListener('click', this.handleClick);
     }
-    
+
     handleClick() {
         console.log('clicked');
     }
-    
+
     // Missing destroy method!
 }
 
@@ -192,7 +234,7 @@ class Component {
         this.handleClick = this.handleClick.bind(this);
         document.addEventListener('click', this.handleClick);
     }
-    
+
     destroy() {
         document.removeEventListener('click', this.handleClick);
     }
@@ -205,7 +247,7 @@ class Component {
 // Leak: Closure keeps reference to large data
 function createProcessor() {
     const largeData = new Array(1000000).fill('x');
-    
+
     return function process() {
         // largeData is captured and never freed
         return largeData.length;
@@ -217,12 +259,14 @@ function createProcessor() {
     let largeData = new Array(1000000).fill('x');
     const length = largeData.length;
     largeData = null; // Allow GC
-    
+
     return function process() {
         return length;
     };
 }
 ```
+
+Closures are a particularly insidious source of leaks because the captured variables are not always obvious. Modern JavaScript engines use escape analysis to determine which variables a closure actually accesses, but the analysis has limits. If a closure references any variable in its enclosing scope, the entire scope may be retained even if most variables in that scope are never used by the closure.
 
 ### 4. Detached DOM Elements
 
@@ -248,6 +292,8 @@ function removeElement(index) {
 }
 ```
 
+A related pattern occurs in single-page applications where route transitions create new DOM trees. If the old DOM tree is referenced by JavaScript closures (event handlers, state subscriptions), the entire tree is retained in memory even after being removed from the document. React's `useEffect` cleanup, Vue's `onUnmounted`, and Angular's `ngOnDestroy` are essential for breaking these references.
+
 ### 5. Uncleared Timers
 
 ```javascript
@@ -259,7 +305,7 @@ class Poller {
             this.fetchData();
         }, 5000);
     }
-    
+
     async fetchData() {
         const response = await fetch('/api/data');
         this.data = await response.json();
@@ -274,7 +320,7 @@ class Poller {
             this.fetchData();
         }, 5000);
     }
-    
+
     destroy() {
         clearInterval(this.intervalId);
     }
@@ -289,7 +335,7 @@ const cache = new Map();
 
 function getCachedData(key) {
     if (cache.has(key)) return cache.get(key);
-    
+
     const data = expensiveComputation(key);
     cache.set(key, data); // Grows forever!
     return data;
@@ -301,16 +347,16 @@ class LRUCache {
         this.cache = new Map();
         this.maxSize = maxSize;
     }
-    
+
     get(key) {
         if (!this.cache.has(key)) return undefined;
-        
+
         const value = this.cache.get(key);
         this.cache.delete(key);
         this.cache.set(key, value); // Move to end
         return value;
     }
-    
+
     set(key, value) {
         if (this.cache.has(key)) {
             this.cache.delete(key);
@@ -318,9 +364,84 @@ class LRUCache {
             const oldestKey = this.cache.keys().next().value;
             this.cache.delete(oldestKey);
         }
-        
+
         this.cache.set(key, value);
     }
+}
+```
+
+### 7. Event Emitter Accumulation
+
+```javascript
+// Leak: Listeners accumulate without cleanup
+class EventBus {
+    constructor() {
+        this.listeners = new Map();
+    }
+
+    on(event, callback) {
+        if (!this.listeners.has(event)) {
+            this.listeners.set(event, []);
+        }
+        this.listeners.get(event).push(callback);
+    }
+
+    // Missing off() method
+}
+
+// Fix: Provide cleanup mechanism
+class EventBus {
+    constructor() {
+        this.listeners = new Map();
+    }
+
+    on(event, callback) {
+        if (!this.listeners.has(event)) {
+            this.listeners.set(event, []);
+        }
+        const listeners = this.listeners.get(event);
+        listeners.push(callback);
+
+        // Return unsubscribe function
+        return () => {
+            const index = listeners.indexOf(callback);
+            if (index > -1) listeners.splice(index, 1);
+        };
+    }
+
+    off(event, callback) {
+        const listeners = this.listeners.get(event);
+        if (!listeners) return;
+        const index = listeners.indexOf(callback);
+        if (index > -1) listeners.splice(index, 1);
+    }
+}
+```
+
+### 8. Promise Chains and Async Leaks
+
+```javascript
+// Leak: Async operation retains closure scope
+function fetchDashboard() {
+    const largeDataset = loadLargeDataset(); // 50MB in memory
+
+    return fetch('/api/dashboard')
+        .then(response => response.json())
+        .then(data => {
+            // largeDataset is still in scope even though it's unused
+            return processDashboard(data);
+        });
+}
+
+// Fix: Break the closure chain
+function fetchDashboard() {
+    const largeDataset = loadLargeDataset();
+    const processed = processLocally(largeDataset);
+    // largeDataset can now be GC'd
+
+    return fetch('/api/dashboard')
+        .then(response => response.json())
+        .then(data => mergeResults(processed, data));
 }
 ```
 
@@ -328,17 +449,19 @@ class LRUCache {
 
 1. **Use strict mode**: Prevent accidental global variables with `'use strict'`.
 
-2. **Clean up event listeners**: Always remove event listeners when components are destroyed.
+2. **Clean up event listeners**: Always remove event listeners when components are destroyed. Use `AbortController` for fetch requests.
 
-3. **Nullify references**: Set references to `null` when you're done with large objects.
+3. **Nullify references**: Set references to `null` when you're done with large objects, especially in closures.
 
-4. **Use WeakMap/WeakSet**: For associations that shouldn't prevent garbage collection.
+4. **Use WeakMap/WeakSet**: For associations that shouldn't prevent garbage collection. DOM element metadata is a perfect use case.
 
-5. **Limit cache sizes**: Implement LRU caches with maximum size limits.
+5. **Limit cache sizes**: Implement LRU caches with maximum size limits. Use `WeakRef` for caches that should automatically evict under memory pressure.
 
-6. **Profile regularly**: Use Chrome DevTools Memory tab to identify leaks.
+6. **Profile regularly**: Use Chrome DevTools Memory tab to identify leaks. Take heap snapshots before and after user interactions.
 
-7. **Use AbortController**: Cancel fetch requests when components unmount.
+7. **Use AbortController**: Cancel fetch requests when components unmount to prevent callbacks from retaining closure scope.
+
+8. **Monitor in production**: Use `performance.memory` (Chrome) or `process.memoryUsage()` (Node.js) to track memory trends.
 
 ## Debugging Memory Leaks
 
@@ -362,6 +485,18 @@ if (performance.memory) {
 }
 ```
 
+### Three-Snapshot Technique
+
+The most effective way to find memory leaks is the three-snapshot technique:
+
+1. **Snapshot 1**: Take a heap snapshot after the page loads and stabilizes
+2. **Action**: Perform the action you suspect causes a leak (e.g., navigate to a page and back)
+3. **Snapshot 2**: Take another snapshot
+4. **Action**: Perform the same action again
+5. **Snapshot 3**: Take a final snapshot
+
+Compare Snapshot 2 and Snapshot 3, filtering by objects allocated between Snapshot 1 and Snapshot 2. Objects that appear in both comparisons are leaked—they were allocated during the first action and never freed.
+
 ### Programmatic Leak Detection
 
 ```javascript
@@ -369,7 +504,7 @@ class MemoryMonitor {
     constructor() {
         this.snapshots = [];
     }
-    
+
     snapshot(label) {
         if (performance.memory) {
             this.snapshots.push({
@@ -380,13 +515,13 @@ class MemoryMonitor {
             });
         }
     }
-    
+
     report() {
         for (let i = 1; i < this.snapshots.length; i++) {
             const prev = this.snapshots[i - 1];
             const curr = this.snapshots[i];
             const diff = curr.used - prev.used;
-            
+
             console.log(
                 `${prev.label} -> ${curr.label}: ${(diff / 1024).toFixed(2)} KB`
             );
@@ -401,6 +536,32 @@ monitor.snapshot('After');
 monitor.report();
 ```
 
+### Automated Leak Detection in Tests
+
+```javascript
+// Jest/Node.js leak detection
+describe('Memory leak tests', () => {
+    it('should not leak memory on component mount/unmount', () => {
+        const before = process.memoryUsage().heapUsed;
+
+        for (let i = 0; i < 100; i++) {
+            const component = new MyComponent();
+            component.mount();
+            component.unmount();
+        }
+
+        // Force GC
+        global.gc();
+
+        const after = process.memoryUsage().heapUsed;
+        const leaked = after - before;
+
+        // Allow 1MB tolerance
+        expect(leaked).toBeLessThan(1024 * 1024);
+    });
+});
+```
+
 ## Performance Optimization
 
 ### Object Pooling
@@ -413,24 +574,24 @@ class ObjectPool {
         this.createFn = createFn;
         this.resetFn = resetFn;
         this.pool = [];
-        
+
         for (let i = 0; i < initialSize; i++) {
             this.pool.push(createFn());
         }
     }
-    
+
     acquire() {
         if (this.pool.length > 0) {
             return this.pool.pop();
         }
         return this.createFn();
     }
-    
+
     release(obj) {
         this.resetFn(obj);
         this.pool.push(obj);
     }
-    
+
     get size() {
         return this.pool.length;
     }
@@ -455,6 +616,12 @@ function despawnParticle(particle) {
 }
 ```
 
+Object pooling is particularly effective for:
+- Game entities (particles, bullets, enemies)
+- Network request objects
+- DOM elements in virtual lists
+- Temporary buffers in data processing pipelines
+
 ### Avoiding Memory Churn
 
 ```javascript
@@ -470,17 +637,34 @@ for (let i = 0; i < 1000; i++) {
     temp.fill(0); // Reset instead of recreate
     process(temp);
 }
+
+// Bad: String concatenation in loop
+let html = '';
+for (const item of items) {
+    html += `<li>${item.name}</li>`; // Creates new string each iteration
+}
+
+// Good: Array join
+const parts = items.map(item => `<li>${item.name}</li>`);
+const html = parts.join('');
 ```
 
-## Comparison of Approaches
+### Typed Arrays for Large Data
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| Automatic GC | Easy to use, no manual work | Can cause pauses, less control |
-| Manual cleanup | Predictable, no pauses | Error-prone, complex |
-| WeakRef/FinalizationRegistry | Fine-grained control | Complex API, not widely supported |
-| Object pooling | Reduces allocations | More code to maintain |
-| Arena allocation | Very fast bulk allocation | All-or-nothing deallocation |
+When working with large numerical datasets, `TypedArray` (Float32Array, Int32Array, etc.) uses a contiguous memory buffer that is more memory-efficient than regular arrays and can be transferred to Web Workers without copying:
+
+```javascript
+// Regular array: each number is a boxed object (16+ bytes per element)
+const regular = [1.5, 2.5, 3.5, 4.5]; // ~64 bytes + overhead
+
+// Typed array: raw binary data (4 bytes per float32 element)
+const typed = new Float32Array([1.5, 2.5, 3.5, 4.5]); // 16 bytes
+
+// Large dataset comparison
+const size = 1000000;
+const regularLarge = new Array(size).fill(0); // ~16 MB
+const typedLarge = new Float32Array(size);      // ~4 MB
+```
 
 ## WeakRef and FinalizationRegistry
 
@@ -535,6 +719,8 @@ class WeakCache {
 }
 ```
 
+**Important caveat**: `FinalizationRegistry` callbacks are not guaranteed to run before the process exits. They are opportunistic—the engine runs them when it has idle time. Never use them for critical cleanup like closing file handles or network connections. Always provide explicit cleanup methods alongside finalizers.
+
 ## Memory Management in Node.js
 
 Node.js applications have additional memory considerations beyond the browser. The V8 engine in Node.js has configurable heap limits that affect how much memory your application can use:
@@ -566,6 +752,38 @@ setInterval(() => {
 }, 30000);
 ```
 
+### Detecting Memory Leaks in Production
+
+For long-running Node.js services, implement automated memory monitoring:
+
+```javascript
+class ProductionMemoryGuard {
+    constructor(options = {}) {
+        this.thresholdMB = options.thresholdMB || 512;
+        this.checkIntervalMs = options.checkIntervalMs || 60000;
+        this.onLeak = options.onLeak || (() => {});
+        this.interval = null;
+    }
+
+    start() {
+        this.interval = setInterval(() => {
+            const { heapUsed } = process.memoryUsage();
+            const heapMB = heapUsed / 1024 / 1024;
+
+            if (heapMB > this.thresholdMB) {
+                this.onLeak({ heapMB, threshold: this.thresholdMB });
+                // Take heap snapshot for post-mortem analysis
+                if (global.gc) global.gc();
+            }
+        }, this.checkIntervalMs);
+    }
+
+    stop() {
+        clearInterval(this.interval);
+    }
+}
+```
+
 ## Memory Management in Web Workers
 
 Web Workers have their own heap, separate from the main thread. This means a memory leak in a worker does not directly affect the main thread, but it can still crash the worker. When transferring large data between the main thread and workers, use Transferable objects to avoid copying:
@@ -586,6 +804,8 @@ self.onmessage = (event) => {
     processLargeDataset(data);
 };
 ```
+
+SharedArrayBuffer provides another option for worker communication—it allows multiple workers to access the same memory region simultaneously. This is useful for high-performance computing scenarios but requires careful synchronization with `Atomics` to avoid race conditions.
 
 ## Real-World Case Study: Single-Page Application
 
@@ -621,18 +841,31 @@ function Dashboard() {
 
 Without the cleanup function, every navigation to and from the Dashboard would leak a WebSocket connection and potentially an active fetch request. Over a user session with dozens of navigations, this accumulates significant memory and network resource waste.
 
+## Comparison of Approaches
+
+| Approach | Pros | Cons | Best For |
+|----------|------|------|----------|
+| Automatic GC | Easy to use, no manual work | Can cause pauses, less control | Most applications |
+| Manual cleanup | Predictable, no pauses | Error-prone, complex | Resource-critical code |
+| WeakRef/FinalizationRegistry | Fine-grained control | Complex API, not guaranteed | Caches, metadata |
+| Object pooling | Reduces allocations | More code to maintain | Games, real-time apps |
+| Typed Arrays | Memory-efficient, transferable | Numeric data only | Data processing, ML |
+| Arena allocation | Very fast bulk allocation | All-or-nothing deallocation | Compiler internals |
+
 ## Conclusion
 
 Understanding JavaScript memory management is essential for building performant applications. By recognizing common leak patterns and applying proper cleanup strategies, you can prevent memory-related performance issues.
 
 Key takeaways:
-1. JavaScript uses automatic garbage collection via mark-and-sweep
-2. V8 uses generational collection for efficiency
-3. Global variables, event listeners, and closures are common leak sources
-4. Always clean up resources when components are destroyed
-5. Use WeakMap/WeakSet for object associations
-6. Profile memory usage regularly with Chrome DevTools
-7. WeakRef and FinalizationRegistry provide fine-grained control for caches
+1. JavaScript uses automatic garbage collection via mark-and-sweep with generational optimization
+2. V8 uses concurrent and incremental collection to minimize pause times
+3. Global variables, event listeners, closures, and DOM references are common leak sources
+4. Always clean up resources when components are destroyed—use `AbortController`, remove listeners, close connections
+5. Use WeakMap/WeakSet for object associations that shouldn't prevent garbage collection
+6. Profile memory usage regularly with Chrome DevTools using the three-snapshot technique
+7. WeakRef and FinalizationRegistry provide fine-grained control for caches, but never rely on finalizers for critical cleanup
 8. Node.js servers require active memory monitoring for long-running processes
+9. Use object pooling and typed arrays to reduce garbage collection pressure in performance-critical code
+10. Transferable objects enable zero-copy data sharing with Web Workers
 
 Master memory management to build JavaScript applications that remain fast and responsive over extended usage periods.
