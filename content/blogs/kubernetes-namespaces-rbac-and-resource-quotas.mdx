@@ -399,7 +399,7 @@ Resource quotas and namespace labels enable cost allocation. By tagging namespac
 
 ### Hierarchical Namespaces
 
-Use tools like Hierarchical Namespace Controller (HNC) to create namespace hierarchies:
+The Hierarchical Namespace Controller (HNC) from Kubernetes SIGs enables namespace hierarchies where child namespaces inherit policies from their parents. This is invaluable for organizations with complex team structures where a platform team manages shared policies and individual teams inherit them automatically.
 
 ```yaml
 apiVersion: hnc.x-k8s.io/v1alpha2
@@ -411,9 +411,41 @@ spec:
   parent: payments
 ```
 
+HNC propagates RBAC RoleBindings, NetworkPolicies, and ResourceQuotas from parent to child namespaces. When you create a new team namespace under an existing parent, the child automatically inherits the parent's security baseline. You can then customize specific policies in the child without affecting the parent or sibling namespaces. HNC also provides `hierarchicalnamespaceness` (subnamespace anchor) objects that allow namespace administrators to create child namespaces without requiring cluster-level permissions—a critical capability for delegated namespace management.
+
+```bash
+# Install HNC
+kubectl apply -f https://github.com/kubernetes-sigs/hierarchical-namespaces/releases/latest/download/hnc-manager.yaml
+
+# View the namespace hierarchy
+kubectl hns tree payments
+# payments
+# ├── payments-production
+# ├── payments-staging
+# └── payments-development
+```
+
+### RBAC Auditing and Debugging
+
+Debugging RBAC issues is one of the most common operational challenges. Kubernetes provides built-in tools for testing permissions:
+
+```bash
+# Check if a user can perform an action
+kubectl auth can-i create deployments --namespace payments-production --as alice@company.com
+
+# Check if a service account can list secrets
+kubectl auth can-i list secrets --namespace payments-production --as system:serviceaccount:payments:payments-sa
+
+# List all permissions for a user (requires rbac-lookup or similar tools)
+kubectl get rolebindings,clusterrolebindings --all-namespaces -o json | \
+  jq -r '.items[] | select(.subjects[]?.name=="alice@company.com") | .metadata.namespace + "/" + .roleRef.name'
+```
+
+Tools like `kubectl-who-can`, `rbac-lookup`, and `rakkess` provide comprehensive RBAC visibility. Run regular audits to identify over-privileged service accounts and stale bindings. A common anti-pattern is granting `cluster-admin` temporarily for debugging and forgetting to revoke it.
+
 ### OPA/Gatekeeper Policies
 
-Enforce policies with Open Policy Agent:
+Open Policy Agent (OPA) Gatekeeper extends Kubernetes admission control with policy-as-code. Unlike built-in Pod Security Standards, Gatekeeper lets you define custom policies using the Rego language:
 
 ```yaml
 apiVersion: constraints.gatekeeper.sh/v1beta1
@@ -429,7 +461,19 @@ spec:
     labels:
     - key: "team"
     - key: "environment"
+---
+# Audit existing violations without blocking
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: Config
+metadata:
+  name: config
+  namespace: gatekeeper-system
+spec:
+  match:
+    - excludedNamespaces: ["kube-system", "gatekeeper-system"]
 ```
+
+Gatekeeper also supports audit mode, which reports policy violations on existing resources without blocking new admissions. This is essential for gradually enforcing policies on clusters with legacy workloads. You can run Gatekeeper in `dryrun` mode first to understand the impact before switching to `enforce`.
 
 ## Future Outlook
 
@@ -439,11 +483,73 @@ The trend toward platform engineering means that more organizations are building
 
 ## Network Policies for Namespace Isolation
 
-Resource quotas and RBAC control compute resources and API access, but network policies control pod-to-pod communication. By default, all pods in a Kubernetes cluster can communicate with each other across namespaces. Network policies allow you to restrict this communication, creating network-level isolation between namespaces. Define policies that allow only necessary traffic patterns, such as allowing the frontend namespace to communicate with the API namespace on specific ports while blocking all other cross-namespace traffic. This defense-in-depth approach combines RBAC, resource quotas, and network policies for comprehensive multi-tenancy.
+Resource quotas and RBAC control compute resources and API access, but network policies control pod-to-pod communication. By default, all pods in a Kubernetes cluster can communicate with each other across namespaces. Network policies allow you to restrict this communication, creating network-level isolation between namespaces.
+
+The most effective approach is to start with a default-deny policy for every namespace, then explicitly allow only the traffic patterns you need:
+
+```yaml
+# Default deny all ingress and egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: payments-production
+spec:
+  podSelector: {}  # Applies to all pods in the namespace
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# Allow DNS resolution (required for almost all workloads)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: payments-production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+```
+
+With default-deny in place, every cross-namespace communication path must be explicitly declared. This prevents accidental coupling between teams and makes the network topology visible in version-controlled manifests. Use namespace selectors with labels rather than IP ranges for maintainability—labels survive namespace recreation while IP addresses do not.
+
+Monitor NetworkPolicy violations using CNI plugins that support logging (like Calico's `FlowLog` or Cilium's Hubble). When a policy blocks traffic, the pod receives no error—the connection simply times out, making debugging difficult without proper observability.
 
 ### Pod Security Standards
 
-Beyond RBAC and resource quotas, Kubernetes Pod Security Standards define three levels of security restrictions: privileged (unrestricted), baseline (minimally restrictive), and restricted (heavily restrictive). Apply these standards at the namespace level using pod-security.kubernetes.io labels to enforce security policies without custom admission controllers. The restricted standard prevents containers from running as root, restricts volume types, and requires read-only root filesystems, significantly reducing the attack surface of your workloads.
+Beyond RBAC and resource quotas, Kubernetes Pod Security Standards define three levels of security restrictions enforced by the built-in Pod Security Admission controller:
+
+| Standard | Use Case | Key Restrictions |
+|----------|----------|-----------------|
+| **privileged** | System namespaces (kube-system) | No restrictions |
+| **baseline** | Development namespaces | Prevents known privilege escalations (hostNetwork, hostPID, privileged containers) |
+| **restricted** | Production namespaces | Requires non-root, read-only root filesystem, drops all capabilities, seccomp profile |
+
+Apply these standards at the namespace level using labels:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments-production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+The `enforce` label rejects pods that violate the policy. The `audit` label logs violations to the audit log without blocking. The `warn` label shows a warning to the user applying the manifest but does not block. Use all three labels simultaneously—`enforce` for production safety, `audit` for monitoring, and `warn` for developer feedback.
+
+The `restricted` standard is particularly valuable for production namespaces. It prevents containers from running as root, restricts volume types to `configMap`, `emptyDir`, `persistentVolumeClaim`, `secret`, and `projected`, drops all Linux capabilities except `NET_BIND_SERVICE`, and requires a seccomp profile. This significantly reduces the blast radius of a container compromise.
 
 ## Conclusion
 
