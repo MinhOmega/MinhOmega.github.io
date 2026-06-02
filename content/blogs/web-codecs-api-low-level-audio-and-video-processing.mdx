@@ -681,6 +681,147 @@ class VideoEffectsProcessor {
 }
 ```
 
+## Worker-Based Architecture for Production Applications
+
+Production Web Codecs applications should run encoding and decoding in Web Workers to avoid blocking the main thread. The `VideoFrame` and `AudioData` objects support transferable semantics, allowing zero-copy handoff between threads.
+
+### Dedicated Worker for Video Processing
+
+```typescript
+// video-processor.worker.ts
+import { VideoEncoder, VideoDecoder, VideoFrame } from 'webcodecs';
+
+class VideoProcessorWorker {
+  private decoder: VideoDecoder;
+  private encoder: VideoEncoder;
+
+  constructor() {
+    this.decoder = new VideoDecoder({
+      output: (frame) => this.processDecodedFrame(frame),
+      error: (e) => self.postMessage({ type: 'error', message: e.message }),
+    });
+
+    this.encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        self.postMessage(
+          { type: 'encoded', data, timestamp: chunk.timestamp, metadata: meta },
+          [data.buffer]  // Transfer ownership — zero copy
+        );
+      },
+      error: (e) => self.postMessage({ type: 'error', message: e.message }),
+    });
+  }
+
+  private async processDecodedFrame(frame: VideoFrame) {
+    // Apply transformations, filters, or analysis
+    // Then re-encode if needed
+    this.encoder.encode(frame);
+    frame.close();
+  }
+
+  configure(config: { decoder: VideoDecoderConfig; encoder: VideoEncoderConfig }) {
+    this.decoder.configure(config.decoder);
+    this.encoder.configure(config.encoder);
+  }
+
+  decode(data: ArrayBuffer, timestamp: number, type: 'key' | 'delta') {
+    const chunk = new EncodedVideoChunk({
+      type,
+      timestamp,
+      data,
+    });
+    this.decoder.decode(chunk);
+  }
+}
+
+const processor = new VideoProcessorWorker();
+
+self.onmessage = (event) => {
+  const { action, payload } = event.data;
+  switch (action) {
+    case 'configure':
+      processor.configure(payload);
+      break;
+    case 'decode':
+      processor.decode(payload.data, payload.timestamp, payload.type);
+      break;
+  }
+};
+```
+
+### Transferable Objects for Zero-Copy Communication
+
+When passing `VideoFrame` objects between threads, use the transfer list to avoid expensive copies of GPU-backed pixel data:
+
+```typescript
+// Main thread → Worker: transfer the frame
+const frame = new VideoFrame(videoElement, { timestamp: performance.now() * 1000 });
+worker.postMessage({ frame, timestamp: frame.timestamp }, [frame]);
+// frame is now neutered on the main thread — cannot be used here
+
+// Worker receives the frame without copying
+worker.onmessage = (event) => {
+  const { frame } = event.data;
+  // frame is valid and usable in the worker
+  processFrame(frame);
+};
+```
+
+## Video Transcoding Pipeline
+
+Building a browser-based video transcoder demonstrates the full power of Web Codecs. This pattern reads a file, decodes it, optionally applies transformations, and re-encodes in a different format or quality.
+
+```typescript
+class BrowserTranscoder {
+  async transcode(inputFile: File, outputConfig: VideoEncoderConfig) {
+    const buffer = await inputFile.arrayBuffer();
+    const demuxer = new Mp4Demuxer(buffer);
+    const muxer = new WebMMuxer({
+      target: 'buffer',
+      video: { codec: 'V_VP9', width: outputConfig.width!, height: outputConfig.height! },
+    });
+
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: console.error,
+    });
+    encoder.configure(outputConfig);
+
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        // Optional: resize, crop, or apply effects here
+        encoder.encode(frame);
+        frame.close();
+      },
+      error: console.error,
+    });
+
+    const videoTrack = demuxer.getVideoTrack();
+    decoder.configure({
+      codec: videoTrack.codec,
+      codedWidth: videoTrack.width,
+      codedHeight: videoTrack.height,
+      description: videoTrack.description,
+    });
+
+    for (const chunk of demuxer.getChunks()) {
+      decoder.decode(chunk);
+    }
+
+    await decoder.flush();
+    await encoder.flush();
+    decoder.close();
+    encoder.close();
+
+    return muxer.finalize(); // Returns ArrayBuffer containing WebM data
+  }
+}
+```
+
+This transcoding pipeline runs entirely in the browser with no server round-trips. For large files, integrate it with the worker architecture above to keep the UI responsive.
+
 ## WebRTC Integration
 
 The Web Codecs API integrates naturally with WebRTC for real-time communication, giving you fine-grained control over encoding parameters that the standard WebRTC API does not expose.
