@@ -526,6 +526,260 @@ describe("Stitched schema", () => {
 });
 ```
 
+## Schema Stitching vs Federation: A Deep Comparison
+
+### When to Choose Stitching
+
+Schema stitching excels in specific scenarios where federation falls short:
+
+```typescript
+// Scenario 1: Integrating a third-party API you don't control
+// You can't add federation directives to GitHub's GraphQL API
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    {
+      schema: githubSchema,  // Third-party schema - no modifications
+      executor: githubExecutor,
+    },
+    {
+      schema: internalUsersSchema,  // Your own schema
+      executor: usersExecutor,
+    },
+  ],
+});
+
+// Scenario 2: Migrating from REST to GraphQL incrementally
+// Stitch REST and GraphQL services together
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    { schema: graphqlProductsSchema, executor: productsExecutor },
+    { schema: restOrdersSchema, executor: restToGraphqlExecutor },  // REST wrapper
+  ],
+});
+```
+
+### When to Choose Federation
+
+Federation is better for greenfield microservices:
+
+```typescript
+// Federation requires @key directives in sub-schemas
+// Users service
+const typeDefs = gql`
+  type User @key(fields: "id") {
+    id: ID!
+    name: String!
+    email: String!
+  }
+`;
+
+// Orders service extends User
+const typeDefs = gql`
+  extend type User @key(fields: "id") {
+    id: ID! @external
+    orders: [Order!]!
+  }
+`;
+```
+
+### Performance Comparison
+
+| Operation | Stitching | Federation |
+|-----------|-----------|------------|
+| Entity resolution | Manual (DataLoader) | Automatic batching |
+| Cross-schema query | N+1 without DataLoader | Optimized by gateway |
+| Schema composition | Runtime or build-time | Build-time (rover CLI) |
+| Query planning | Manual | Automatic |
+| Cache invalidation | Manual | Automatic |
+
+## Advanced Stitching Patterns
+
+### Type Merging with Computed Fields
+
+Computed fields require data from multiple schemas before they can be resolved:
+
+```typescript
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    {
+      schema: usersSchema,
+      merge: {
+        User: {
+          selectionSet: "{ id }",
+          fieldName: "user",
+          args: (obj) => ({ id: obj.id }),
+          // Computed field needs orders data
+          computedFields: {
+            totalSpent: { selectionSet: "{ id }", needs: { orders: "{ userId total }" } },
+          },
+        },
+      },
+    },
+  ],
+});
+```
+
+### Batch Merging for Performance
+
+Batch multiple entity lookups into a single request:
+
+```typescript
+import { createBatchDelegate } from "@graphql-tools/batch-delegate";
+
+const UserBatchDelegate = createBatchDelegate({
+  schema: usersSchema,
+  fieldName: "usersByIds",
+  key: "id",
+  argsFromKeys: (ids) => ({ ids }),
+  mapKeysFn: (users) => {
+    const map = new Map();
+    users.forEach((user) => map.set(user.id, user));
+    return map;
+  },
+});
+```
+
+### Custom Merge Resolvers
+
+Implement custom logic for resolving merged types:
+
+```typescript
+const gatewaySchema = stitchSchemas({
+  subschemas: [
+    {
+      schema: usersSchema,
+      merge: {
+        User: {
+          selectionSet: "{ id }",
+          fieldName: "user",
+          args: (obj) => ({ id: obj.id }),
+          // Custom resolver for conflict resolution
+          resolve: (originalObject, context, info, schema) => {
+            // Prefer data from users schema
+            return info.mergeInfo.delegateToSchema({
+              schema,
+              fieldName: "user",
+              args: { id: originalObject.id },
+              context,
+              info,
+            });
+          },
+        },
+      },
+    },
+  ],
+});
+```
+
+## Error Handling and Monitoring
+
+### Error Propagation
+
+Errors from sub-schemas propagate through the gateway:
+
+```typescript
+// Sub-schema error handling
+const executor = async ({ document, variables, context }) => {
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: print(document), variables }),
+    });
+
+    const result = await response.json();
+
+    if (result.errors) {
+      // Log errors for monitoring
+      console.error("Sub-schema errors:", result.errors);
+    }
+
+    return result;
+  } catch (error) {
+    // Return partial result with error
+    return {
+      data: null,
+      errors: [{ message: "Service unavailable", extensions: { code: "SERVICE_ERROR" } }],
+    };
+  }
+};
+```
+
+### Distributed Tracing
+
+Add tracing to monitor cross-schema query performance:
+
+```typescript
+import { ApolloServerPluginInlineTrace } from "@apollo/server";
+
+const gateway = new ApolloServer({
+  schema: gatewaySchema,
+  plugins: [ApolloServerPluginInlineTrace()],
+  formatError: (error) => {
+    // Send to monitoring service
+    errorTracker.captureException(error);
+    return error;
+  },
+});
+```
+
+## Testing Stitched Schemas
+
+### Unit Testing Individual Resolvers
+
+```typescript
+describe("User orders resolver", () => {
+  it("fetches orders for a user", async () => {
+    const result = await execute({
+      schema: gatewaySchema,
+      document: gql`
+        query {
+          user(id: "1") {
+            name
+            orders {
+              id
+              total
+            }
+          }
+        }
+      `,
+    });
+
+    expect(result.data.user.orders).toBeDefined();
+    expect(result.data.user.orders.length).toBeGreaterThan(0);
+  });
+});
+```
+
+### Integration Testing with Mock Services
+
+```typescript
+describe("Gateway integration", () => {
+  let mockUsersServer: MockServer;
+  let mockOrdersServer: MockServer;
+
+  beforeAll(async () => {
+    mockUsersServer = await createMockServer(usersTypeDefs, usersResolvers);
+    mockOrdersServer = await createMockServer(ordersTypeDefs, ordersResolvers);
+  });
+
+  it("stitches data from multiple services", async () => {
+    const gateway = await createGateway({
+      usersUrl: mockUsersServer.url,
+      ordersUrl: mockOrdersServer.url,
+    });
+
+    const result = await gateway.execute({
+      query: `{ user(id: "1") { name orders { total } } }`,
+    });
+
+    expect(result.errors).toBeUndefined();
+    expect(result.data.user.name).toBeDefined();
+    expect(result.data.user.orders).toBeDefined();
+  });
+});
+```
+
 ## Future Outlook
 
 Schema stitching is being superseded by Apollo Federation for new projects, but it remains relevant for integrating existing schemas and third-party APIs. GraphQL Mesh builds on stitching concepts with support for REST, gRPC, and other source types. The `@graphql-tools/stitch` library continues to be maintained and improved.

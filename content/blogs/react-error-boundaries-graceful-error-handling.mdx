@@ -663,6 +663,278 @@ it('recovers after reset', async () => {
 });
 ```
 
+## Error Boundaries with React 19 and Server Components
+
+### Error Handling in React Server Components
+
+React Server Components introduce new error handling patterns that complement error boundaries:
+
+```typescript
+// app/dashboard/page.tsx (Server Component)
+// Use error.tsx for route-level error handling in Next.js App Router
+export default async function DashboardPage() {
+  const data = await fetchDashboardData(); // If this throws, error.tsx catches it
+  return <Dashboard data={data} />;
+}
+
+// app/dashboard/error.tsx (Client Component)
+'use client';
+
+export default function DashboardError({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  return (
+    <div>
+      <h2>Something went wrong loading the dashboard</h2>
+      <p>{error.message}</p>
+      <button onClick={() => reset()}>Try again</button>
+    </div>
+  );
+}
+```
+
+### Combining Error Boundaries with Suspense
+
+Error boundaries work naturally with Suspense for loading and error states:
+
+```typescript
+function UserProfile({ userId }: { userId: string }) {
+  return (
+    <ErrorBoundary
+      fallbackRender={({ error, resetErrorBoundary }) => (
+        <div>
+          <p>Failed to load profile: {error.message}</p>
+          <button onClick={resetErrorBoundary}>Retry</button>
+        </div>
+      )}
+    >
+      <Suspense fallback={<ProfileSkeleton />}>
+        <UserProfileContent userId={userId} />
+      </Suspense>
+    </ErrorBoundary>
+  );
+}
+```
+
+### Streaming Error Handling
+
+For streaming SSR, errors may occur after the initial response has started:
+
+```typescript
+// Server-side streaming with error handling
+async function* StreamPage() {
+  try {
+    yield <Header />;
+    yield <Suspense fallback={<ContentSkeleton />}>
+      <AsyncContent />
+    </Suspense>;
+    yield <Footer />;
+  } catch (error) {
+    yield <ErrorBanner message="An error occurred while loading this page" />;
+  }
+}
+```
+
+## Production Error Reporting Integration
+
+### Sentry Integration
+
+Connect error boundaries to Sentry for production error tracking:
+
+```typescript
+import * as Sentry from '@sentry/react';
+
+function App() {
+  return (
+    <Sentry.ErrorBoundary
+      fallback={({ error, resetError }) => (
+        <ErrorFallback error={error} onRetry={resetError} />
+      )}
+      beforeCapture={(scope) => {
+        scope.setTag('errorBoundary', true);
+        scope.setLevel('error');
+      }}
+      onError={(error, componentStack) => {
+        // Custom error processing
+        console.error('Error boundary caught:', error);
+      }}
+      showDialog
+    >
+      <AppContent />
+    </Sentry.ErrorBoundary>
+  );
+}
+
+// Custom error boundary with Sentry
+class SentryErrorBoundary extends React.Component<Props, State> {
+  state: State = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    Sentry.withScope((scope) => {
+      scope.setExtras(errorInfo);
+      scope.setTag('component', 'ErrorBoundary');
+      Sentry.captureException(error);
+    });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+```
+
+### Custom Error Reporting Service
+
+Build a custom error reporting pipeline:
+
+```typescript
+interface ErrorReport {
+  message: string;
+  stack?: string;
+  componentStack?: string;
+  url: string;
+  userAgent: string;
+  timestamp: string;
+  userId?: string;
+  sessionId: string;
+}
+
+function reportError(error: Error, errorInfo: React.ErrorInfo) {
+  const report: ErrorReport = {
+    message: error.message,
+    stack: error.stack,
+    componentStack: errorInfo.componentStack,
+    url: window.location.href,
+    userAgent: navigator.userAgent,
+    timestamp: new Date().toISOString(),
+    userId: getCurrentUserId(),
+    sessionId: getSessionId(),
+  };
+
+  // Send to monitoring endpoint
+  fetch('/api/errors', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(report),
+  }).catch(() => {
+    // Silently fail - don't error on error reporting
+  });
+}
+
+<ErrorBoundary
+  onError={(error, errorInfo) => reportError(error, errorInfo)}
+  fallback={<ErrorFallback />}
+>
+  <AppContent />
+</ErrorBoundary>
+```
+
+## Testing Error Boundaries
+
+### Testing with React Testing Library
+
+```typescript
+import { render, screen, fireEvent } from '@testing-library/react';
+
+// Suppress console.error for expected errors
+const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+afterAll(() => consoleSpy.mockRestore());
+
+describe('ErrorBoundary', () => {
+  it('renders children when no error occurs', () => {
+    render(
+      <ErrorBoundary fallback={<div>Error occurred</div>}>
+        <div>Normal content</div>
+      </ErrorBoundary>
+    );
+    expect(screen.getByText('Normal content')).toBeInTheDocument();
+  });
+
+  it('renders fallback when child throws', () => {
+    const ThrowComponent = () => {
+      throw new Error('Test error');
+    };
+
+    render(
+      <ErrorBoundary fallback={<div>Something went wrong</div>}>
+        <ThrowComponent />
+      </ErrorBoundary>
+    );
+    expect(screen.getByText('Something went wrong')).toBeInTheDocument();
+  });
+
+  it('calls onError callback when error occurs', () => {
+    const onError = jest.fn();
+    const ThrowComponent = () => {
+      throw new Error('Test error');
+    };
+
+    render(
+      <ErrorBoundary fallback={<div>Error</div>} onError={onError}>
+        <ThrowComponent />
+      </ErrorBoundary>
+    );
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Test error' }),
+      expect.objectContaining({ componentStack: expect.any(String) })
+    );
+  });
+
+  it('recovers when resetKeys change', () => {
+    const { rerender } = render(
+      <ErrorBoundary fallback={<div>Error</div>} resetKeys={[1]}>
+        <ThrowingComponent shouldThrow={true} />
+      </ErrorBoundary>
+    );
+
+    expect(screen.getByText('Error')).toBeInTheDocument();
+
+    rerender(
+      <ErrorBoundary fallback={<div>Error</div>} resetKeys={[2]}>
+        <ThrowingComponent shouldThrow={false} />
+      </ErrorBoundary>
+    );
+
+    expect(screen.queryByText('Error')).not.toBeInTheDocument();
+  });
+});
+```
+
+### E2E Testing Error Scenarios
+
+```typescript
+// Cypress E2E test
+describe('Error handling', () => {
+  it('shows error fallback when API fails', () => {
+    // Intercept API call and force failure
+    cy.intercept('GET', '/api/users', { statusCode: 500 });
+    cy.visit('/users');
+
+    cy.get('[data-testid="error-boundary"]')
+      .should('be.visible')
+      .and('contain', 'Failed to load users');
+
+    // Test recovery
+    cy.intercept('GET', '/api/users', { fixture: 'users.json' });
+    cy.get('[data-testid="retry-button"]').click();
+    cy.get('[data-testid="user-list"]').should('be.visible');
+  });
+});
+```
+
 ## Future Outlook
 
 - **React Compiler integration**: Automatic error boundary placement based on component analysis
