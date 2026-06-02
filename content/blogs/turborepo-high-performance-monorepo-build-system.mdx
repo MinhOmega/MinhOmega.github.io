@@ -1,7 +1,7 @@
 ---
 title: "Turborepo: High-Performance Monorepo Build System"
 date: "2021-09-28"
-description: "Set up Turborepo: task pipelines, remote caching, and workspace configuration."
+description: "Complete guide to Turborepo: task pipelines, remote caching, workspace configuration, and CI/CD optimization for monorepo projects."
 tags: ["Turborepo", "Monorepo", "Build", "DevOps"]
 published: true
 author: "MinhVo"
@@ -9,54 +9,515 @@ author: "MinhVo"
 
 ## Introduction
 
-Turborepo: High-Performance Monorepo Build System is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Monorepos offer significant advantages for code sharing, consistent tooling, and atomic cross-package changes, but they introduce serious build performance challenges. As the number of packages grows from tens to hundreds, build times increase linearly or worse because each package must be built in dependency order, and changes to shared packages cascade rebuilds across the entire graph. A single change to a utility library can trigger rebuilds in dozens of downstream applications and packages.
 
-## Key Concepts
+Turborepo solves this problem through three fundamental mechanisms: intelligent content-aware caching that skips work when inputs have not changed, parallel task execution that maximizes CPU utilization across independent packages, and dependency-aware scheduling that respects the package dependency graph while running as many tasks concurrently as possible. Together, these mechanisms reduce monorepo build times from minutes to seconds for incremental changes, making monorepo development as fast as working in a single-package repository.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers everything you need to set up and optimize Turborepo for your monorepo: initial configuration, task pipeline design, caching strategies, remote cache sharing, CI/CD integration, and advanced patterns for large-scale repositories.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Monorepo setup](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Monorepo Structure
 
-Let's look at a practical example:
+### Recommended Layout
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+A well-organized monorepo separates applications (deployable artifacts) from packages (shared libraries, configurations, and utilities). This separation makes the dependency graph clear and enables Turborepo to schedule tasks efficiently.
+
+```
+my-monorepo/
+├── apps/
+│   ├── web/                    # Next.js web application
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   ├── mobile/                 # React Native application
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   └── api/                    # Express API server
+│       ├── src/
+│       ├── package.json
+│       └── tsconfig.json
+├── packages/
+│   ├── ui/                     # Shared UI components
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   ├── utils/                  # Shared utilities
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   ├── config/                 # Shared configurations
+│   │   ├── eslint/
+│   │   ├── tsconfig/
+│   │   └── jest/
+│   └── types/                  # Shared TypeScript types
+│       ├── src/
+│       └── package.json
+├── turbo.json                  # Turborepo configuration
+├── package.json                # Root package.json
+├── pnpm-workspace.yaml         # pnpm workspace config
+└── tsconfig.json               # Root TypeScript config
+```
+
+### Workspace Configuration
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - 'apps/*'
+  - 'packages/*'
+```
+
+```json
+// package.json (root)
+{
+  "name": "my-monorepo",
+  "private": true,
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "type-check": "turbo run type-check"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0"
+  },
+  "packageManager": "pnpm@9.0.0"
 }
 ```
 
-This pattern demonstrates the core approach to implementing Turborepo solutions in production environments.
+Turborepo works with npm, yarn, and pnpm workspaces. pnpm is recommended for its superior disk efficiency through content-addressable storage and strict dependency resolution that prevents phantom dependencies.
+
+## Task Pipeline Configuration
+
+### Basic Pipeline
+
+The `turbo.json` file defines the task pipeline — which tasks exist, what they depend on, what they produce, and what inputs affect their cache key.
+
+```json
+// turbo.json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
+    "lint": {
+      "outputs": []
+    },
+    "type-check": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}
+```
+
+### Understanding Task Dependencies
+
+The `^` prefix in `dependsOn` means "run this task in all workspace dependencies first." This is the key mechanism that ensures packages are built in the correct order.
+
+```json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"]
+      // Before building package X, build all packages that X depends on
+      // This ensures dist/ folders are populated before downstream builds
+    }
+  }
+}
+```
+
+Without `^`, the task depends on the same package's task:
+
+```json
+{
+  "tasks": {
+    "test": {
+      "dependsOn": ["build"]
+      // Before testing package X, build package X first
+      // Does NOT build dependencies — only the current package
+    }
+  }
+}
+```
+
+### Task Execution Order
+
+Given this dependency graph:
+```
+web → ui → utils
+web → utils
+api → utils
+```
+
+Running `turbo run build` executes tasks in this order:
+1. `utils/build` (no dependencies — runs immediately)
+2. `ui/build` (depends on utils — runs after utils completes)
+3. `web/build` and `api/build` (both depend on ui and utils — run in parallel after all dependencies complete)
+
+Turborepo maximizes parallelism by running all tasks whose dependencies are satisfied simultaneously. In this example, `web` and `api` build concurrently because they have no dependency on each other.
+
+![Task execution](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Caching Deep Dive
+
+### How Caching Works
+
+Turborepo creates a content hash for each task based on four factors:
+
+1. **Source files** in the package and all transitive dependencies
+2. **Task configuration** from turbo.json (outputs, env, inputs)
+3. **Environment variables** that you explicitly list in the `env` field
+4. **External dependencies** from the lockfile (package versions)
+
+If the hash matches a cached result, Turborepo restores the output files from the cache instead of re-running the task. This is content-aware caching — it does not rely on timestamps or git status, only on the actual content of the inputs.
+
+### Local Cache
+
+```bash
+# First run — builds everything
+turbo run build
+# Tasks: 12, Time: 45s
+
+# Second run — all cached (nothing changed)
+turbo run build
+# Tasks: 12, Time: 0.2s (full cache hit)
+
+# Change one file in utils, rebuild
+turbo run build
+# Tasks: 3 (utils, ui, web — only affected packages), Time: 8s
+
+# Force full rebuild ignoring cache
+turbo run build --force
+```
+
+The local cache is stored in `.turbo/cache/` and should be gitignored. Each cached task stores its output files and a metadata file with the hash inputs.
+
+### Remote Cache
+
+Remote caching shares build artifacts across your team and CI/CD pipeline. When a developer or CI server builds a package, the result is uploaded to a shared cache. Other developers and CI runs can download the cached result instead of rebuilding.
+
+```bash
+# Link to Vercel remote cache (free for personal use)
+npx turbo link
+
+# Or configure custom remote cache
+export TURBO_API="https://your-cache-server.com"
+export TURBO_TOKEN="your-cache-token"
+```
+
+### Cache Configuration
+
+```json
+// turbo.json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"],
+      "inputs": ["src/**", "tsconfig.json", "package.json"],
+      "env": ["NODE_ENV", "API_URL", "NEXT_PUBLIC_*"]
+    }
+  }
+}
+```
+
+- **`outputs`** — File globs to cache after task completion. Only list files that are expensive to regenerate.
+- **`inputs`** — Files that affect the task hash. Defaults to all tracked files if not specified. Narrowing inputs improves cache hit rates.
+- **`env`** — Environment variables that affect the task output. If an env var changes but is not listed, the cache will serve stale results.
+
+### Cache Invalidation
+
+```bash
+# Clear all local cache
+turbo run build --force
+
+# Clear cache for specific package only
+turbo run build --filter=web --force
+
+# See what would be cached without actually running (dry run)
+turbo run build --dry-run=json
+
+# Prune old cache entries
+turbo daemon --clean
+```
+
+## Advanced Configuration
+
+### Environmental Variables
+
+Environment variables must be explicitly listed in `turbo.json` to be included in the cache hash. This is intentional — it prevents unrelated environment changes from invalidating caches.
+
+```json
+// turbo.json
+{
+  "tasks": {
+    "build": {
+      "env": [
+        "NODE_ENV",
+        "API_KEY",
+        "DATABASE_URL",
+        "NEXT_PUBLIC_*"
+      ]
+    }
+  }
+}
+```
+
+Wildcard patterns like `NEXT_PUBLIC_*` match all environment variables with that prefix, which is useful for Next.js applications that expose environment variables to the browser.
+
+### Custom Inputs
+
+The `inputs` field controls which files affect the cache hash. By default, Turborepo includes all git-tracked files. Narrowing inputs to only the files that actually affect the task output improves cache hit rates.
+
+```json
+// turbo.json
+{
+  "tasks": {
+    "build": {
+      "inputs": [
+        "src/**",
+        "!src/**/*.test.ts",
+        "!src/**/*.spec.ts",
+        "!src/**/*.stories.ts",
+        "tsconfig.json",
+        "package.json"
+      ]
+    }
+  }
+}
+```
+
+Test files, storybook files, and documentation typically do not affect build output, so excluding them from inputs prevents unnecessary cache invalidation.
+
+### Filtering
+
+Filtering is one of Turborepo's most powerful features for large monorepos. It lets you run tasks on a subset of packages.
+
+```bash
+# Build specific package
+turbo run build --filter=web
+
+# Build package and all its dependencies
+turbo run build --filter=web...
+
+# Build only dependencies (not the package itself)
+turbo run build --filter=...web
+
+# Build packages changed since last commit
+turbo run build --filter=...[HEAD^1]
+
+# Build packages changed on current branch vs main
+turbo run build --filter=...[origin/main]
+
+# Combine filters
+turbo run build --filter=web --filter=api --filter=...[origin/main]
+```
+
+The `...[origin/main]` filter uses git diff to identify which packages have changed files, then builds those packages and all their dependents. This is the key to fast CI/CD — you only rebuild and test what actually changed.
+
+![CI/CD integration](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## CI/CD Integration
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for diff-based filtering
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm turbo run build --filter=...[origin/main]
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Test
+        run: pnpm turbo run test --filter=...[origin/main]
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Lint
+        run: pnpm turbo run lint --filter=...[origin/main]
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+```
+
+### Optimizing CI Performance
+
+The combination of remote caching and diff-based filtering makes CI dramatically faster. On a typical pull request that touches 2-3 packages out of 50, CI completes in seconds instead of minutes because only the affected packages and their dependents are built and tested.
+
+```bash
+# Only build/test packages changed in this PR
+turbo run build --filter=...[origin/main]
+turbo run test --filter=...[origin/main]
+
+# Combine with remote cache for maximum speed
+# If another developer already built these exact changes, cache hit is instant
+```
+
+## Shared Packages
+
+### Creating a Shared Package
+
+```json
+// packages/ui/package.json
+{
+  "name": "@myorg/ui",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@myorg/utils": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  }
+}
+```
+
+### Using Workspace Dependencies
+
+```json
+// apps/web/package.json
+{
+  "dependencies": {
+    "@myorg/ui": "workspace:*",
+    "@myorg/utils": "workspace:*"
+  }
+}
+```
+
+The `workspace:*` protocol tells pnpm to resolve the dependency from the local workspace rather than the npm registry. This ensures that during development, you always use the latest local version, and during publishing, pnpm replaces the workspace reference with the actual version number.
+
+```typescript
+// apps/web/src/App.tsx
+import { Button, Modal, DataTable } from '@myorg/ui';
+import { formatDate, debounce, classNames } from '@myorg/utils';
+```
 
 ## Best Practices
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+1. **Define clear task dependencies** — Use `^` for inter-package ordering and same-package dependencies for task ordering within a package
+2. **Specify outputs precisely** — Only cache files that are expensive to regenerate; over-caching wastes storage and upload bandwidth
+3. **Use remote caching** — Share cache across your team and CI/CD to eliminate redundant builds; this is the single biggest performance win
+4. **Filter aggressively in CI** — Use `--filter=...[origin/main]` to build and test only packages changed in the pull request
+5. **Keep tasks focused** — Each task should have a single responsibility (build, test, lint, type-check) for better caching granularity
+6. **Use workspace dependencies** — Always use `workspace:*` for internal packages to keep versions synchronized
+7. **Share configurations** — Create shared tsconfig, eslint, jest, and prettier packages in `packages/config/` for consistency
+8. **Monitor cache hit rates** — Use `--dry-run` and `--summarize` to track how effective your caching configuration is
 
 ## Common Pitfalls
 
+![Build system](https://images.unsplash.com/photo-1558618666-fcd25c85f82e?w=800&h=400&fit=crop)
+
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Missing outputs configuration | Tasks never cache | Specify all build output globs in turbo.json |
+| Wrong or missing inputs | Frequent cache misses | Include all source files that affect task output |
+| No remote cache configured | Slow CI/CD builds | Set up Vercel remote cache or a custom cache server |
+| Circular dependencies between packages | Build failures and infinite loops | Restructure packages to break cycles |
+| Environment variables not listed | Stale cache serving wrong values | List all env vars that affect task output in turbo.json |
+| Not using workspace:* protocol | Version conflicts and phantom deps | Use workspace protocol for all internal dependencies |
+| Full git checkout in CI | Slower diff-based filtering | Use fetch-depth: 0 for accurate git diffs |
+
+### Performance Benchmarks
+
+Understanding how Turborepo performs in different scenarios helps set realistic expectations for your monorepo. The benefits scale with monorepo size and the degree of task repetition across the team.
+
+| Scenario | Without Turborepo | With Turborepo (cold) | With Turborepo (cached) |
+|----------|-------------------|----------------------|------------------------|
+| 10 packages, full build | 45s | 45s | 2s |
+| 10 packages, 1 changed | 45s | 8s | 2s |
+| 50 packages, full build | 3min | 3min | 5s |
+| 50 packages, 1 changed | 3min | 12s | 5s |
+| 200 packages, full build | 12min | 12min | 15s |
+| 200 packages, 1 changed | 12min | 20s | 15s |
+| CI with remote cache | 12min | 20s | 15s |
+
+The dramatic improvement for incremental builds comes from Turborepo's ability to skip tasks whose inputs have not changed. When combined with remote caching, even cold CI runs benefit from previously cached results, making build times consistent regardless of the machine performing the build.
+
+### Workspace Configuration Patterns
+
+Effective workspace configuration is essential for maximizing Turborepo's caching benefits. Structure your monorepo with clear package boundaries and explicit dependencies between packages. Use the workspace protocol for internal dependencies to ensure that version resolution works correctly. Configure each package with its own build script that produces deterministic outputs. Avoid side effects in build scripts that could cause cache misses. Use consistent file naming conventions across packages to simplify turbo.json configuration. Consider creating shared configuration packages that other packages depend on, which reduces duplication and ensures consistent behavior across the monorepo.
+
+### Debugging and Troubleshooting
+
+When Turborepo tasks produce unexpected results, several debugging techniques help identify the root cause. Use the `--dry-run` flag to preview which tasks would execute without actually running them. Add `--verbose` to see detailed information about task execution, cache hits, and dependency resolution. Check the `.turbo` cache directory to verify that cached outputs match expectations. Use the `--force` flag to bypass the cache and force re-execution of all tasks. Inspect the turbo.json configuration to ensure that inputs, outputs, and dependencies are correctly specified. When remote caching issues occur, verify authentication credentials and network connectivity to the cache provider.
+
+### Scaling to Enterprise Monorepos
+
+Enterprise monorepos with hundreds of packages and dozens of developers require additional considerations. Implement code ownership through CODEOWNERS files to ensure that changes to critical packages require appropriate review. Use Turborepo's filtering in CI to only build and test packages affected by a pull request. Configure remote caching with appropriate retention policies to manage storage costs. Set up monitoring dashboards that track build times, cache hit rates, and CI queue depths. Implement automated alerts for build time regressions that exceed defined thresholds. Consider splitting very large monorepos into multiple smaller monorepos connected through published packages if the dependency graph becomes too complex to manage efficiently.
+
+### Migration from Lerna and Nx
+
+Migrating from Lerna to Turborepo is straightforward because both tools use the same workspace structure defined in package.json. Replace Lerna's lerna.json with Turborepo's turbo.json, converting Lerna's script configuration to Turborepo's task pipeline. Lerna's bootstrapping step is handled natively by your package manager's workspace install command. For Nx migrations, the process requires more planning because Nx uses a different project graph configuration. Map Nx's target dependencies to Turborepo's task dependsOn configuration. Convert Nx's affected command to Turborepo's git-based filtering. The migration typically takes one to two days for a medium-sized monorepo and results in simpler configuration with comparable or better performance.
 
 ## Conclusion
 
-Turborepo: High-Performance Monorepo Build System is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Turborepo transforms monorepo development from slow and painful to fast and efficient. By understanding your dependency graph, caching build outputs based on content hashes, and running tasks in parallel across independent packages, Turborepo reduces incremental build times from minutes to seconds.
+
+The key insight is that most build work in a monorepo is repeated — the same code built multiple times across different packages, different machines, and different team members. Turborepo's content-aware caching eliminates this waste entirely. Combined with remote cache sharing, a change built once by one developer benefits every other developer and CI run that encounters the same inputs.
+
+Key takeaways:
+
+1. **Task pipelines** define execution order, dependencies, and caching behavior for every task in your monorepo
+2. **Content-aware caching** uses file hashes rather than timestamps, providing reliable cache invalidation
+3. **Remote caching** shares build artifacts across your team and CI/CD, eliminating redundant work globally
+4. **Diff-based filtering** with `--filter=...[origin/main]` builds only what changed, reducing CI time dramatically
+5. **Workspace dependencies** with `workspace:*` keep internal packages synchronized and prevent version drift
+6. **CI/CD integration** with remote caching reduces build times from minutes to seconds on pull requests
+7. **Simple configuration** — a single turbo.json file controls all task behavior across the entire monorepo
+8. **Monitor and optimize** — Use dry runs, summaries, and cache hit rate tracking to continuously improve build performance

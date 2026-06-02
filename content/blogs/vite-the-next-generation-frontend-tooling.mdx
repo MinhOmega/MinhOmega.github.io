@@ -1,62 +1,656 @@
 ---
-title: "Vite: The Next Generation Frontend Tooling"
-date: "2021-10-20"
-description: "Get started with Vite: plugin system, HMR, SSR, and comparison with webpack."
-tags: ["Vite", "Build Tools", "Bundler", "Frontend"]
+title: "Vite: The Next-Generation Frontend Tooling"
+date: "2024-02-14"
+description: "Deep dive into Vite 5: Rolldown, Environment API, new features, and migration from Webpack."
+tags: ["Vite", "Frontend", "Build Tools", "JavaScript"]
 published: true
 author: "MinhVo"
 ---
 
 ## Introduction
 
-Vite: The Next Generation Frontend Tooling is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Since its initial release in 2020, Vite has evolved from an exciting experiment into the standard build tool for modern frontend development. By 2024, Vite 5 had matured significantly—offering a robust plugin system, production-grade SSR support, framework-specific integrations, and a growing ecosystem of community plugins. What started as Evan You's side project now powers Vue, SvelteKit, Astro, and countless production applications.
 
-## Key Concepts
+This guide focuses on the practical aspects of using Vite in production: building plugins, implementing server-side rendering, optimizing builds, configuring for monorepos, and migrating from Webpack. If you've already experienced Vite's lightning-fast dev server and want to leverage its full power, this is the deep dive you need.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Frontend tooling evolution](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Vite: Core Concepts
 
-## Practical Implementation
+### Vite's Architecture
 
-Let's look at a practical example:
+Vite uses a dual architecture: esbuild-powered dependency pre-bundling and native ESM dev server for development, and Rollup-based production builds. Understanding this split is essential for advanced usage.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Development flow:
+// Browser → native ESM request → Vite dev server → esbuild transform → response
+// Dependencies → pre-bundled once by esbuild → cached in node_modules/.vite
+
+// Production flow:
+// Entry point → Rollup bundling → tree-shaking → code splitting → optimized output
+```
+
+### The Plugin Interface
+
+Vite plugins implement hooks from both Vite's own API and Rollup's plugin interface. This dual compatibility means most Rollup plugins work with Vite out of the box, while Vite-specific hooks provide access to the dev server, HMR system, and HTML transformation.
+
+```typescript
+interface Plugin {
+  name: string;
+
+  // Vite-specific hooks
+  configureServer(server: ViteDevServer): void;
+  transformIndexHtml(html: string, ctx: IndexHtmlTransformContext): string;
+  handleHotUpdate(ctx: HmrContext): void;
+
+  // Rollup-compatible hooks
+  options(options: InputOptions): InputOptions;
+  buildStart(options: InputOptions): void;
+  resolveId(source: string, importer: string): string | null;
+  load(id: string): string | null;
+  transform(code: string, id: string): TransformResult;
+  generateBundle(options: OutputOptions, bundle: OutputBundle): void;
 }
 ```
 
-This pattern demonstrates the core approach to implementing Vite solutions in production environments.
+### HMR API Deep Dive
+
+Vite's HMR API allows fine-grained control over how modules are updated in the browser:
+
+```typescript
+if (import.meta.hot) {
+  // Accept self-updates
+  import.meta.hot.accept((newModule) => {
+    // Update the DOM or re-render
+  });
+
+  // Accept updates from dependencies
+  import.meta.hot.accept('./dependency', (newDep) => {
+    // Handle updated dependency
+  });
+
+  // Decline updates — forces full page reload
+  import.meta.hot.decline();
+
+  // Listen for custom events
+  import.meta.hot.on('custom-event', (data) => {
+    console.log('Custom HMR event:', data);
+  });
+
+  // Clean up side effects when module is replaced
+  import.meta.hot.dispose((data) => {
+    data.cleanup = myCleanupFunction;
+    clearInterval(myInterval);
+  });
+}
+```
+
+![Plugin architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Implementation Guide
+
+### Building Custom Plugins
+
+#### Environment-Aware Configuration Plugin
+
+```typescript
+import { Plugin } from 'vite';
+
+function envPlugin(): Plugin {
+  let isDev: boolean;
+
+  return {
+    name: 'vite-plugin-env',
+
+    config(config, { command }) {
+      isDev = command === 'serve';
+
+      return {
+        define: {
+          __APP_VERSION__: JSON.stringify(process.env.npm_package_version),
+          __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+          __IS_DEV__: isDev,
+        },
+      };
+    },
+
+    transformIndexHtml(html) {
+      if (!isDev) {
+        return html.replace(
+          '<head>',
+          `<head>
+            <meta name="version" content="${process.env.npm_package_version}">`
+        );
+      }
+    },
+  };
+}
+```
+
+#### Virtual Modules Plugin
+
+Virtual modules are modules that don't exist on disk but are generated by plugins:
+
+```typescript
+import { Plugin } from 'vite';
+import glob from 'fast-glob';
+
+function virtualRoutesPlugin(): Plugin {
+  const virtualModuleId = 'virtual:routes';
+  const resolvedVirtualModuleId = '\0' + virtualModuleId;
+
+  return {
+    name: 'vite-plugin-virtual-routes',
+
+    resolveId(id) {
+      if (id === virtualModuleId) {
+        return resolvedVirtualModuleId;
+      }
+    },
+
+    load(id) {
+      if (id === resolvedVirtualModuleId) {
+        const pages = glob.sync('src/pages/**/*.tsx');
+        const routes = pages.map((page) => {
+          const path = page
+            .replace('src/pages', '')
+            .replace(/\.tsx$/, '')
+            .replace(/\/index$/, '/');
+
+          return `{
+            path: '${path}',
+            component: () => import('./${page}')
+          }`;
+        });
+
+        return `export default [${routes.join(',\n')}]`;
+      }
+    },
+  };
+}
+```
+
+#### Markdown Transform Plugin
+
+```typescript
+import { Plugin } from 'vite';
+import matter from 'gray-matter';
+import { marked } from 'marked';
+
+function markdownPlugin(): Plugin {
+  return {
+    name: 'vite-plugin-markdown',
+
+    transform(code, id) {
+      if (!id.endsWith('.md')) return;
+
+      const { data, content } = matter(code);
+      const html = marked(content);
+
+      return {
+        code: `
+          export const frontmatter = ${JSON.stringify(data)};
+          export const html = ${JSON.stringify(html)};
+          export default ${JSON.stringify(html)};
+        `,
+        map: null,
+      };
+    },
+  };
+}
+```
+
+### Server-Side Rendering (SSR)
+
+Vite provides built-in SSR support through `ssrLoadModule`, which transforms and executes modules in Node.js:
+
+```typescript
+import express from 'express';
+import { createServer as createViteServer } from 'vite';
+
+async function createServer() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const app = express();
+
+  let vite;
+
+  if (!isProd) {
+    vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'custom',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static('dist/client'));
+  }
+
+  app.use('*', async (req, res) => {
+    const url = req.originalUrl;
+
+    try {
+      let template, render;
+
+      if (!isProd && vite) {
+        template = await readFile('index.html', 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+        render = (await vite.ssrLoadModule('/src/entry-server.tsx')).render;
+      } else {
+        template = await readFile('dist/client/index.html', 'utf-8');
+        render = (await import('./dist/server/entry-server.js')).render;
+      }
+
+      const appHtml = render(url);
+      const html = template.replace('<!--ssr-outlet-->', appHtml);
+
+      res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
+    } catch (e) {
+      if (vite) vite.ssrFixStacktrace(e);
+      console.error(e);
+      res.status(500).end(e.message);
+    }
+  });
+
+  app.listen(3000);
+}
+
+createServer();
+```
+
+### SSR Entry Points
+
+```typescript
+// src/entry-server.tsx
+import { renderToString } from 'react-dom/server';
+import { StaticRouter } from 'react-router-dom/server';
+import App from './App';
+
+export function render(url: string) {
+  return renderToString(
+    <StaticRouter location={url}>
+      <App />
+    </StaticRouter>
+  );
+}
+
+// src/entry-client.tsx
+import { hydrateRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+
+hydrateRoot(
+  document.getElementById('root')!,
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+```
+
+## Step-by-Step Implementation
+
+### Monorepo Configuration
+
+```typescript
+// packages/shared/vite.config.ts
+import { defineConfig } from 'vite';
+import { resolve } from 'path';
+
+export default defineConfig({
+  build: {
+    lib: {
+      entry: resolve(__dirname, 'src/index.ts'),
+      formats: ['es', 'cjs'],
+      fileName: 'index',
+    },
+    rollupOptions: {
+      external: ['react', 'react-dom'],
+    },
+  },
+});
+
+// apps/web/vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@shared': resolve(__dirname, '../../packages/shared/src'),
+    },
+  },
+  server: {
+    watch: {
+      ignored: ['!**/packages/shared/**'],
+    },
+  },
+});
+```
+
+### Webpack Migration Guide
+
+```typescript
+// Step 1: Install Vite
+// npm i -D vite @vitejs/plugin-react
+
+// Step 2: Create vite.config.ts
+// Map webpack.config.js settings to Vite equivalents:
+// babel-loader → @vitejs/plugin-react
+// css-loader/style-loader → built-in
+// sass-loader → sass package (auto-detected)
+// ts-loader → built-in (esbuild)
+
+// Step 3: Update entry point
+// Webpack: entry: './src/index.js'
+// Vite: <script type="module" src="/src/main.tsx"></script> in index.html
+
+// Step 4: Replace environment variables
+// Webpack: process.env.REACT_APP_*
+// Vite: import.meta.env.VITE_*
+
+// Step 5: Update path aliases
+// Webpack: resolve.alias in config
+// Vite: resolve.alias in vite.config.ts + tsconfig paths
+```
+
+### Advanced Build Configuration
+
+```typescript
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { visualizer } from 'rollup-plugin-visualizer';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    visualizer({ open: true, gzipSize: true, brotliSize: true }),
+  ],
+
+  build: {
+    target: 'es2020',
+    cssCodeSplit: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('react-dom')) return 'vendor-react';
+            if (id.includes('lodash') || id.includes('date-fns')) return 'vendor-utils';
+            return 'vendor';
+          }
+        },
+        entryFileNames: 'assets/[name].[hash].js',
+        chunkFileNames: 'assets/[name].[hash].js',
+        assetFileNames: 'assets/[name].[hash].[ext]',
+      },
+    },
+    sourcemap: true,
+    chunkSizeWarningLimit: 500,
+  },
+});
+```
+
+![Build optimization](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Use Cases and Real-World Applications
+
+### Component Library with HMR
+
+```typescript
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import dts from 'vite-plugin-dts';
+
+export default defineConfig({
+  plugins: [react(), dts({ include: ['src'] })],
+  build: {
+    lib: {
+      entry: 'src/index.ts',
+      formats: ['es', 'cjs'],
+      fileName: 'index',
+    },
+    rollupOptions: {
+      external: ['react', 'react-dom', 'react/jsx-runtime'],
+    },
+  },
+});
+```
+
+### Micro-Frontend with Module Federation
+
+```typescript
+import { defineConfig } from 'vite';
+import federation from '@originjs/vite-plugin-federation';
+
+export default defineConfig({
+  plugins: [
+    federation({
+      name: 'host',
+      remotes: {
+        remote_app: 'http://localhost:3001/assets/remoteEntry.js',
+      },
+      shared: ['react', 'react-dom'],
+    }),
+  ],
+});
+```
+
+### Internationalization Plugin
+
+```typescript
+import { Plugin } from 'vite';
+import { readFileSync, existsSync } from 'fs';
+import { resolve } from 'path';
+
+function i18nPlugin(localesDir: string): Plugin {
+  return {
+    name: 'vite-plugin-i18n',
+
+    resolveId(id) {
+      if (id === 'virtual:i18n') return '\0virtual:i18n';
+    },
+
+    load(id) {
+      if (id !== '\0virtual:i18n') return;
+
+      const locales = {};
+      const files = ['en', 'es', 'fr', 'de', 'ja'];
+
+      for (const lang of files) {
+        const path = resolve(localesDir, `${lang}.json`);
+        if (existsSync(path)) {
+          locales[lang] = JSON.parse(readFileSync(path, 'utf-8'));
+        }
+      }
+
+      return `
+        const locales = ${JSON.stringify(locales)};
+        let currentLocale = 'en';
+        export function setLocale(locale) { currentLocale = locale; }
+        export function t(key, params = {}) {
+          let text = locales[currentLocale]?.[key] || key;
+          for (const [k, v] of Object.entries(params)) {
+            text = text.replace(new RegExp('\\\\{' + k + '\\\\}', 'g'), v);
+          }
+          return text;
+        }
+        export default { setLocale, t, locales };
+      `;
+    },
+  };
+}
+```
 
 ## Best Practices
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+1. **Use `optimizeDeps.include` for heavy dependencies** — Pre-bundle large CJS dependencies to avoid slow page loads in development.
 
-## Common Pitfalls
+2. **Implement proper SSR error handling** — Always wrap `ssrLoadModule` calls in try-catch and use `ssrFixStacktrace` for meaningful error messages.
+
+3. **Use CSS Modules over global CSS** — CSS Modules provide scoping, work with HMR, and have zero runtime overhead in Vite.
+
+4. **Configure `build.rollupOptions.output.manualChunks`** — Split vendor code into separate chunks for better caching strategies.
+
+5. **Use `vite-plugin-checker` for type checking** — Run TypeScript type checking and ESLint in a separate thread to avoid blocking the dev server.
+
+6. **Enable `css.devSourcemap` in development** — CSS source maps make debugging styles significantly easier.
+
+7. **Use `server.proxy` for API development** — Avoid CORS issues by proxying API requests to your backend server.
+
+8. **Test production builds with `vite preview`** — Always verify the production build locally before deploying.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| CJS dependencies causing slow dev startup | 5-10s delay on first page load | Add to `optimizeDeps.include` |
+| SSR hydration mismatches | Console warnings, visual glitches | Ensure server and client render identical HTML |
+| Missing `external` in library build | Bundled peer dependencies | Externalize react, react-dom, etc. |
+| CSS not loading in SSR | Flash of unstyled content | Use `vite.ssrLoadModule` for CSS handling |
+| HMR not working for custom file types | Full page reload on change | Implement `handleHotUpdate` in plugin |
+| Path aliases not working in TypeScript | Type errors despite runtime working | Update `tsconfig.json` paths to match |
+
+## Performance Optimization
+
+### Development Performance
+
+```typescript
+export default defineConfig({
+  optimizeDeps: {
+    include: ['react', 'react-dom', 'react-router-dom', 'axios', 'lodash-es'],
+    exclude: ['@myorg/shared'],
+  },
+  server: {
+    watch: { usePolling: false },
+    warmup: {
+      clientFiles: ['./src/components/**/*.tsx', './src/pages/**/*.tsx'],
+    },
+  },
+});
+```
+
+### Production Build Optimization
+
+```typescript
+export default defineConfig({
+  build: {
+    minify: 'esbuild',
+    target: 'es2020',
+    cssCodeSplit: true,
+    reportCompressedSize: true,
+    rollupOptions: {
+      treeshake: {
+        moduleSideEffects: false,
+        propertyReadSideEffects: false,
+      },
+    },
+  },
+});
+```
+
+## Comparison with Alternatives
+
+| Feature | Vite 5 | Webpack 5 | Parcel 2 | esbuild (standalone) |
+|---------|--------|-----------|----------|---------------------|
+| Dev startup | ~300ms | ~5s | ~1s | ~100ms |
+| HMR | ~30ms | ~500ms | ~100ms | N/A |
+| Production build | Rollup | Webpack | esbuild | esbuild |
+| SSR support | Built-in | Manual | Limited | Manual |
+| Plugin system | Rollup compat + custom | Loaders + plugins | Transformers | Limited |
+| CSS handling | Built-in + PostCSS | Loaders | Built-in | Limited |
+| Tree shaking | Excellent (Rollup) | Good | Good | Good |
+| Configuration | Minimal | Extensive | Zero | Minimal |
+
+## Advanced Patterns
+
+### Custom Dev Server Middleware
+
+```typescript
+import { Plugin } from 'vite';
+
+function apiMockPlugin(): Plugin {
+  return {
+    name: 'api-mock',
+    configureServer(server) {
+      server.middlewares.use('/api', (req, res, next) => {
+        if (req.url === '/api/users') {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify([
+            { id: 1, name: 'Alice' },
+            { id: 2, name: 'Bob' },
+          ]));
+          return;
+        }
+        next();
+      });
+    },
+  };
+}
+```
+
+### Build-Time Data Generation
+
+```typescript
+import { Plugin } from 'vite';
+import { execSync } from 'child_process';
+
+function buildInfoPlugin(): Plugin {
+  return {
+    name: 'build-info',
+    config() {
+      const gitHash = execSync('git rev-parse --short HEAD').toString().trim();
+      const gitBranch = execSync('git rev-parse --abbrev-ref HEAD').toString().trim();
+
+      return {
+        define: {
+          __GIT_HASH__: JSON.stringify(gitHash),
+          __GIT_BRANCH__: JSON.stringify(gitBranch),
+          __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+        },
+      };
+    },
+  };
+}
+```
+
+## Testing with Vitest
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.ts',
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.test.{ts,tsx}', 'src/**/*.d.ts'],
+    },
+  },
+});
+```
+
+## Future Outlook
+
+Vite's roadmap is ambitious. **Rolldown**, a Rust-based bundler, is being developed to replace both Rollup and esbuild within Vite, promising 10-30x faster builds. The **Environment API** (Vite 5) enables multi-environment builds targeting browser, Node.js, and edge from a single configuration.
+
+The ecosystem continues to grow rapidly. Framework authors are standardizing on Vite, and the plugin ecosystem is expanding with solutions for every use case. The future of frontend tooling is fast, and Vite is leading the way.
 
 ## Conclusion
 
-Vite: The Next Generation Frontend Tooling is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Vite has matured from a promising experiment into the standard build tool for modern frontend development. Its plugin system, SSR support, and build optimization capabilities make it suitable for everything from simple SPAs to complex full-stack applications.
+
+Key takeaways:
+
+1. **The plugin system is powerful and Rollup-compatible** — leverage existing Rollup plugins and build custom ones
+2. **SSR is built-in** — use `ssrLoadModule` for development and pre-built SSR bundles for production
+3. **HMR is fast and fine-grained** — use the `import.meta.hot` API for custom update behavior
+4. **Monorepo support is excellent** — configure aliases and watch settings for linked packages
+5. **Migration from Webpack is straightforward** — most patterns have direct Vite equivalents
+6. **Production builds are optimized** — Rollup handles tree-shaking, code splitting, and minification
+7. **The ecosystem is thriving** — official plugins for React, Vue, Svelte, and a growing community
+
+Start with a new Vite project to experience the difference, then migrate existing Webpack projects one at a time. The developer experience improvement is transformative.
