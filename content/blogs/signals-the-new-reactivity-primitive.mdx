@@ -9,54 +9,498 @@ author: "MinhVo"
 
 ## Introduction
 
-Signals: The New Reactivity Primitive is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+The frontend ecosystem is converging on a new reactivity primitive: Signals. Angular adopted them in v16, Preact shipped them as a first-class feature, Solid.js was built around them from the start, and a TC39 proposal aims to make them a JavaScript language standard. This is not a framework-specific trend — it represents a fundamental shift in how UI frameworks track and propagate state changes.
 
-## Key Concepts
+Traditional approaches to reactivity fall into two camps: virtual DOM diffing (React, Vue) and fine-grained observers (MobX, Knockout). Signals combine the best of both: they offer fine-grained dependency tracking like MobX but with a simpler API designed specifically for UI frameworks. A Signal is a container for a value that automatically notifies its dependents when that value changes, without requiring explicit subscriptions or component re-renders.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+Understanding Signals is now essential for any frontend developer. Whether you work in Angular, React, or vanilla JavaScript, Signals are arriving in your ecosystem. This guide covers the core concepts, framework implementations, the TC39 proposal, and production patterns for adopting Signals in real applications.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Signals reactivity concept](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Signals: Core Concepts
 
-Let's look at a practical example:
+A Signal is a reactive container that holds a value and tracks which computations depend on it. When the value changes, only the specific computations that read it re-execute. There are three core primitives:
+
+**Signal (State)** holds a value and notifies dependents on change. Reading a Signal inside a tracking scope (an effect or computed value) automatically registers that dependency.
+
+**Computed (Derived)** produces a value from other Signals. It caches its result and only recomputes when a dependency changes — and only when someone reads it (lazy evaluation).
+
+**Effect (Side Effect)** runs a function whenever its tracked dependencies change. Effects bridge reactive state to the outside world: DOM updates, network requests, logging.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import { signal, computed, effect } from "@preact/signals-core";
+
+const count = signal(0);
+const doubled = computed(() => count.value * 2);
+
+effect(() => {
+  console.log(`Count: ${count.value}, Doubled: ${doubled.value}`);
+});
+
+count.value = 5; // Logs: "Count: 5, Doubled: 10"
+```
+
+The key insight: Signals solve over-rendering without manual optimization. In React, developers use `useMemo`, `useCallback`, and `React.memo` to prevent unnecessary re-renders. Signals make granularity the default — you never need to think about what to memoize.
+
+### Dependency Tracking Mechanics
+
+When a Signal is read inside an effect, the runtime records that dependency automatically. This is accomplished using a global "subscriber" variable: before executing an effect's function, the runtime sets a global to point at that effect. When the Signal's getter runs, it checks the global and registers the dependency. After the function completes, the global is cleared.
+
+```typescript
+// Simplified internal implementation
+let currentSubscriber = null;
+
+function createSignal(initialValue) {
+  let value = initialValue;
+  const subscribers = new Set();
+
+  return {
+    get value() {
+      if (currentSubscriber) subscribers.add(currentSubscriber);
+      return value;
+    },
+    set value(newValue) {
+      value = newValue;
+      for (const sub of subscribers) sub.update();
+    },
+  };
+}
+
+function createEffect(fn) {
+  const effect = { update() { currentSubscriber = effect; fn(); currentSubscriber = null; } };
+  effect.update();
 }
 ```
 
-This pattern demonstrates the core approach to implementing Signals solutions in production environments.
+## Architecture: Signals Across Frameworks
 
-## Best Practices
+### Angular Signals
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+Angular introduced Signals in v16 as the foundation for zoneless change detection. Angular's implementation uses `signal()`, `computed()`, and `effect()`, with explicit `set()` and `update()` methods for mutation.
 
-## Common Pitfalls
+```typescript
+import { signal, computed, effect, WritableSignal } from "@angular/core";
+
+const count: WritableSignal<number> = signal(0);
+const doubled = computed(() => count() * 2);
+
+effect(() => {
+  console.log(`Count: ${count()}, Doubled: ${doubled()}`);
+});
+
+count.set(5);
+count.update((v) => v + 1);
+```
+
+Angular provides interop utilities for RxJS: `toObservable()` converts a Signal to an Observable, and `toSignal()` converts an Observable to a Signal. This enables gradual migration from RxJS-based patterns.
+
+```typescript
+import { toObservable, toSignal } from "@angular/core/rxjs-interop";
+
+const count$ = toObservable(count); // Signal → Observable
+const data = toSignal(this.http.get("/api/data")); // Observable → Signal
+```
+
+### Solid.js Signals
+
+Solid.js pioneered fine-grained reactivity in modern JavaScript frameworks. Its Signal implementation is the most mature and serves as the reference architecture. Solid uses function calls (`count()`) rather than property access (`count.value`), which gives the compiler maximum optimization opportunities.
+
+```typescript
+import { createSignal, createEffect, createMemo, batch } from "solid-js";
+
+const [firstName, setFirstName] = createSignal("John");
+const [lastName, setLastName] = createSignal("Doe");
+
+const fullName = createMemo(() => `${firstName()} ${lastName()}`);
+
+createEffect(() => {
+  console.log(fullName()); // "John Doe"
+});
+
+batch(() => {
+  setFirstName("Jane");
+  setLastName("Smith");
+}); // Effect runs once: "Jane Smith"
+```
+
+### Preact Signals
+
+Preact's `@preact/signals` package brings Signals to the React ecosystem. Its unique innovation: when a Signal is used directly in JSX, Preact can update the DOM node without re-rendering the component. This bypasses React's virtual DOM entirely for Signal-bound values.
+
+```typescript
+import { signal, computed } from "@preact/signals-react";
+
+const count = signal(0);
+const doubled = computed(() => count.value * 2);
+
+function Counter() {
+  return <div>Count: {count} Doubled: {doubled}</div>;
+  // No re-render on count change — Preact patches the DOM directly
+}
+```
+
+### Qwik Signals
+
+Qwik uses Signals as its core reactivity model, tightly integrated with resumability. Qwik Signals are serializable — they survive server-side rendering and resume on the client without hydration.
+
+```typescript
+import { component$, useSignal, useComputed$ } from "@builder.io/qwik";
+
+export const Counter = component$(() => {
+  const count = useSignal(0);
+  const doubled = useComputed$(() => count.value * 2);
+
+  return (
+    <button onClick$={() => count.value++}>
+      Count: {count.value} Doubled: {doubled.value}
+    </button>
+  );
+});
+```
+
+### The TC39 Proposal
+
+The TC39 Signals proposal (Stage 1) aims to standardize Signals as a JavaScript language primitive. The API includes:
+
+```typescript
+// TC39 proposed API
+const count = new Signal.State(0);
+const doubled = new Signal.Computed(() => count.get() * 2);
+
+const watcher = new Signal.subtle.Watch(() => {
+  console.log(`Count: ${count.get()}, Doubled: ${doubled.get()}`);
+});
+
+count.set(5); // Watcher fires: "Count: 5, Doubled: 10"
+```
+
+If adopted, this would mean a single Signal implementation shared across all frameworks, dramatically reducing bundle sizes and enabling cross-framework component interop.
+
+## Step-by-Step Implementation
+
+### Building a Signal Library from Scratch
+
+Understanding the internals demystifies the magic. Here is a minimal but complete Signal implementation:
+
+```typescript
+let currentEffect: (() => void) | null = null;
+
+class Signal<T> {
+  private value: T;
+  private subscribers = new Set<() => void>();
+
+  constructor(initial: T) {
+    this.value = initial;
+  }
+
+  get(): T {
+    if (currentEffect) this.subscribers.add(currentEffect);
+    return this.value;
+  }
+
+  set(newValue: T): void {
+    this.value = newValue;
+    for (const sub of this.subscribers) sub();
+  }
+}
+
+class Computed<T> {
+  private value!: T;
+  private dirty = true;
+  private fn: () => T;
+  private subscribers = new Set<() => void>();
+
+  constructor(fn: () => T) {
+    this.fn = fn;
+    // Evaluate immediately to capture dependencies
+    this.recompute();
+  }
+
+  private recompute(): void {
+    const prev = currentEffect;
+    currentEffect = () => { this.dirty = true; for (const sub of this.subscribers) sub(); };
+    this.value = this.fn();
+    currentEffect = prev;
+  }
+
+  get(): T {
+    if (currentEffect) this.subscribers.add(currentEffect);
+    if (this.dirty) { this.recompute(); this.dirty = false; }
+    return this.value;
+  }
+}
+
+function effect(fn: () => void): () => void {
+  const execute = () => {
+    const prev = currentEffect;
+    currentEffect = execute;
+    fn();
+    currentEffect = prev;
+  };
+  execute();
+  return () => { /* cleanup logic */ };
+}
+```
+
+### Real-World Application: Shopping Cart
+
+```typescript
+import { signal, computed, effect } from "@preact/signals-core";
+
+interface Product {
+  id: string;
+  name: string;
+  price: number;
+}
+
+interface CartItem {
+  product: Product;
+  quantity: number;
+}
+
+const cartItems = signal<CartItem[]>([]);
+const discountCode = signal<string>("");
+
+const subtotal = computed(() =>
+  cartItems.value.reduce((sum, item) => sum + item.product.price * item.quantity, 0)
+);
+
+const discount = computed(() => {
+  const code = discountCode.value.toUpperCase();
+  if (code === "SAVE10") return subtotal.value * 0.1;
+  if (code === "SAVE20") return subtotal.value * 0.2;
+  return 0;
+});
+
+const total = computed(() => Math.max(0, subtotal.value - discount.value));
+
+const itemCount = computed(() =>
+  cartItems.value.reduce((sum, item) => sum + item.quantity, 0)
+);
+
+function addToCart(product: Product) {
+  cartItems.value = [
+    ...cartItems.value.filter((i) => i.product.id !== product.id),
+    {
+      product,
+      quantity:
+        (cartItems.value.find((i) => i.product.id === product.id)?.quantity ??
+          0) + 1,
+    },
+  ];
+}
+
+function removeFromCart(productId: string) {
+  cartItems.value = cartItems.value.filter((i) => i.product.id !== productId);
+}
+
+effect(() => {
+  console.log(`Cart: ${itemCount.value} items, Total: $${total.value.toFixed(2)}`);
+});
+```
+
+## Real-World Use Cases
+
+### Use Case 1: High-Frequency Data Dashboards
+
+Financial trading platforms update hundreds of data points per second. With virtual DOM diffing, every tick triggers a full component tree reconciliation. Signals update only the specific DOM nodes bound to changed values, enabling sub-millisecond updates across thousands of cells.
+
+### Use Case 2: Complex Form Validation
+
+Enterprise forms with interdependent fields — where changing a country filters available states, which filters available cities — are natural Signal graphs. Each field is a Signal, and validation rules are computed values that automatically stay in sync.
+
+### Use Case 3: Game State Management
+
+Game engines require frame-precise reactivity for scores, health, inventory, and AI state. Signals provide the performance characteristics needed for 60fps updates without the overhead of immutable state reconciliation.
+
+### Use Case 4: Real-Time Collaboration
+
+Multi-user editing applications (like Google Docs) need to merge remote changes into local state without triggering full re-renders. Signals allow surgical updates to specific document regions while keeping the rest of the UI stable.
+
+## Best Practices for Production
+
+1. **Keep Signals fine-grained**: Create separate Signals for independently changing values. A single `user` signal containing all fields triggers unnecessary updates when only `lastSeen` changes.
+
+2. **Use Computed for derived state**: Never compute derived values inside effects. Computed values cache their results and only recompute when dependencies change.
+
+3. **Batch related updates**: When updating multiple Signals read by the same effect, wrap them in `batch()` to prevent intermediate notifications.
+
+4. **Avoid creating Signals dynamically**: Create Signals at module or component initialization, not inside render functions or effects. Dynamic Signal creation causes memory leaks.
+
+5. **Structure your Signal graph as a DAG**: Signals are leaf nodes, Computed values are intermediate nodes, Effects are terminal nodes. Never create circular dependencies.
+
+6. **Scope Signals to the smallest context**: Component-level Signals for UI state, module-level for feature state, application-level only for truly global concerns like auth or theme.
+
+7. **Test the Signal graph independently**: Write unit tests that verify update propagation without rendering UI. This catches reactivity bugs that integration tests miss.
+
+8. **Profile dependency chains**: Long chains (A → B → C → D → Effect) cause waterfall recomputation. Flatten the graph by combining intermediate computed values where possible.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Reading Signals outside tracking context | Dependency not registered, updates missed | Always read inside effects or computed values |
+| Creating Signals in render loops | Memory leaks, stale closures | Create at component initialization |
+| Mutating objects stored in Signals | Reactivity system unaware of change | Use immutable updates or framework-specific mutable APIs |
+| Circular Computed dependencies | Infinite recomputation loops | Restructure graph; break cycles with untracked reads |
+| Over-granular Signals | Memory overhead, complex dependency graph | Group values that always change together |
+| Mixing reactive and non-reactive state | Stale UI showing inconsistent data | Use Signals for all state that affects rendering |
+
+## Performance Optimization
+
+```typescript
+import { signal, computed, untracked } from "@preact/signals-core";
+
+// Lazy evaluation: computed values only compute when accessed
+const expensiveResult = computed(() => {
+  // Only runs when expensiveResult.value is read
+  return processLargeDataset(rawData.value);
+});
+
+// Untracked reads: access without creating a dependency
+effect(() => {
+  const primary = primarySignal.value;
+  const secondary = untracked(() => secondarySignal.value);
+  console.log(primary, secondary);
+  // This effect only re-runs when primarySignal changes
+});
+
+// Signal disposal: clean up effects to prevent memory leaks
+const dispose = effect(() => {
+  const ws = new WebSocket("ws://api.example.com");
+  ws.send(data.value);
+  return () => ws.close(); // Cleanup when effect re-runs or is disposed
+});
+// Later: dispose();
+```
+
+Benchmarks consistently show Signal-based frameworks outperforming virtual DOM approaches by 2–10x on update-heavy workloads. The js-framework-benchmark ranks Solid.js in the top 3 alongside vanilla JavaScript and Svelte for both startup and update performance.
+
+## Comparison with Alternatives
+
+| Feature | Signals | React useState/useMemo | Redux/Zustand | RxJS Observables |
+|---------|---------|------------------------|---------------|------------------|
+| Granularity | Per-value | Per-component | Per-selector | Per-stream |
+| Auto dependency tracking | Yes | No | No | Manual subscriptions |
+| Bundle size | ~1KB | 0 (built-in) | 2–11KB | ~15KB |
+| Learning curve | Low | Low | Medium | High |
+| Backpressure | No | No | No | Yes |
+| Standards track | TC39 Stage 1 | No | No | No |
+| Server components | Qwik/Angular | React | No | No |
+| DevTools | Emerging | React DevTools | Redux DevTools | rxjs-devtools |
+
+## Advanced Patterns
+
+### Signal-Based State Machines
+
+```typescript
+type GameState = "idle" | "playing" | "paused" | "gameover";
+
+const state = signal<GameState>("idle");
+const score = signal(0);
+const highScore = signal(0);
+
+const isPlaying = computed(() => state.value === "playing");
+const isNewHighScore = computed(() => score.value > highScore.value);
+
+function transition(action: "start" | "pause" | "resume" | "end") {
+  const transitions: Record<string, GameState> = {
+    "idle:start": "playing",
+    "playing:pause": "paused",
+    "paused:resume": "playing",
+    "playing:end": "gameover",
+    "paused:end": "gameover",
+    "gameover:start": "playing",
+  };
+  const nextState = transitions[`${state.value}:${action}`];
+  if (nextState) {
+    state.value = nextState;
+    if (nextState === "playing" && action === "start") score.value = 0;
+    if (nextState === "gameover" && isNewHighScore.value) highScore.value = score.value;
+  }
+}
+```
+
+### Persisted Signals with localStorage
+
+```typescript
+function persistedSignal<T>(key: string, initial: T): Signal<T> {
+  const stored = localStorage.getItem(key);
+  const sig = signal<T>(stored ? JSON.parse(stored) : initial);
+
+  effect(() => {
+    localStorage.setItem(key, JSON.stringify(sig.value));
+  });
+
+  return sig;
+}
+```
+
+## Testing Strategies
+
+```typescript
+import { describe, it, expect } from "vitest";
+import { signal, computed, effect } from "@preact/signals-core";
+
+describe("Signals", () => {
+  it("propagates updates through computed chain", () => {
+    const count = signal(0);
+    const doubled = computed(() => count.value * 2);
+    const quadrupled = computed(() => doubled.value * 2);
+
+    expect(quadrupled.value).toBe(0);
+    count.value = 3;
+    expect(quadrupled.value).toBe(12);
+  });
+
+  it("batch prevents intermediate effects", () => {
+    const a = signal(0);
+    const b = signal(0);
+    let runCount = 0;
+
+    effect(() => { a.value; b.value; runCount++; });
+    expect(runCount).toBe(1);
+
+    // Without batch: 3 runs (initial + a change + b change)
+    a.value = 1;
+    b.value = 1;
+    expect(runCount).toBe(3);
+  });
+
+  it("computed caches until dependency changes", () => {
+    const source = signal(1);
+    let computeCount = 0;
+    const derived = computed(() => { computeCount++; return source.value * 2; });
+
+    derived.value; // Compute
+    derived.value; // Cache hit
+    expect(computeCount).toBe(1);
+
+    source.value = 2;
+    derived.value; // Recompute
+    expect(computeCount).toBe(2);
+  });
+});
+```
+
+## Future Outlook
+
+The TC39 Signals proposal represents the most significant potential change to JavaScript reactivity since Promises standardized async patterns. At Stage 1, the proposal is early but has strong cross-framework support from Angular, Preact, Qwik, and Solid teams.
+
+If adopted, we can expect framework-agnostic reactive components, shared Signal-based state management libraries, and dramatically smaller framework bundles since the reactivity runtime would be built into JavaScript itself.
+
+The convergence happening now is unprecedented. Every major frontend framework is converging on the same primitive, with the explicit goal of standardizing it at the language level. This is the Signals decade.
 
 ## Conclusion
 
-Signals: The New Reactivity Primitive is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Signals represent a fundamental shift in frontend reactivity — from coarse-grained component re-renders to fine-grained value-level updates. The key takeaways:
+
+1. **Signals are reactive containers** that automatically track dependencies and notify dependents on change
+2. **Computed values cache lazily** and only recompute when dependencies change and someone reads them
+3. **Effects bridge reactive state to the outside world** — DOM, network, logging
+4. **Every major framework is adopting Signals** — Angular, Preact, Solid, Qwik all have implementations
+5. **The TC39 proposal** could make Signals a JavaScript standard, enabling cross-framework interop
+6. **Signals eliminate the memoization burden** — no more `useMemo`, `useCallback`, or `React.memo`
+7. **Production performance is excellent** — Signal-based frameworks consistently top benchmarks
+
+Whether you adopt Signals through Angular's built-in API, Solid.js, or Preact's package today — or wait for the TC39 standard — the direction is clear. Signals are the reactivity primitive for the next decade of web development.

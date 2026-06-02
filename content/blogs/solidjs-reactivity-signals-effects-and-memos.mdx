@@ -9,54 +9,608 @@ author: "MinhVo"
 
 ## Introduction
 
-SolidJS Reactivity: Signals, Effects, and Memos is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Reactivity is the core mechanism that drives modern UI frameworks — when state changes, the UI updates. Most frameworks handle this through virtual DOM diffing or template re-compilation. Solid.js takes a radically different approach: it uses a fine-grained reactive system where every piece of state is a Signal, every derived value is a Memo, and every side effect is an Effect. The result is a system that updates the DOM with surgical precision, touching only the exact nodes that need to change.
 
-## Key Concepts
+What makes Solid.js's reactivity model worth studying is not just its performance — though it consistently ranks among the fastest frameworks in benchmarks — but its simplicity. The three primitives (Signal, Memo, Effect) form a complete reactive system that can express any state management pattern. Once you understand these three building blocks, you understand the entire framework's reactivity engine.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide dives deep into each primitive, explains how they compose into a dependency graph, covers the JSX compilation model that makes fine-grained updates possible, and provides production patterns for building reactive applications.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![SolidJS reactivity model](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Signals: The Reactive Foundation
 
-Let's look at a practical example:
+A Signal in Solid.js is a reactive value container with a getter and setter. The getter is a function — calling it reads the value and registers a dependency if executed inside a tracking scope. The setter updates the value and notifies all registered dependents.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+import { createSignal } from "solid-js";
+
+const [name, setName] = createSignal("World");
+
+console.log(name()); // "World"
+setName("Solid");
+console.log(name()); // "Solid"
+```
+
+The function-call syntax `name()` is not arbitrary — it enables the compiler to track which JSX expressions depend on which Signals. When the compiler sees `<h1>{name()}</h1>`, it generates code that wraps the expression in a tracking scope, so only that specific text node updates when `name` changes.
+
+### Signal Options
+
+Signals accept options for equality checking and serialization:
+
+```typescript
+const [items, setItems] = createSignal([], {
+  equals: (prev, next) => prev.length === next.length,
+  name: "itemList", // Used by DevTools
+});
+```
+
+Setting `equals: false` disables change detection entirely — every setter call triggers notifications regardless of whether the value actually changed.
+
+### Signal Types
+
+Solid provides typed Signal constructors for common patterns:
+
+```typescript
+import { createSignal } from "solid-js";
+
+// Basic Signal
+const [count, setCount] = createSignal(0);
+
+// Array Signal with custom equality
+const [items, setItems] = createSignal<string[]>([], { equals: false });
+
+// Object Signal
+const [user, setUser] = createSignal<{ name: string; age: number } | null>(null);
+```
+
+## Understanding Effects: Reactive Side Effects
+
+Effects are functions that run whenever their tracked dependencies change. They are the bridge between reactive state and the outside world — DOM updates, network requests, logging, localStorage synchronization.
+
+```typescript
+import { createEffect } from "solid-js";
+
+const [count, setCount] = createSignal(0);
+
+createEffect(() => {
+  console.log(`Count is now: ${count()}`);
+});
+// Immediately logs: "Count is now: 0"
+
+setCount(1); // Logs: "Count is now: 1"
+setCount(2); // Logs: "Count is now: 2"
+```
+
+### Effect Lifecycle
+
+Effects run synchronously during the current microtask after their dependencies change. The execution flow:
+
+1. A Signal's setter is called
+2. The Signal notifies all registered dependents
+3. Each dependent effect is scheduled (deduped if already scheduled)
+4. Effects execute in dependency order
+5. Each effect re-tracks dependencies on every execution (dependencies can change between runs)
+
+```typescript
+const [showDetail, setShowDetail] = createSignal(false);
+const [userId, setUserId] = createSignal("123");
+
+createEffect(() => {
+  if (showDetail()) {
+    // Only tracks userId when showDetail is true
+    console.log(`Fetching details for user ${userId()}`);
+    fetch(`/api/users/${userId()}`);
+  }
+});
+// showDetail is tracked, userId is NOT tracked (conditional branch not taken)
+
+setUserId("456"); // Effect does NOT re-run — userId not tracked
+
+setShowDetail(true); // Effect runs, now tracks both showDetail AND userId
+setUserId("789"); // Effect runs — userId now tracked
+```
+
+### Effect Cleanup
+
+Effects can return a cleanup function that runs before the next execution and when the effect is disposed:
+
+```typescript
+createEffect(() => {
+  const ws = new WebSocket(`wss://api.example.com/feed/${channel()}`);
+
+  ws.onmessage = (event) => {
+    setMessages((prev) => [...prev, JSON.parse(event.data)]);
+  };
+
+  return () => {
+    ws.close(); // Cleanup before next run or disposal
+  };
+});
+```
+
+### onCleanup
+
+For cleanup that should happen when the component unmounts (not just when the effect re-runs), use `onCleanup`:
+
+```typescript
+import { onCleanup } from "solid-js";
+
+function Timer() {
+  const [seconds, setSeconds] = createSignal(0);
+
+  const interval = setInterval(() => setSeconds((s) => s + 1), 1000);
+
+  onCleanup(() => clearInterval(interval));
+
+  return <div>{seconds()} seconds</div>;
 }
 ```
 
-This pattern demonstrates the core approach to implementing SolidJS solutions in production environments.
+## Understanding Memos: Derived Reactive Values
 
-## Best Practices
+Memos are computed values that cache their result. They only recompute when a dependency changes AND when someone reads them (lazy evaluation). This makes them ideal for expensive computations that may not always be needed.
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+import { createMemo } from "solid-js";
 
-## Common Pitfalls
+const [items, setItems] = createSignal([
+  { name: "Apple", price: 1.5, quantity: 3 },
+  { name: "Banana", price: 0.75, quantity: 6 },
+  { name: "Cherry", price: 3.0, quantity: 2 },
+]);
+
+const total = createMemo(() =>
+  items().reduce((sum, item) => sum + item.price * item.quantity, 0)
+);
+
+console.log(total()); // 12.0 — computed here
+console.log(total()); // 12.0 — cached, no recomputation
+```
+
+### Memo vs Effect for Derived State
+
+A common mistake is using effects to derive state:
+
+```typescript
+// WRONG: Using effect for derived state
+const [total, setTotal] = createSignal(0);
+createEffect(() => {
+  setTotal(items().reduce((sum, item) => sum + item.price * item.quantity, 0));
+});
+// This creates an unnecessary intermediate Signal and a synchronous side effect
+
+// RIGHT: Using memo
+const total = createMemo(() =>
+  items().reduce((sum, item) => sum + item.price * item.quantity, 0)
+);
+// Cached, lazy, no side effects, single computation
+```
+
+Memos should be used for all derived state. Effects should be used only for actual side effects (DOM updates, network requests, logging).
+
+### Chaining Memos
+
+Memos can depend on other Memos, forming a computation graph:
+
+```typescript
+const [data, setData] = createSignal([5, 2, 8, 1, 9, 3]);
+
+const sorted = createMemo(() => [...data()].sort((a, b) => a - b));
+const median = createMemo(() => {
+  const s = sorted();
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+});
+const range = createMemo(() => {
+  const s = sorted();
+  return s[s.length - 1] - s[0];
+});
+```
+
+When `data` changes, `sorted` recomputes, then `median` and `range` recompute from the cached `sorted` value. The graph is topologically sorted — each value computes exactly once per change cycle.
+
+## The Dependency Graph
+
+Solid.js's reactivity system forms a directed acyclic graph (DAG):
+
+```text
+Signal ──→ Memo ──→ Effect
+   │         │
+   └────────→└──→ Effect
+   │
+   └──→ Effect
+```
+
+- **Edges** are created when a Signal is read inside a tracking scope
+- **Edges are dynamic** — they are re-established on every effect execution
+- **Notifications propagate topologically** — dependencies execute before dependents
+- **Cycles are prevented** — writing to a Signal inside its own effect's tracking is detected and blocked
+
+### How the Compiler Enables Fine-Grained Tracking
+
+Solid's compiler transforms JSX into optimized DOM code with explicit reactive bindings:
+
+```typescript
+// Source
+function App() {
+  const [first, setFirst] = createSignal("John");
+  const [last, setLast] = createSignal("Doe");
+  return <h1>Hello, {first()} {last()}!</h1>;
+}
+
+// Compiled (simplified)
+function App() {
+  const [first, setFirst] = createSignal("John");
+  const [last, setLast] = createSignal("Doe");
+
+  const _el$ = document.createElement("h1");
+  const _text1$ = document.createTextNode("");
+  const _text2$ = document.createTextNode("");
+
+  _el$.append("Hello, ", _text1$, " ", _text2$, "!");
+
+  // Only these text nodes update — nothing else is touched
+  createEffect(() => _text1$.nodeValue = first());
+  createEffect(() => _text2$.nodeValue = last());
+
+  return _el$;
+}
+```
+
+This is why Solid.js doesn't need a virtual DOM. Each reactive expression gets its own tiny effect that updates exactly one DOM node.
+
+## Step-by-Step Implementation
+
+### Building a Search Autocomplete
+
+This example demonstrates all three primitives working together:
+
+```typescript
+import { createSignal, createMemo, createEffect, For, Show } from "solid-js";
+
+interface SearchResult {
+  id: string;
+  title: string;
+  description: string;
+}
+
+function SearchAutocomplete() {
+  const [query, setQuery] = createSignal("");
+  const [results, setResults] = createSignal<SearchResult[]>([]);
+  const [loading, setLoading] = createSignal(false);
+  const [selectedIndex, setSelectedIndex] = createSignal(-1);
+
+  const hasResults = createMemo(() => results().length > 0);
+  const showDropdown = createMemo(() => hasResults() && query().length >= 2);
+
+  // Debounced search effect
+  let debounceTimer: number;
+  createEffect(() => {
+    const q = query();
+    if (q.length < 2) {
+      setResults([]);
+      return;
+    }
+
+    clearTimeout(debounceTimer);
+    debounceTimer = window.setTimeout(async () => {
+      setLoading(true);
+      try {
+        const response = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        const data = await response.json();
+        setResults(data.results);
+        setSelectedIndex(-1);
+      } finally {
+        setLoading(false);
+      }
+    }, 300);
+  });
+
+  // Keyboard navigation
+  function handleKeyDown(e: KeyboardEvent) {
+    if (!showDropdown()) return;
+
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setSelectedIndex((i) => Math.min(i + 1, results().length - 1));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setSelectedIndex((i) => Math.max(i - 1, -1));
+        break;
+      case "Enter":
+        e.preventDefault();
+        if (selectedIndex() >= 0) {
+          const selected = results()[selectedIndex()];
+          setQuery(selected.title);
+          setResults([]);
+        }
+        break;
+      case "Escape":
+        setResults([]);
+        break;
+    }
+  }
+
+  return (
+    <div class="autocomplete">
+      <input
+        type="text"
+        value={query()}
+        onInput={(e) => setQuery(e.currentTarget.value)}
+        onKeyDown={handleKeyDown}
+        placeholder="Search..."
+      />
+
+      <Show when={loading()}>
+        <div class="spinner">Searching...</div>
+      </Show>
+
+      <Show when={showDropdown()}>
+        <ul class="dropdown">
+          <For each={results()}>
+            {(result, index) => (
+              <li
+                classList={{ selected: index() === selectedIndex() }}
+                onClick={() => {
+                  setQuery(result.title);
+                  setResults([]);
+                }}
+              >
+                <strong>{result.title}</strong>
+                <p>{result.description}</p>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+    </div>
+  );
+}
+```
+
+### Global State with Module-Level Signals
+
+Solid.js Signals don't need to live inside components:
+
+```typescript
+// store/auth.ts
+import { createSignal, createMemo } from "solid-js";
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: "admin" | "user";
+}
+
+const [currentUser, setCurrentUser] = createSignal<User | null>(null);
+const [authToken, setAuthToken] = createSignal<string | null>(null);
+
+const isAuthenticated = createMemo(() => currentUser() !== null);
+const isAdmin = createMemo(() => currentUser()?.role === "admin");
+
+export function login(email: string, password: string) {
+  return fetch("/api/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  })
+    .then((r) => r.json())
+    .then(({ user, token }) => {
+      setCurrentUser(user);
+      setAuthToken(token);
+    });
+}
+
+export function logout() {
+  setCurrentUser(null);
+  setAuthToken(null);
+}
+
+export { currentUser, isAuthenticated, isAdmin, authToken };
+```
+
+```typescript
+// Any component can import and use these
+import { isAuthenticated, isAdmin, logout } from "./store/auth";
+
+function Navbar() {
+  return (
+    <Show when={isAuthenticated()}>
+      <nav>
+        <Show when={isAdmin()}>
+          <a href="/admin">Admin Panel</a>
+        </Show>
+        <button onClick={logout}>Logout</button>
+      </nav>
+    </Show>
+  );
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: Reactive Form Validation
+
+Form validation is a natural Signal graph. Each field is a Signal, validation rules are Memos, and the submit button's enabled state is a Memo that depends on all field validations.
+
+### Use Case 2: Real-Time Data Visualization
+
+Charts updating from WebSocket data need sub-millisecond DOM updates. Solid's fine-grained reactivity updates individual chart elements without re-rendering the entire SVG, maintaining 60fps even with hundreds of data points.
+
+### Use Case 3: E-Commerce Product Filtering
+
+Product listings with multiple filter dimensions (category, price range, ratings, availability) are perfect Memo chains. Each filter is a Signal, the filtered product list is a Memo, and the pagination is another Memo that depends on the filtered list.
+
+### Use Case 4: Multi-Step Wizard Forms
+
+Wizard forms with step-dependent validation, conditional fields, and progress tracking map cleanly to Signal graphs where `currentStep` drives which fields are visible and which validation rules apply.
+
+## Best Practices for Production
+
+1. **Signals for mutable state, Memos for derived state**: Never use an effect with a setter to derive state. Use `createMemo` — it's cached, lazy, and has no side effects.
+
+2. **Effects only for side effects**: If the code doesn't produce output outside the reactive system (DOM, network, logging), it should be a Memo, not an Effect.
+
+3. **Use `untrack()` to prevent unwanted dependencies**: When reading a Signal inside an effect should not create a dependency, wrap it in `untrack()`.
+
+4. **Batch multi-Signal updates**: Use `batch()` when updating multiple Signals to prevent intermediate effect executions.
+
+5. **Keep dependency chains short**: Long chains (A → B → C → D → E → Effect) cause waterfall recomputation. Combine intermediate Memos where possible.
+
+6. **Use Stores for nested objects**: `createStore` provides deep reactivity with granular updates to nested properties, which is more ergonomic than manually decomposing objects into individual Signals.
+
+7. **Leverage Suspense for async data**: Use `createResource` with `<Suspense>` instead of manual loading states. It handles loading, error, and streaming automatically.
+
+8. **Name Signals for DevTools**: Pass a `name` option to Signals for easier debugging with Solid DevTools.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Destructuring props | Reactive getters lost, stale values | Access `props.property` directly |
+| Using `.map()` instead of `<For>` | Entire list rebuilds on every change | Use `<For>` for keyed list reconciliation |
+| Using effects for derived state | Unnecessary intermediate Signal, potential sync issues | Use `createMemo` instead |
+| Reading Signals outside tracking | Dependency not registered | Always read inside effects, memos, or JSX |
+| Creating Signals inside JSX | New Signal on each access, memory leak | Create Signals in component body |
+| Not cleaning up effects | Memory leaks from subscriptions, event listeners | Return cleanup function from effects |
+
+## Performance Optimization
+
+```typescript
+import { createSignal, createMemo, untrack, batch } from "solid-js";
+
+// Lazy memos: only compute when accessed
+const expensiveData = createMemo(() => {
+  console.log("Computing..."); // Only logs when expensiveData() is called
+  return rawData().map(transform).filter(validate);
+});
+
+// Untracked reads: break dependency edges
+createEffect(() => {
+  const config = configSignal();
+  // Don't track dataSignal — we want to react to config changes only
+  const data = untrack(() => dataSignal());
+  processData(config, data);
+});
+
+// Batch: single notification for multiple updates
+function applyFilters(filters: FilterState) {
+  batch(() => {
+    setCategory(filters.category);
+    setPriceRange(filters.priceRange);
+    setRating(filters.rating);
+    setInStock(filters.inStock);
+  });
+  // Effects run once after all four Signals are updated
+}
+
+// Signal disposal: prevent leaks in dynamic components
+function createTimedSignal(duration: number) {
+  const [value, setValue] = createSignal(null);
+  const timeout = setTimeout(() => setValue("expired"), duration);
+  onCleanup(() => clearTimeout(timeout));
+  return value;
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Solid.js Signals | React Hooks | Vue Composition API | MobX Observables |
+|---------|-----------------|-------------|---------------------|------------------|
+| Granularity | Per-value | Per-component | Per-value | Per-value |
+| Auto tracking | Yes | No (manual deps) | Yes (Proxy) | Yes (Proxy) |
+| Caching | Built-in (Memo) | Manual (useMemo) | Built-in (computed) | Built-in (computed) |
+| Batch updates | Explicit `batch()` | Automatic | Automatic | Automatic |
+| Hook rules | None | Strict | None | None |
+| Compiler involvement | Yes (JSX → DOM) | No (React Forget upcoming) | Template compilation | No |
+| DevTools | Solid DevTools | React DevTools | Vue DevTools | MobX DevTools |
+
+## Testing Strategies
+
+```typescript
+import { describe, it, expect, vi } from "vitest";
+import { createSignal, createMemo, createEffect, batch, untrack } from "solid-js";
+
+describe("Signals", () => {
+  it("initializes with the given value", () => {
+    const [count] = createSignal(42);
+    expect(count()).toBe(42);
+  });
+
+  it("notifies dependents on change", () => {
+    const [count, setCount] = createSignal(0);
+    let observed = -1;
+    createEffect(() => { observed = count(); });
+    expect(observed).toBe(0);
+    setCount(99);
+    expect(observed).toBe(99);
+  });
+
+  it("supports functional updates", () => {
+    const [count, setCount] = createSignal(0);
+    setCount((c) => c + 1);
+    setCount((c) => c + 1);
+    expect(count()).toBe(2);
+  });
+});
+
+describe("Memos", () => {
+  it("caches until dependencies change", () => {
+    const [a, setA] = createSignal(1);
+    let computeCount = 0;
+    const derived = createMemo(() => { computeCount++; return a() * 2; });
+    expect(derived()).toBe(2);
+    expect(derived()).toBe(2);
+    expect(computeCount).toBe(1);
+    setA(5);
+    expect(derived()).toBe(10);
+    expect(computeCount).toBe(2);
+  });
+
+  it("chains correctly", () => {
+    const [base, setBase] = createSignal(2);
+    const doubled = createMemo(() => base() * 2);
+    const quadrupled = createMemo(() => doubled() * 2);
+    expect(quadrupled()).toBe(8);
+    setBase(3);
+    expect(quadrupled()).toBe(12);
+  });
+});
+
+describe("Batch", () => {
+  it("defers effect execution until batch completes", () => {
+    const [a, setA] = createSignal(0);
+    const [b, setB] = createSignal(0);
+    const values: string[] = [];
+    createEffect(() => values.push(`${a()}-${b()}`));
+    expect(values).toEqual(["0-0"]);
+    batch(() => {
+      setA(1);
+      setB(1);
+    });
+    expect(values).toEqual(["0-0", "1-1"]); // Only one batched update
+  });
+});
+```
+
+## Future Outlook
+
+Solid.js's reactivity model is influencing the broader ecosystem. Angular's Signal-based change detection (v16+) draws directly from Solid's approach. The TC39 Signals proposal, championed by Solid's creator Ryan Carniato alongside engineers from Angular and Preact, aims to standardize the reactive primitive that Solid pioneered.
+
+SolidStart, the meta-framework for Solid.js, is reaching maturity with file-based routing, server functions, and streaming SSR. It demonstrates that fine-grained reactivity works not just for client-side SPAs but for full-stack applications with server-side rendering.
+
+The convergence around Signals means that learning Solid.js's reactivity model today prepares you for the future of every major framework.
 
 ## Conclusion
 
-SolidJS Reactivity: Signals, Effects, and Memos is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Solid.js's reactivity system is built on three primitives that form a complete reactive graph:
+
+1. **Signals** hold mutable values and notify dependents on change. Read them as function calls (`count()`) to register dependencies.
+2. **Memos** derive values from other reactive sources. They are lazy, cached, and should be used for all derived state.
+3. **Effects** run side effects when dependencies change. Use them only for actual side effects — DOM, network, logging — not for computing derived values.
+
+The dependency graph is dynamic and topologically sorted. Signals are leaf nodes, Memos are intermediate nodes, and Effects are terminal nodes. The compiler transforms JSX into direct DOM operations with per-expression reactive bindings, eliminating the need for a virtual DOM.
+
+These three primitives, combined with Solid's compile-time JSX transformation, produce a framework that delivers virtual-DOM-level developer ergonomics with near-vanilla-JavaScript performance. Understanding this model is understanding the direction the entire frontend ecosystem is moving.
