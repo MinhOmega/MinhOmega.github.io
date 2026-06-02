@@ -820,6 +820,128 @@ Gatekeeper also supports audit mode, which reports policy violations on existing
 
 ![Policy enforcement](https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?w=800&h=400&fit=crop)
 
+## Debugging RBAC Issues
+
+RBAC misconfigurations are among the most common Kubernetes issues. When a user or ServiceAccount gets a `403 Forbidden` error, debugging requires understanding the full authorization chain.
+
+### Step-by-Step RBAC Debugging
+
+**Step 1: Verify the identity**
+
+```bash
+# Who is making the request?
+kubectl auth whoami
+# For service accounts:
+kubectl auth whoami --as system:serviceaccount:payments:payments-api-sa
+```
+
+**Step 2: Check specific permissions**
+
+```bash
+# Can this user create deployments in the payments namespace?
+kubectl auth can-i create deployments \
+  --namespace payments-production \
+  --as alice@company.com
+
+# What can this user do in the namespace?
+kubectl auth can-i --list \
+  --namespace payments-production \
+  --as alice@company.com
+```
+
+**Step 3: Inspect bindings**
+
+```bash
+# List all RoleBindings in the namespace
+kubectl get rolebindings -n payments-production -o wide
+
+# Check if a specific user is bound
+kubectl get rolebindings -n payments-production -o json | \
+  jq '.items[] | select(.subjects[]?.name=="alice@company.com")'
+```
+
+**Step 4: Check for deny rules**
+
+RBAC has no deny rules—it's purely additive. If a user is getting denied, it means no binding grants the permission. Common causes:
+- The binding references a non-existent Role
+- The binding's namespace doesn't match the resource's namespace
+- The user's group membership doesn't match the binding's subject
+- The ServiceAccount token has expired (check pod restart)
+
+**Step 5: Enable audit logging**
+
+```yaml
+# audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+- level: Metadata
+  users: ["system:serviceaccount:payments:payments-api-sa"]
+  verbs: ["create", "update", "delete"]
+```
+
+Audit logs show every API request with the authenticated user, the resource, and the verb. This is invaluable for understanding why a request was denied.
+
+## Real-World Case Studies
+
+### Case Study 1: Startup Scaling to Multi-Team
+
+A fintech startup with 3 engineers started with a single Kubernetes cluster using the `default` namespace. When the team grew to 20 engineers across 5 teams, they faced constant issues: naming collisions, accidental cross-team deployments, and a runaway cron job that consumed all cluster resources.
+
+The migration took 2 weeks:
+1. Created namespaces for each team and environment (15 namespaces total)
+2. Defined RBAC roles (developer, lead, admin) and bound them to teams
+3. Set resource quotas proportional to team size
+4. Applied NetworkPolicy default-deny with explicit cross-namespace rules
+5. Added LimitRanges with conservative defaults
+
+The result: zero naming collisions, no more resource contention, and developers could only deploy to their own namespaces. The migration paid for itself within a month through reduced incidents and faster debugging.
+
+### Case Study 2: Enterprise Compliance
+
+A healthcare company needed to comply with HIPAA requirements for their Kubernetes cluster. They used namespaces to isolate PHI (Protected Health Information) workloads from non-PHI workloads. PHI namespaces had:
+- `restricted` Pod Security Standards
+- Network policies that only allowed traffic from known sources
+- RBAC that limited access to compliance-trained engineers
+- Audit logging enabled for every API request
+- Resource quotas with dedicated node pools for PHI workloads
+
+Non-PHI namespaces had relaxed policies for development and experimentation. The clear namespace boundary made it straightforward to demonstrate compliance during audits.
+
+### Case Study 3: Cost Allocation
+
+A SaaS company with 12 product teams used namespace labels for cost allocation:
+
+```yaml
+metadata:
+  labels:
+    cost-center: "CC-1234"
+    team: "payments"
+    product: "payment-gateway"
+```
+
+They used Kubecost to track resource consumption per namespace and generated monthly cost reports by cost center. This visibility led to a 30% reduction in cloud spending as teams optimized their resource requests based on actual usage data.
+
+## Cost Allocation with Namespaces
+
+Namespaces enable precise cost allocation across teams and products. By tagging namespaces with cost-center labels and tracking resource consumption per namespace, organizations can attribute infrastructure costs to specific teams.
+
+Tools like **Kubecost**, **OpenCost**, and **Kubernetes Resource Report** provide namespace-level cost visibility. They track CPU, memory, storage, and network costs per namespace, broken down by pod, deployment, and label.
+
+```bash
+# Install Kubecost
+helm install kubecost kubecost/cost-analyzer \
+  --namespace kubecost \
+  --create-namespace \
+  --set kubecostToken="your-token"
+
+# View costs by namespace
+kubectl port-forward -n kubecost svc/kubecost-cost-analyzer 9090:9090
+# Open http://localhost:9090 and filter by namespace
+```
+
+Cost allocation data drives optimization. When teams see their namespace costs, they naturally optimize resource requests, delete unused deployments, and right-size their workloads. The visibility itself is the intervention.
+
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
