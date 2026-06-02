@@ -9,54 +9,648 @@ author: "MinhVo"
 
 ## Introduction
 
-Next.js Middleware: Authentication, A/B Testing, and More is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Next.js Middleware runs code *before* a request is completed, allowing you to modify the response based on the incoming request. It sits between the client and your application's routes, enabling powerful patterns like authentication checks, A/B testing, geolocation-based content, feature flags, and request rewriting — all without the client knowing it happened.
 
-## Key Concepts
+Unlike API routes or server components, middleware executes at the edge for every matching request, making it ideal for cross-cutting concerns that affect multiple pages. A single `middleware.ts` file at the root of your project can protect every dashboard route, assign every user to an A/B test bucket, or redirect users based on their country.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide covers the most practical middleware patterns with real-world implementations for authentication, A/B testing, geolocation, and feature flags.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Edge middleware architecture](https://images.unsplash.com/photo-1555949963-aa79dcee981c?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding Middleware: Core Concepts
 
-Let's look at a practical example:
+### How Middleware Works
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+Middleware runs on the Edge Runtime before a request reaches your page or API route. It can:
+
+- **Rewrite** the URL (serve different content without changing the URL)
+- **Redirect** the user (change the URL)
+- **Modify headers** (add custom headers for downstream components)
+- **Return early** (short-circuit with a response like a login redirect)
+- **Set cookies** (persist decisions like A/B test assignments)
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export function middleware(request: NextRequest) {
+  // This runs BEFORE the page renders
+  console.log("Middleware:", request.nextUrl.pathname);
+
+  // Continue to the page
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: "/dashboard/:path*",
+};
+```
+
+### The Matcher Configuration
+
+The `matcher` config controls which routes trigger middleware:
+
+```tsx
+export const config = {
+  matcher: [
+    // Single path
+    "/dashboard",
+
+    // Wildcard path
+    "/dashboard/:path*",
+
+    // Multiple paths
+    "/((?!api|_next/static|_next/image|favicon.ico).*)",
+
+    // Regex with negative lookahead
+    "/((?!_next|[^?]*\\.(?:html?|css|js(?!on)|jpe?g|webp|png|gif|svg|ttf|woff2?|ico|csv|docx?|xlsx?|zip|webmanifest)).*)",
+  ],
+};
+```
+
+### Performance Considerations
+
+Middleware runs on every matching request, so it must be fast:
+
+- **Edge Runtime**: Middleware runs on Vercel's Edge Network (or your edge provider), not your origin server
+- **No Node.js APIs**: Only Web APIs are available (no `fs`, `crypto` with Node.js, etc.)
+- **Keep it lightweight**: Heavy computation in middleware adds latency to every request
+- **Avoid blocking operations**: Don't make API calls in middleware unless absolutely necessary
+
+![Middleware execution flow](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Pattern 1: Authentication Middleware
+
+Protect routes by verifying session tokens before the page renders:
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@/lib/auth";
+
+const protectedRoutes = ["/dashboard", "/profile", "/settings"];
+const authRoutes = ["/login", "/register"];
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  const token = request.cookies.get("session")?.value;
+
+  // Check if the route is protected
+  const isProtectedRoute = protectedRoutes.some(route => pathname.startsWith(route));
+  const isAuthRoute = authRoutes.some(route => pathname.startsWith(route));
+
+  if (isProtectedRoute) {
+    if (!token) {
+      // No session — redirect to login with return URL
+      const loginUrl = new URL("/login", request.url);
+      loginUrl.searchParams.set("redirect", pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+
+    try {
+      const session = await verifyToken(token);
+      if (!session) {
+        // Invalid session — clear cookie and redirect
+        const response = NextResponse.redirect(new URL("/login", request.url));
+        response.cookies.delete("session");
+        return response;
+      }
+
+      // Add user info to headers for downstream components
+      const requestHeaders = new Headers(request.headers);
+      requestHeaders.set("x-user-id", session.userId);
+      requestHeaders.set("x-user-role", session.role);
+
+      return NextResponse.next({
+        request: { headers: requestHeaders },
+      });
+    } catch {
+      return NextResponse.redirect(new URL("/login", request.url));
+    }
+  }
+
+  // Redirect authenticated users away from auth pages
+  if (isAuthRoute && token) {
+    return NextResponse.redirect(new URL("/dashboard", request.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
+};
+```
+
+### Pattern 2: A/B Testing Middleware
+
+Assign users to test buckets and serve different content:
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const AB_TESTS = {
+  "hero-variant": {
+    variants: ["control", "variant-a", "variant-b"],
+    weights: [0.34, 0.33, 0.33],
+    paths: ["/"],
+  },
+  "pricing-layout": {
+    variants: ["standard", "comparison"],
+    weights: [0.5, 0.5],
+    paths: ["/pricing"],
+  },
+} as const;
+
+function selectVariant(weights: number[]): number {
+  const random = Math.random();
+  let cumulative = 0;
+  for (let i = 0; i < weights.length; i++) {
+    cumulative += weights[i];
+    if (random < cumulative) return i;
+  }
+  return weights.length - 1;
+}
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  const response = NextResponse.next();
+
+  for (const [testId, config] of Object.entries(AB_TESTS)) {
+    if (config.paths.some(path => pathname.startsWith(path))) {
+      // Check for existing assignment
+      const existingVariant = request.cookies.get(`ab-${testId}`)?.value;
+
+      if (!existingVariant || !config.variants.includes(existingVariant as any)) {
+        // Assign new variant
+        const variantIndex = selectVariant(config.weights);
+        const variant = config.variants[variantIndex];
+
+        response.cookies.set(`ab-${testId}`, variant, {
+          maxAge: 60 * 60 * 24 * 30, // 30 days
+          httpOnly: true,
+          secure: true,
+          sameSite: "lax",
+        });
+      }
+
+      // Add variant to headers for page components
+      const variant = request.cookies.get(`ab-${testId}`)?.value || config.variants[0];
+      response.headers.set(`x-ab-${testId}`, variant);
+    }
+  }
+
+  return response;
 }
 ```
 
-This pattern demonstrates the core approach to implementing Next.js solutions in production environments.
+Use the variant in your page:
 
-## Best Practices
+```tsx
+// app/page.tsx
+import { headers } from "next/headers";
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+export default async function HomePage() {
+  const headersList = await headers();
+  const heroVariant = headersList.get("x-ab-hero-variant") || "control";
 
-## Common Pitfalls
+  return (
+    <div>
+      {heroVariant === "control" && <HeroControl />}
+      {heroVariant === "variant-a" && <HeroVariantA />}
+      {heroVariant === "variant-b" && <HeroVariantB />}
+    </div>
+  );
+}
+```
+
+### Pattern 3: Geolocation-Based Content
+
+Serve content based on the user's location:
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const countryConfig: Record<string, { locale: string; currency: string }> = {
+  US: { locale: "en-US", currency: "USD" },
+  GB: { locale: "en-GB", currency: "GBP" },
+  DE: { locale: "de-DE", currency: "EUR" },
+  JP: { locale: "ja-JP", currency: "JPY" },
+};
+
+export function middleware(request: NextRequest) {
+  // Vercel provides geolocation data automatically
+  const country = request.geo?.country || "US";
+  const city = request.geo?.city || "Unknown";
+  const config = countryConfig[country] || countryConfig.US;
+
+  const response = NextResponse.next();
+
+  // Set locale and currency headers
+  response.headers.set("x-user-country", country);
+  response.headers.set("x-user-city", city);
+  response.headers.set("x-user-locale", config.locale);
+  response.headers.set("x-user-currency", config.currency);
+
+  // Auto-redirect based on geo (optional)
+  const { pathname } = request.nextUrl;
+  if (pathname === "/" && country !== "US") {
+    // Don't redirect — just set headers for content customization
+  }
+
+  return response;
+}
+```
+
+Use geolocation in server components:
+
+```tsx
+import { headers } from "next/headers";
+
+export default async function PricingPage() {
+  const headersList = await headers();
+  const currency = headersList.get("x-user-currency") || "USD";
+  const country = headersList.get("x-user-country") || "US";
+
+  const prices = await getPrices(currency);
+
+  return (
+    <div>
+      <h1>Pricing</h1>
+      <p>Showing prices in {currency} for {country}</p>
+      {plans.map(plan => (
+        <div key={plan.id}>
+          <h3>{plan.name}</h3>
+          <p>{formatPrice(plan.price, currency)}/month</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+### Pattern 4: Feature Flags
+
+Control feature rollout with middleware:
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+interface FeatureFlag {
+  enabled: boolean;
+  rolloutPercentage: number;
+  allowedUsers?: string[];
+}
+
+const featureFlags: Record<string, FeatureFlag> = {
+  "new-dashboard": {
+    enabled: true,
+    rolloutPercentage: 50,
+  },
+  "beta-search": {
+    enabled: true,
+    rolloutPercentage: 100,
+    allowedUsers: ["beta-testers"],
+  },
+};
+
+function isFeatureEnabled(flag: FeatureFlag, userId?: string): boolean {
+  if (!flag.enabled) return false;
+  if (flag.allowedUsers && userId && flag.allowedUsers.includes(userId)) return true;
+  if (userId) {
+    // Consistent hashing — same user always gets the same result
+    const hash = userId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    return (hash % 100) < flag.rolloutPercentage;
+  }
+  return Math.random() * 100 < flag.rolloutPercentage;
+}
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  const userId = request.cookies.get("user-id")?.value;
+  const response = NextResponse.next();
+
+  // Check feature flags for specific routes
+  if (pathname.startsWith("/dashboard")) {
+    const flag = featureFlags["new-dashboard"];
+    if (flag && isFeatureEnabled(flag, userId)) {
+      response.headers.set("x-feature-new-dashboard", "true");
+    }
+  }
+
+  if (pathname.startsWith("/search")) {
+    const flag = featureFlags["beta-search"];
+    if (flag && isFeatureEnabled(flag, userId)) {
+      // Rewrite to the beta search page
+      return NextResponse.rewrite(new URL("/search-beta", request.url));
+    }
+  }
+
+  return response;
+}
+```
+
+![Feature flag architecture](https://images.unsplash.com/photo-1627398242454-45a1465c2479?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Step 1: Create the Middleware File
+
+```tsx
+// middleware.ts (at the root of your project, NOT inside app/)
+import { NextRequest, NextResponse } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // Add request ID for tracing
+  const requestId = crypto.randomUUID();
+  const response = NextResponse.next();
+  response.headers.set("x-request-id", requestId);
+
+  // Add timing header
+  response.headers.set("x-middleware-start", Date.now().toString());
+
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+};
+```
+
+### Step 2: Add Authentication
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+import { verifySessionToken } from "@/lib/auth-edge";
+
+export async function middleware(request: NextRequest) {
+  const session = request.cookies.get("session")?.value;
+  const { pathname } = request.nextUrl;
+
+  // Protected routes
+  if (pathname.startsWith("/dashboard") || pathname.startsWith("/settings")) {
+    if (!session) {
+      return NextResponse.redirect(new URL("/login", request.url));
+    }
+
+    const user = await verifySessionToken(session);
+    if (!user) {
+      const response = NextResponse.redirect(new URL("/login", request.url));
+      response.cookies.delete("session");
+      return response;
+    }
+  }
+
+  return NextResponse.next();
+}
+```
+
+### Step 3: Combine Multiple Middleware Patterns
+
+```tsx
+// middleware.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export async function middleware(request: NextRequest) {
+  const response = NextResponse.next();
+
+  // 1. Authentication
+  const authResult = await handleAuth(request);
+  if (authResult) return authResult;
+
+  // 2. A/B Testing
+  handleABTesting(request, response);
+
+  // 3. Geolocation
+  handleGeolocation(request, response);
+
+  // 4. Feature Flags
+  handleFeatureFlags(request, response);
+
+  // 5. Request tracing
+  response.headers.set("x-request-id", crypto.randomUUID());
+
+  return response;
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: SaaS Multi-Tenant Authentication
+
+A SaaS platform uses middleware to verify the tenant from the subdomain (`tenant.example.com`), check the session cookie, and inject tenant-specific headers. The middleware ensures every page within the tenant's scope has access to the tenant ID and user role without additional API calls. If the session is invalid, the user is redirected to the tenant's login page with the return URL preserved.
+
+### Use Case 2: E-Commerce A/B Testing
+
+An e-commerce site runs A/B tests on the product page layout, pricing display, and checkout flow. Middleware assigns each visitor to a test bucket using a cookie, ensuring consistent experience across sessions. The variant is passed to page components via headers, which render the appropriate version. Analytics events include the variant for statistical analysis.
+
+### Use Case 3: Content Localization
+
+A global news site uses middleware to detect the user's country from the edge geolocation data and sets headers for language, currency, and regional content preferences. The page components use these headers to serve localized content — showing European sports on the homepage for EU visitors and American sports for US visitors, without any client-side detection.
+
+## Best Practices for Production
+
+1. **Keep middleware fast**: Every millisecond in middleware adds to the time-to-first-byte. Avoid heavy computation, database calls, or external API requests.
+
+2. **Use the Edge Runtime**: Middleware runs on the Edge Runtime by default. Don't import Node.js-specific modules — use Web APIs only.
+
+3. **Use `matcher` to limit scope**: Don't run middleware on static assets. Exclude `_next/static`, `_next/image`, and `favicon.ico` from the matcher.
+
+4. **Pass data via headers, not cookies**: Headers are more efficient for passing data to server components. Use cookies for persistent state (A/B test assignments, sessions).
+
+5. **Handle errors gracefully**: If middleware throws an error, the request fails entirely. Wrap edge-sensitive operations in try/catch and fall back to `NextResponse.next()`.
+
+6. **Use `crypto.randomUUID()` for request tracing**: Adding a request ID header helps with debugging and log correlation across services.
+
+7. **Test middleware in isolation**: Write unit tests for your middleware logic. The Edge Runtime is limited, so mock the `NextRequest` and `NextResponse` objects.
+
+8. **Avoid redirect loops**: Always check that the current path isn't the redirect destination before redirecting. Use a simple guard: `if (pathname !== "/login")`.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Importing Node.js modules | Build error in Edge Runtime | Use Web APIs or `@edge-runtime/compat` packages |
+| Missing `matcher` config | Middleware runs on static assets, slowing them down | Exclude `_next/static`, images, and favicon |
+| Redirect loops | Infinite redirects, browser error | Check `pathname !== redirectTarget` before redirecting |
+| Heavy computation in middleware | Slow TTFB for every request | Keep middleware under 5ms; move heavy logic to API routes |
+| Using `req.body` | Not available in Edge Runtime | Use `request.json()` or `request.text()` |
+| Forgetting `async` for Edge operations | Middleware returns before operation completes | Mark middleware as `async` when using `await` |
+
+## Performance Optimization
+
+```tsx
+// middleware.ts — optimized for performance
+import { NextRequest, NextResponse } from "next/server";
+
+// Pre-compute matcher regex for faster matching
+const PROTECTED_PATHS = new Set(["/dashboard", "/profile", "/settings"]);
+const AUTH_PATHS = new Set(["/login", "/register"]);
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  const firstSegment = pathname.split("/")[1];
+
+  // Fast path: skip middleware for static assets
+  if (firstSegment === "_next" || firstSegment === "api" || pathname.includes(".")) {
+    return NextResponse.next();
+  }
+
+  const response = NextResponse.next();
+
+  // Only check auth for protected paths
+  if (PROTECTED_PATHS.has(`/${firstSegment}`) || PROTECTED_PATHS.has(pathname)) {
+    const session = request.cookies.get("session")?.value;
+    if (!session) {
+      return NextResponse.redirect(new URL("/login", request.url));
+    }
+    response.headers.set("x-has-session", "true");
+  }
+
+  // Redirect authenticated users from auth pages
+  if (AUTH_PATHS.has(pathname) && request.cookies.has("session")) {
+    return NextResponse.redirect(new URL("/dashboard", request.url));
+  }
+
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api).*)"],
+};
+```
+
+## Comparison with Alternatives
+
+| Approach | Where it Runs | Scope | Performance | Use Case |
+|----------|--------------|-------|-------------|----------|
+| Next.js Middleware | Edge | All matched routes | Fast (edge) | Auth, A/B, geolocation |
+| API Routes | Server | Single endpoint | Medium | Data processing |
+| Server Components | Server | Single page | Medium | Data fetching |
+| Client-Side Auth | Browser | Single page | Slow | Not recommended for auth |
+| Nginx/Cloudflare Rules | CDN/Proxy | All traffic | Very fast | Simple redirects |
+
+## Advanced Patterns
+
+### Middleware Chaining
+
+```tsx
+// middleware.ts
+type MiddlewareFn = (req: NextRequest) => NextResponse | Promise<NextResponse> | null;
+
+const middlewares: MiddlewareFn[] = [
+  authMiddleware,
+  abTestMiddleware,
+  geoMiddleware,
+  featureFlagMiddleware,
+];
+
+export async function middleware(request: NextRequest) {
+  for (const mw of middlewares) {
+    const result = await mw(request);
+    if (result) return result; // Short-circuit (redirect, rewrite, etc.)
+  }
+  return NextResponse.next();
+}
+```
+
+### Subrequest Optimization
+
+```tsx
+// middleware.ts
+export function middleware(request: NextRequest) {
+  // Use request headers instead of making API calls
+  const session = request.cookies.get("session")?.value;
+
+  // Decode JWT locally (no API call needed)
+  if (session) {
+    try {
+      const payload = JSON.parse(atob(session.split(".")[1]));
+      const response = NextResponse.next();
+      response.headers.set("x-user-id", payload.sub);
+      response.headers.set("x-user-role", payload.role);
+      return response;
+    } catch {
+      // Invalid token
+    }
+  }
+
+  return NextResponse.next();
+}
+```
+
+## Testing Strategies
+
+```typescript
+import { middleware } from "@/middleware";
+import { NextRequest } from "next/server";
+
+function createRequest(path: string, cookies?: Record<string, string>) {
+  const url = new URL(path, "http://localhost:3000");
+  const headers = new Headers();
+  const cookieStore = new Map(Object.entries(cookies || {}));
+
+  return {
+    nextUrl: url,
+    url: url.toString(),
+    headers,
+    cookies: {
+      get: (name: string) => cookieStore.has(name) ? { value: cookieStore.get(name)! } : undefined,
+      has: (name: string) => cookieStore.has(name),
+    },
+    geo: { country: "US", city: "San Francisco" },
+  } as unknown as NextRequest;
+}
+
+describe("Middleware", () => {
+  it("redirects unauthenticated users from protected routes", async () => {
+    const req = createRequest("/dashboard");
+    const response = await middleware(req);
+    expect(response.status).toBe(307); // Redirect
+    expect(response.headers.get("location")).toContain("/login");
+  });
+
+  it("allows authenticated users to access protected routes", async () => {
+    const req = createRequest("/dashboard", { session: "valid-token" });
+    const response = await middleware(req);
+    expect(response.status).toBe(200); // Next
+  });
+
+  it("redirects authenticated users from login page", async () => {
+    const req = createRequest("/login", { session: "valid-token" });
+    const response = await middleware(req);
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toContain("/dashboard");
+  });
+});
+```
+
+## Future Outlook
+
+Next.js middleware is evolving toward better TypeScript support, improved debugging tools, and tighter integration with edge computing platforms. The React Server Components model means middleware can pass data to server components more efficiently, reducing the need for client-side state management for cross-cutting concerns like authentication and feature flags.
+
+Future improvements may include middleware composition APIs, built-in A/B testing primitives, and integration with the React Compiler for optimized rendering based on middleware decisions.
 
 ## Conclusion
 
-Next.js Middleware: Authentication, A/B Testing, and More is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Next.js Middleware is a powerful tool for handling cross-cutting concerns at the edge. Authentication, A/B testing, geolocation, and feature flags all benefit from running before the page renders, reducing client-side complexity and improving security.
+
+Key takeaways:
+
+1. **Use middleware for authentication** — verify sessions at the edge before pages render, redirecting unauthenticated users immediately.
+2. **Implement A/B testing with cookies** — assign variants in middleware and pass them to pages via headers for consistent, server-side testing.
+3. **Leverage geolocation headers** — serve localized content based on the user's country without client-side detection.
+4. **Keep middleware fast** — avoid heavy computation, use Web APIs only, and limit scope with `matcher`.
+5. **Pass data via headers** — use `response.headers.set()` to communicate middleware decisions to server components.
+
+Start with a simple authentication middleware, then layer in A/B testing and feature flags as your application grows. The edge execution model ensures these patterns add minimal latency to every request.
+
+For more details, see the [Next.js Middleware documentation](https://nextjs.org/docs/app/building-your-application/routing/middleware).

@@ -9,54 +9,531 @@ author: "MinhVo"
 
 ## Introduction
 
-Next.js PPR: Partial Prerendering in Production is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Partial Prerendering (PPR) is Next.js's most significant rendering innovation since the introduction of Server Components. It solves the fundamental tension between static and dynamic rendering by allowing both to coexist on the same page—serving an instant static shell while streaming dynamic content into predetermined holes as it becomes available.
 
-## Key Concepts
+Traditional rendering strategies force a binary choice: static generation for speed or server rendering for freshness. Pages are either fully static (fast but potentially stale) or fully dynamic (fresh but slow to first byte). PPR breaks this constraint by decomposing a page into static and dynamic fragments, prerendering the static shell at build time, and filling dynamic holes at request time through streaming.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This approach delivers sub-second Time to First Byte (TTFB) for the static portions while maintaining real-time data accuracy for dynamic sections. For content-heavy sites with personalization, e-commerce platforms with inventory data, or SaaS dashboards with live metrics, PPR offers the performance of static sites with the flexibility of dynamic rendering.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+In this guide, we'll explore PPR's architecture, implement it in production applications, configure caching strategies for optimal performance, and address the deployment considerations that determine whether PPR is right for your project.
 
-## Practical Implementation
+![Streaming Architecture](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-Let's look at a practical example:
+## Understanding PPR: Core Concepts
+
+PPR works by separating a page into two categories of content at the component boundary level. Static components are rendered at build time and cached at the edge. Dynamic components are wrapped in Suspense boundaries and rendered at request time, with their output streamed into the pre-rendered shell.
+
+### The Static Shell
+
+The static shell is the HTML structure that doesn't change between requests. It includes the page layout, navigation, footer, static content sections, and the structural HTML for dynamic sections (including loading placeholders). This shell is generated at build time and served from CDN edge nodes with zero latency.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// This component is static—it renders identically for all users
+function ProductLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="product-page">
+      <Header />
+      <Breadcrumb items={['Products', 'Category']} />
+      <div className="grid grid-cols-12 gap-8">
+        <main className="col-span-8">{children}</main>
+        <aside className="col-span-4">
+          <RecommendedProducts />  {/* Static recommendation block */}
+        </aside>
+      </div>
+      <Footer />
+    </div>
+  )
 }
 ```
 
-This pattern demonstrates the core approach to implementing Next.js solutions in production environments.
+### Dynamic Holes
 
-## Best Practices
+Dynamic holes are sections wrapped in `<Suspense>` that contain data that changes per request—user-specific content, real-time inventory, personalized recommendations, or A/B test variants. These components are rendered on-demand when the request arrives.
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// This creates a dynamic hole—the product price is fetched per-request
+<Suspense fallback={<PriceSkeleton />}>
+  <ProductPrice productId={productId} />
+</Suspense>
+```
 
-## Common Pitfalls
+When a user requests the page, they receive the static shell immediately. The browser renders the shell with skeleton placeholders for dynamic holes. As dynamic data becomes available, Next.js streams `<script>` tags that swap the placeholders with real content—no client-side JavaScript hydration required for the swap.
+
+### How Streaming Works Under the Hood
+
+PPR leverages the RSC (React Server Components) payload protocol. At build time, Next.js generates a prerendered HTML shell and an RSC payload that describes the component tree. Dynamic components are replaced with references in the payload. At request time, the server renders only the dynamic components and streams their RSC payloads alongside the static shell.
+
+The browser receives chunks in this order:
+1. Static HTML shell (immediate—served from edge cache)
+2. Inline `<script>` tags that activate the RSC runtime
+3. Streamed RSC payloads for each dynamic hole as they resolve
+4. The runtime swaps skeleton placeholders with real content
+
+This means the user sees meaningful content immediately, with dynamic data appearing progressively—similar to how native apps load.
+
+![PPR Architecture Diagram](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Component Decomposition Strategy
+
+The key architectural decision in PPR is determining which components are static and which are dynamic. A component is dynamic if it reads from `cookies()`, `headers()`, `searchParams`, or makes uncached data fetches. Everything else can be static.
+
+```typescript
+// Static component—no request-time dependencies
+async function ProductDetails({ id }: { id: string }) {
+  const product = await getProduct(id) // Cached at build time
+  return (
+    <article>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+      <ProductImages images={product.images} />
+    </article>
+  )
+}
+
+// Dynamic component—reads cookies for personalization
+async function PersonalizedBanner() {
+  const cookieStore = cookies()
+  const userSegment = cookieStore.get('user-segment')?.value
+  const banner = await getBannerForSegment(userSegment)
+  return <Banner data={banner} />
+}
+```
+
+### The Suspense Boundary Placement Pattern
+
+Where you place Suspense boundaries determines the granularity of streaming. Too few boundaries means large chunks stream together (users wait longer). Too many boundaries means excessive placeholder swaps (visual jank).
+
+The recommended pattern is one Suspense boundary per independent data source:
+
+```typescript
+// Good: each data source has its own boundary
+<Suspense fallback={<PriceSkeleton />}>
+  <ProductPrice id={id} />         {/* Database query */}
+</Suspense>
+<Suspense fallback={<ReviewsSkeleton />}>
+  <ReviewSummary id={id} />         {/* External API */}
+</Suspense>
+<Suspense fallback={<InventorySkeleton />}>
+  <InventoryStatus id={id} />       {/* Real-time service */}
+</Suspense>
+
+// Bad: single boundary for multiple independent sources
+<Suspense fallback={<EverythingSkeleton />}>
+  <ProductPrice id={id} />
+  <ReviewSummary id={id} />
+  <InventoryStatus id={id} />
+</Suspense>
+```
+
+### Cache Warming and Revalidation
+
+PPR works best with aggressive caching. Use `revalidate` options to control how long the static shell and dynamic components remain fresh:
+
+```typescript
+// Static shell cached for 1 hour at the edge
+export const revalidate = 3600
+
+// Dynamic component with shorter cache
+async function InventoryStatus({ id }: { id: string }) {
+  const inventory = await fetch(`https://api.example.com/inventory/${id}`, {
+    next: { revalidate: 60 } // Fresh every 60 seconds
+  })
+  const data = await inventory.json()
+  return <InventoryBadge quantity={data.quantity} />
+}
+```
+
+For pages where the static shell rarely changes but dynamic data is highly volatile, consider using `fetchCache = 'force-cache'` at the layout level with aggressive `revalidate` on individual dynamic components.
+
+![CDN Edge Caching](https://images.unsplash.com/photo-1544197150-b99a580bb7a8?w=800&h=400&fit=crop)
+
+## Step-by-Step Implementation
+
+### Step 1: Enable PPR in Next.js Configuration
+
+PPR is available as an experimental feature in Next.js 15. Enable it in your `next.config.js`:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  experimental: {
+    ppr: true,
+  },
+}
+
+export default nextConfig
+```
+
+### Step 2: Create a PPR-Optimized Product Page
+
+Build a product page that demonstrates the static-dynamic decomposition:
+
+```typescript
+// app/products/[id]/page.tsx
+import { Suspense } from 'react'
+import { ProductDetails } from '@/components/product/ProductDetails'
+import { ProductPrice } from '@/components/product/ProductPrice'
+import { ReviewSummary } from '@/components/product/ReviewSummary'
+import { InventoryStatus } from '@/components/product/InventoryStatus'
+import { PersonalizedRecommendations } from '@/components/product/Recommendations'
+import {
+  PriceSkeleton,
+  ReviewsSkeleton,
+  InventorySkeleton,
+  RecommendationsSkeleton,
+} from '@/components/skeletons'
+
+// Static metadata generation
+export async function generateStaticParams() {
+  const products = await getTopProducts()
+  return products.map((product) => ({ id: product.id }))
+}
+
+export default async function ProductPage({
+  params,
+}: {
+  params: { id: string }
+}) {
+  const { id } = await params
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      {/* Static: Product details rendered at build time */}
+      <ProductDetails id={id} />
+
+      <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-6">
+        {/* Dynamic: Price changes per request (currency, discounts) */}
+        <Suspense fallback={<PriceSkeleton />}>
+          <ProductPrice id={id} />
+        </Suspense>
+
+        {/* Dynamic: Reviews fetched in real-time */}
+        <Suspense fallback={<ReviewsSkeleton />}>
+          <ReviewSummary id={id} />
+        </Suspense>
+
+        {/* Dynamic: Inventory is real-time */}
+        <Suspense fallback={<InventorySkeleton />}>
+          <InventoryStatus id={id} />
+        </Suspense>
+      </div>
+
+      {/* Dynamic: Personalized per user */}
+      <section className="mt-12">
+        <h2 className="text-2xl font-bold mb-6">Recommended for You</h2>
+        <Suspense fallback={<RecommendationsSkeleton />}>
+          <PersonalizedRecommendations productId={id} />
+        </Suspense>
+      </section>
+    </div>
+  )
+}
+```
+
+### Step 3: Implement Dynamic Components
+
+Each dynamic component handles its own data fetching with appropriate caching:
+
+```typescript
+// components/product/ProductPrice.tsx
+import { cookies } from 'next/headers'
+
+export async function ProductPrice({ id }: { id: string }) {
+  const cookieStore = await cookies()
+  const currency = cookieStore.get('currency')?.value || 'USD'
+
+  const response = await fetch(
+    `https://api.example.com/products/${id}/price?currency=${currency}`,
+    { next: { revalidate: 30 } }  // Fresh every 30 seconds
+  )
+
+  const data = await response.json()
+
+  return (
+    <div className="bg-white rounded-lg border p-6">
+      <div className="text-3xl font-bold text-gray-900">
+        {data.formattedPrice}
+      </div>
+      {data.discount && (
+        <div className="mt-2 text-green-600 font-medium">
+          Save {data.discount.percentage}% — {data.discount.label}
+        </div>
+      )}
+      <div className="mt-2 text-sm text-gray-500">
+        {data.stock > 0 ? `${data.stock} in stock` : 'Out of stock'}
+      </div>
+    </div>
+  )
+}
+```
+
+```typescript
+// components/product/PersonalizedRecommendations.tsx
+import { cookies, headers } from 'next/headers'
+import { getRecommendations } from '@/lib/recommendations'
+
+export async function PersonalizedRecommendations({
+  productId,
+}: {
+  productId: string
+}) {
+  const cookieStore = await cookies()
+  const userId = cookieStore.get('user-id')?.value
+
+  const recommendations = await getRecommendations({
+    userId,
+    productId,
+    limit: 8,
+  })
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      {recommendations.map((product) => (
+        <ProductCard key={product.id} product={product} />
+      ))}
+    </div>
+  )
+}
+```
+
+### Step 4: Configure Edge Runtime for Dynamic Components
+
+For the lowest latency on dynamic components, deploy them to the Edge Runtime:
+
+```typescript
+// components/product/ProductPrice.tsx
+export const runtime = 'edge'
+
+export async function ProductPrice({ id }: { id: string }) {
+  // Edge-compatible data fetching
+  const data = await fetch(`https://api.example.com/products/${id}/price`, {
+    next: { revalidate: 30 },
+  }).then((r) => r.json())
+
+  return <PriceDisplay data={data} />
+}
+```
+
+### Step 5: Test PPR Locally
+
+Run the development server and verify PPR behavior:
+
+```bash
+# Start dev server
+npm run dev
+
+# Build to verify static/dynamic split
+npm run build
+
+# Look for output like:
+# ○ /products/[id]  (Static)
+#   └─ ProductDetails (Static)
+#   └─ ProductPrice (Dynamic)
+#   └─ ReviewSummary (Dynamic)
+#   └─ InventoryStatus (Dynamic)
+```
+
+## Real-World Use Cases
+
+### Use Case 1: E-Commerce Product Pages
+
+Product pages have an ideal static-dynamic split. The product description, images, specifications, and SEO content are static—the same for every visitor. Price, inventory, shipping estimates, and personalized recommendations are dynamic. PPR serves the product content instantly from the CDN while streaming in real-time pricing and availability.
+
+### Use Case 2: News and Media Sites
+
+Article content is static, but comment counts, share buttons with real-time counts, related articles based on reading history, and subscription prompts based on user status are dynamic. PPR delivers the article instantly while personalizing the surrounding experience.
+
+### Use Case 3: SaaS Application Dashboards
+
+Dashboard layouts, navigation, and documentation links are static. User-specific metrics, team activity feeds, notification counts, and billing status are dynamic. PPR eliminates the loading spinner that typically greets users on dashboard pages.
+
+### Use Case 4: Travel Booking Sites
+
+Hotel descriptions, photos, amenities, and location maps are static. Pricing, availability, user reviews, and "recently booked" badges are dynamic. PPR renders the hotel page shell instantly while fetching real-time availability and personalized pricing.
+
+## Best Practices for Production
+
+1. **Start with the static shell as large as possible**: The more you render statically, the faster the initial paint. Move dynamic components as deep in the tree as possible so larger sections can be static.
+
+2. **Use `generateStaticParams` to pre-render popular pages**: Pre-render your top 100-1000 pages at build time. Less popular pages can still benefit from PPR—they'll generate the static shell on first request and cache it.
+
+3. **Set appropriate `revalidate` intervals**: Static shells can have long revalidation (hours) while dynamic components should match their data freshness requirements (seconds to minutes). Don't use the same revalidation for everything.
+
+4. **Implement skeleton loaders that match the final content layout**: Skeleton loaders should match the dimensions and structure of the real content. This prevents Cumulative Layout Shift (CLS) when dynamic content streams in.
+
+5. **Monitor the streaming waterfall**: Use browser DevTools Network tab to visualize the streaming order. If dynamic components render sequentially instead of in parallel, you likely have data dependencies that need restructuring.
+
+6. **Combine with ISR for optimal caching**: Incremental Static Regeneration (ISR) works naturally with PPR. The static shell is regenerated on a timer or on-demand, while dynamic holes are always fresh.
+
+7. **Handle auth-gated content carefully**: Components that read `cookies()` for authentication are inherently dynamic. Consider showing a generic version statically and upgrading to personalized content via streaming.
+
+8. **Use Edge Runtime for latency-sensitive dynamic components**: Dynamic components deployed to the Edge Runtime execute at the CDN node closest to the user, reducing the time to stream dynamic content.
+
+9. **Implement proper error boundaries for dynamic holes**: If a dynamic component fails, the static shell should remain functional. Wrap each dynamic hole in an error boundary that shows a degraded but usable fallback.
+
+10. **Test with real network conditions**: PPR's benefits are most visible on slower connections. Test with Chrome DevTools network throttling to verify the progressive loading experience.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Accidentally making the entire page dynamic | No PPR benefit—entire page renders per-request | Audit components for `cookies()`, `headers()`, and uncached fetches; isolate dynamic logic into dedicated components |
+| Too many Suspense boundaries | Excessive placeholder swaps cause visual jank and layout shift | Group related dynamic content under one Suspense boundary; only separate independent data sources |
+| Skeleton loaders with wrong dimensions | Cumulative Layout Shift when content streams in | Match skeleton dimensions exactly to the real content; use CSS aspect-ratio for images |
+| Dynamic components blocking each other | Sequential streaming instead of parallel | Ensure dynamic components have no data dependencies on each other; use parallel data fetching |
+| Stale static shells after content updates | Users see outdated content until revalidation | Use `revalidateTag()` or `revalidatePath()` in server actions to trigger immediate shell revalidation |
+| PPR not working in production | Falls back to fully dynamic rendering | Verify `ppr: true` in config, ensure you're using Next.js 15+, and check that your deployment platform supports streaming |
+
+## Performance Optimization
+
+PPR inherently optimizes TTFB and First Contentful Paint (FCP), but you can push further:
+
+```typescript
+// Preload critical dynamic data
+import { preload } from 'react/cache'
+
+// In your layout or parent component
+preload(fetchPrice, [productId])
+preload(fetchInventory, [productId])
+
+// In the dynamic components, the data is already being fetched
+async function ProductPrice({ id }: { id: string }) {
+  const data = await fetchPrice(id) // Already in-flight
+  return <PriceDisplay data={data} />
+}
+```
+
+Use the `preload` pattern to start fetching dynamic data as early as possible—ideally in the layout that wraps the Suspense boundaries, not inside the dynamic components themselves.
+
+For static shells, optimize the HTML size by deferring non-critical CSS and JavaScript:
+
+```typescript
+// app/layout.tsx
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html>
+      <head>
+        <link rel="preload" href="/fonts/inter.woff2" as="font" crossOrigin="" />
+        {/* Critical CSS inlined; non-critical loaded async */}
+      </head>
+      <body>{children}</body>
+    </html>
+  )
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | PPR | Full SSG | Full SSR | ISR |
+|---------|-----|----------|----------|-----|
+| TTFB | Sub-second (static shell) | Sub-second | 200ms-2s | Sub-second |
+| Data Freshness | Real-time (dynamic holes) | Build-time | Real-time | Revalidation interval |
+| Personalization | Per-request | None | Per-request | None |
+| CDN Cacheable | Yes (static shell) | Yes | No | Yes |
+| Complexity | Moderate | Low | Low | Low |
+| Build Time | Moderate (pre-renders shells) | Slow (all pages) | None | Fast |
+| Edge Deployment | Supported | Supported | Supported | Supported |
+
+## Advanced Patterns
+
+### Combining PPR with Route Handlers
+
+Use Route Handlers alongside PPR for real-time data updates after the initial page load:
+
+```typescript
+// app/api/products/[id]/price/route.ts
+export async function GET(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  const price = await fetchRealTimePrice(params.id)
+
+  return Response.json(price, {
+    headers: {
+      'Cache-Control': 'public, s-maxage=30, stale-while-revalidate=60',
+    },
+  })
+}
+```
+
+The PPR-rendered page shows initial pricing streamed in, while client-side polling via this Route Handler keeps the price updated without a full page refresh.
+
+### PPR with Middleware-Based Personalization
+
+Use middleware to set personalization cookies, then read them in dynamic PPR components:
+
+```typescript
+// middleware.ts
+import { NextResponse } from 'next/server'
+
+export function middleware(request: NextRequest) {
+  const response = NextResponse.next()
+  const segment = determineUserSegment(request)
+  response.cookies.set('user-segment', segment, { maxAge: 86400 })
+  return response
+}
+```
+
+This keeps the middleware fast (no data fetching) while dynamic PPR components use the segment cookie for personalized content.
+
+## Testing Strategies
+
+```typescript
+// __tests__/ppr.test.tsx
+import { render, screen, waitFor } from '@testing-library/react'
+import ProductPage from '@/app/products/[id]/page'
+
+describe('PPR Product Page', () => {
+  it('renders static shell immediately', async () => {
+    render(await ProductPage({ params: { id: '123' } }))
+
+    // Static content should be present
+    expect(screen.getByText('Product Name')).toBeInTheDocument()
+    expect(screen.getByText('Product description')).toBeInTheDocument()
+  })
+
+  it('shows skeleton loaders for dynamic content', async () => {
+    render(await ProductPage({ params: { id: '123' } }))
+
+    // Skeleton placeholders should be visible
+    expect(screen.getByTestId('price-skeleton')).toBeInTheDocument()
+    expect(screen.getByTestId('reviews-skeleton')).toBeInTheDocument()
+  })
+
+  it('streams dynamic content when available', async () => {
+    render(await ProductPage({ params: { id: '123' } }))
+
+    await waitFor(() => {
+      expect(screen.getByText('$29.99')).toBeInTheDocument()
+    })
+  })
+})
+```
+
+## Future Outlook
+
+PPR represents the direction the entire web ecosystem is moving toward. The React team's work on selective hydration and the streaming HTML specification will further refine how static and dynamic content coexist on a page. Expect more granular controls—per-component caching strategies, predictive prefetching of dynamic holes based on user behavior, and automatic static-dynamic decomposition based on component analysis.
+
+The combination of PPR with React Server Components and the evolving Next.js caching layer is converging on a model where developers write components naturally, and the framework automatically optimizes rendering strategy based on data dependencies. The explicit `static` vs `dynamic` distinction may eventually disappear as the framework infers optimal strategies.
+
+Edge computing platforms are also evolving to better support PPR. Vercel's Edge Network, Cloudflare Workers, and Deno Deploy are all investing in infrastructure that makes streaming dynamic content from edge nodes faster and more reliable.
 
 ## Conclusion
 
-Next.js PPR: Partial Prerendering in Production is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Partial Prerendering bridges the gap between static and dynamic rendering, giving you the best of both worlds: instant static shells from CDN edge nodes with real-time dynamic content streamed in progressively. This isn't a compromise—it's a fundamentally better architecture for most web applications.
+
+Key takeaways:
+
+1. PPR decomposes pages into static shells and dynamic holes, rendering each optimally
+2. Static content serves from CDN with zero latency; dynamic content streams per-request
+3. Suspense boundaries define the granularity of streaming—use one per independent data source
+4. Skeleton loaders must match final content dimensions to prevent layout shift
+5. Combine PPR with Edge Runtime for the lowest latency on dynamic components
+6. Use `revalidate` strategically—long for static shells, short for dynamic components
+7. Start implementing PPR on your highest-traffic pages where the performance gains are most impactful
+
+Enable PPR in your Next.js configuration today, identify the static-dynamic split in your existing pages, and progressively adopt the pattern. The performance improvements are immediate and measurable, and the developer experience is remarkably natural compared to managing separate static and dynamic rendering strategies.
