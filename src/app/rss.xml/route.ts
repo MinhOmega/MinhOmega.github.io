@@ -1,4 +1,4 @@
-import { projects, tils } from "#site/content";
+import { blogs, projects, tils } from "#site/content";
 import { siteConfig } from "@/config/site.config";
 import { portfolioConfig } from "@/config/portfolio.config";
 
@@ -48,7 +48,18 @@ export function GET() {
     category: "TIL",
   }));
 
-  const items = [...projectItems, ...tilItems]
+  const blogItems: FeedItem[] = blogs
+    .filter((blog) => blog.published)
+    .map((blog) => ({
+      title: blog.title,
+      link: `${origin}/blogs/${blog.slugAsParams}`,
+      guid: `${origin}/blogs/${blog.slugAsParams}`,
+      pubDate: toRfc822(blog.date),
+      description: blog.description,
+      category: "Blog",
+    }));
+
+  const items = [...projectItems, ...tilItems, ...blogItems]
     .sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime())
     .slice(0, 50);
 
@@ -70,7 +81,7 @@ export function GET() {
   const xml = `<?xml version="1.0" encoding="UTF-8" ?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
-    <title>${escapeXml(`${portfolioConfig.name} — Projects & TIL`)}</title>
+    <title>${escapeXml(`${portfolioConfig.name} — Blog, Projects & TIL`)}</title>
     <link>${origin}</link>
     <atom:link href="${origin}/rss.xml" rel="self" type="application/rss+xml" />
     <description>${escapeXml(siteConfig.description)}</description>

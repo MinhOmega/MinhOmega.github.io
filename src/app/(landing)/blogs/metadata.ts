@@ -3,8 +3,8 @@ import type { Metadata } from "next";
 
 export async function generateMetadata(): Promise<Metadata> {
   const title = `Blog | ${siteConfig.creator.name}`;
-  const description = `Personal blog by ${siteConfig.creator.name}. Coming soon with interesting articles about web development, technology, and more.`;
-  
+  const description = `Technical blog by ${siteConfig.creator.name} covering web development, AI engineering, DevOps, TypeScript, React, Next.js, and modern software engineering.`;
+
   const ogUrl = new URL(`${siteConfig.siteUrl}/og`);
   ogUrl.searchParams.set("heading", "Blog");
   ogUrl.searchParams.set("type", "Blog");
@@ -13,7 +13,15 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     title,
     description,
-    keywords: [...siteConfig.keywords, "Blog", "Articles", "Web Development"],
+    keywords: [
+      ...siteConfig.keywords,
+      "Blog",
+      "Articles",
+      "Web Development",
+      "AI Engineering",
+      "DevOps",
+      "TypeScript",
+    ],
     openGraph: {
       title,
       description,
@@ -38,4 +46,4 @@ export async function generateMetadata(): Promise<Metadata> {
       images: [ogUrl.toString()],
     },
   };
-} 
+}

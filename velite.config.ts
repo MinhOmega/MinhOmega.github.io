@@ -25,9 +25,9 @@ export const blogs = defineCollection({
       published: s.boolean().default(true),
       tags: s.array(s.string()),
       body: s.mdx(),
-      image: s.image(),
+      image: s.image().optional(),
       toc: s.toc(),
-      author: s.string(),
+      author: s.string().default("MinhVo"),
     })
     .transform(computedFields),
 });
