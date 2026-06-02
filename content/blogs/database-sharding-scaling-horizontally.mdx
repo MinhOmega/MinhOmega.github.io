@@ -426,6 +426,164 @@ Vitess is the production standard for MySQL sharding:
 4. Provision replacement replica
 5. Verify data integrity
 
+## Sharding Anti-Patterns
+
+### Sharding Too Early
+
+The most common mistake is sharding before it's necessary. Sharding adds operational complexity that compounds over time. A single PostgreSQL instance with proper indexing, connection pooling, and read replicas can handle 100,000+ queries per second and terabytes of data. Many startups that shard early spend more engineering time managing shards than building product features.
+
+Before sharding, verify that you've exhausted vertical scaling. A modern server with 128 cores, 512GB RAM, and NVMe storage can handle most workloads. Cloud providers offer instances with up to 448 vCPUs and 12TB RAM. If your workload fits on a single machine, keep it there.
+
+### Choosing the Wrong Shard Key
+
+The shard key is nearly impossible to change after the fact. A poor shard key creates cascading problems:
+
+**Hotspot**: If 80% of your traffic hits 20% of your shards, you've created hotspots. This happens when the shard key is correlated with access patterns—for example, sharding by country when 60% of users are in the US.
+
+**Cross-shard joins**: If your most common query joins two tables that are sharded on different keys, every join becomes a cross-shard operation. Design your schema so related data lives on the same shard.
+
+**Rebalancing nightmare**: If the shard key has uneven distribution, adding new shards doesn't help—the data stays skewed. Hash-based keys avoid this, but range-based keys require careful planning.
+
+### Ignoring Cross-Shard Queries
+
+Some teams shard their database and then discover that 30% of their queries are cross-shard. This happens when the data model doesn't align with the shard key. Before sharding, analyze your query patterns:
+
+```sql
+-- Find the most common WHERE clauses in your slow query log
+SELECT query, COUNT(*) as frequency, AVG(duration) as avg_duration
+FROM slow_query_log
+WHERE timestamp > NOW() - INTERVAL 7 DAY
+GROUP BY query
+ORDER BY frequency DESC
+LIMIT 20;
+```
+
+If most queries include the same column (like `user_id` or `tenant_id`), that's your shard key. If queries are all over the place, sharding will be painful.
+
+## Real-World Sharding Case Studies
+
+### Case Study 1: Instagram's Sharding Strategy
+
+Instagram shards by user ID using PostgreSQL. Each user's data (posts, comments, likes) lives on a single shard determined by `hash(user_id) % num_shards`. This works because the most common query pattern is "get user's feed," which only needs data from one shard.
+
+When Instagram needed to reshard (double the number of shards), they used a multi-phase migration:
+1. Created new shard databases
+2. Ran a background job to copy data from old shards to new shards based on the new hash
+3. Used double-write to keep both old and new shards in sync during migration
+4. Verified consistency with checksums
+5. Switched reads to new shards
+6. Stopped writes to old shards
+
+The entire migration took 3 months and was performed without downtime.
+
+### Case Study 2: Slack's Message Sharding
+
+Slack sharded their message storage by workspace ID. Each workspace's messages live on a single shard. This works because users only access messages within their workspace—there are no cross-workspace queries.
+
+The challenge was handling large workspaces. A single workspace with 500,000 users generates billions of messages. Slack addressed this with sub-sharding: large workspaces are split into time-based sub-shards, with recent messages on fast storage and older messages on cheaper storage.
+
+### Case Study 3: Pinterest's Migration from Vitess
+
+Pinterest initially sharded MySQL using Vitess, but found that the operational complexity of managing Vitess clusters was significant. They migrated to a custom sharding layer built on top of bare MySQL instances. The custom layer handled routing, resharding, and failover with less overhead than Vitess.
+
+The lesson: off-the-shelf sharding solutions are a good starting point, but at massive scale, custom solutions may be more efficient. Most teams should start with Vitess or Citus and only consider custom solutions when they've exhausted the existing tools.
+
+![Distributed systems](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
+
+## Advanced Sharding Patterns
+
+### Hierarchical Sharding
+
+For multi-tenant SaaS applications with tenants of vastly different sizes, a single-level shard key may not work. A small tenant with 100 users doesn't need a dedicated shard, but a large enterprise tenant with 100,000 users might need multiple shards.
+
+Hierarchical sharding uses two levels:
+
+```text
+Level 1: Tenant ID → determines shard group
+Level 2: User ID → determines shard within group
+
+Small tenants: tenant_id % 8 → Shard 0-7
+Large tenants: (tenant_id, user_id) → dedicated shards
+```
+
+This pattern lets you give large tenants dedicated resources while small tenants share shards efficiently.
+
+### Shard-Per-Service Architecture
+
+In a microservices architecture, different services may shard differently. The user service shards by user ID, the order service shards by tenant ID, and the analytics service shards by time period. Each service owns its sharding strategy independently.
+
+This works as long as services don't need to join data across shards. When services need to correlate data (e.g., "show me orders for this user"), use asynchronous replication to a denormalized read store rather than cross-service joins.
+
+### Geo-Sharding with Data Residency
+
+GDPR, CCPA, and other regulations require data to be stored in specific geographic regions. Geo-sharding routes user data to shards in their region:
+
+```python
+def get_shard(user):
+    if user.region == 'EU':
+        return eu_shards[hash(user.id) % len(eu_shards)]
+    elif user.region == 'US':
+        return us_shards[hash(user.id) % len(us_shards)]
+    else:
+        return ap_shards[hash(user.id) % len(ap_shards)]
+```
+
+The challenge is handling users who move between regions. This requires data migration between shard groups, which must be coordinated carefully to avoid data loss or inconsistency.
+
+## Monitoring Sharded Databases
+
+### Key Metrics
+
+Sharded databases require monitoring at both the shard level and the cluster level:
+
+**Shard-level metrics**:
+- Query latency per shard (identify hotspots)
+- Replication lag per shard (catch replication issues early)
+- Connection pool utilization per shard
+- Disk usage and growth rate per shard
+
+**Cluster-level metrics**:
+- Cross-shard query ratio (should be <5% for a well-designed shard key)
+- Data distribution skew (no shard should have >2x the average data)
+- Total query throughput across all shards
+- End-to-end latency for cross-shard operations
+
+**Alerting thresholds**:
+- Shard query latency >100ms → investigate hotspot
+- Replication lag >5 seconds → alert oncall
+- Cross-shard query ratio >10% → review shard key
+- Data skew >2x → plan rebalancing
+
+### Tools for Sharded Databases
+
+- **Vitess**: Built-in monitoring dashboard, query analysis, and resharding tools
+- **Citus**: pg_citus extension for monitoring distributed tables
+- **ProxySQL**: Query routing and monitoring for MySQL sharding
+- **Orchestrator**: MySQL replication management and failover
+- **pganalyze**: PostgreSQL query analysis across distributed nodes
+
+![Database monitoring](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Testing Sharded Databases
+
+### Load Testing at Scale
+
+Sharding problems only manifest at scale. A query that runs in 10ms on a single database with 1 million rows might take 5 seconds when scattered across 16 shards with 100 million rows each. Load testing must use production-scale data volumes and realistic query patterns.
+
+Tools like pgbench for PostgreSQL and sysbench for MySQL can simulate concurrent workloads across multiple shards. The key is to test not just individual shard performance but also cross-shard query patterns, connection pool exhaustion, and failover scenarios.
+
+### Consistency Verification
+
+After resharding or data migration, verify consistency between source and destination shards. This involves counting rows, comparing checksums on critical columns, and running application-level consistency checks. Tools like pt-table-checksum for MySQL and pg_comparator for PostgreSQL automate this process.
+
+The verification step is often skipped in the rush to complete a migration, but inconsistencies discovered weeks later are much harder to diagnose and fix. Build automated consistency checks into your resharding pipeline and run them continuously during the migration window.
+
+### Chaos Testing
+
+Test shard failures under load. Kill a shard primary during peak traffic and verify that failover happens cleanly without data loss or prolonged downtime. This testing reveals assumptions in your application code about database availability that would otherwise surface during a real incident.
+
+Netflix's Chaos Monkey philosophy applies to sharded databases: the best time to discover that your application doesn't handle shard failover gracefully is during a controlled test, not during a production incident at 3 AM.
+
 ## Conclusion
 
 Database sharding is a powerful scaling technique, but it comes with significant complexity. Before sharding, exhaust simpler alternatives: query optimization, read replicas, caching, and vertical scaling. When you do shard, choose your shard key carefully—it's the single most important decision and very difficult to change later.
@@ -437,5 +595,8 @@ Key takeaways:
 3. **Range-based sharding for time-series** — Natural fit for data that's accessed by time ranges
 4. **Avoid cross-shard operations** — Design your schema so most queries hit a single shard
 5. **Use established tools** — Vitess, Citus, and MongoDB's built-in sharding handle the hard parts for you
+6. **Monitor shard skew** — Uneven data distribution defeats the purpose of sharding
+7. **Plan for resharding** — You will need to add shards eventually. Design for it from the start
+8. **Test with production-scale data** — Sharding problems only appear at scale. Load test with realistic data volumes
 
 Sharding is a journey, not a destination. Start with a clear understanding of your data access patterns, choose a shard key that aligns with your most common queries, and build the operational tooling you'll need to manage a distributed database. The complexity is real, but so is the scale it enables.
