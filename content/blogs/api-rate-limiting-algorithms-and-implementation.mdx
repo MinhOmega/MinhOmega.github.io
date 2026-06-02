@@ -13,53 +13,59 @@ Rate limiting is one of the most critical mechanisms for protecting APIs from ab
 
 ![API rate limiting architecture](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
+Every major API provider — from Stripe and GitHub to AWS and Google Cloud — implements rate limiting as a core infrastructure component. Stripe limits to 100 requests per second in live mode, GitHub allows 5,000 requests per hour for authenticated users, and AWS API Gateway supports burst limits of 10,000 requests per second. These limits aren't arbitrary — they're carefully calibrated to protect infrastructure while enabling legitimate use cases.
+
 The choice of rate limiting algorithm significantly impacts the user experience and system behavior. Token bucket allows burst traffic while maintaining average rates. Sliding window provides smooth, consistent limiting. Fixed window is simple but can allow traffic spikes at window boundaries. Understanding these algorithms and their trade-offs is essential for implementing rate limiting that protects your system without unnecessarily restricting legitimate users.
 
 Modern APIs use distributed rate limiting — coordinating limits across multiple server instances, data centers, and regions. This requires shared state (typically in Redis) and careful handling of network partitions and clock skew. This guide covers the algorithms, implementation patterns, and production considerations for building robust rate limiting systems.
 
-## Understanding Rate Limiting: Core Concepts
+## Why Rate Limiting Matters
+
+### Protection Against Abuse
+
+Without rate limiting, a single client can send thousands of requests per second, consuming CPU, memory, database connections, and network bandwidth. This degrades service for all users. Rate limiting acts as a circuit breaker, preventing any single client from monopolizing shared resources.
+
+### Cost Control
+
+For APIs that call expensive downstream services — LLMs like GPT-4, payment processors like Stripe, or external databases — each request has a real cost. A runaway script making 10,000 API calls to an LLM endpoint could cost hundreds of dollars in minutes. Rate limiting caps this exposure.
+
+### Fair Resource Allocation
+
+In multi-tenant SaaS platforms, rate limiting ensures that no single tenant can monopolize shared infrastructure. A free-tier user shouldn't be able to consume the same resources as an enterprise customer paying 100x more.
+
+### DDoS Mitigation
+
+Rate limiting is the first line of defense against distributed denial-of-service attacks. While it won't stop a sophisticated DDoS attack alone, it prevents simple volumetric attacks from overwhelming your infrastructure.
+
+![Rate limiting monitoring dashboard](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
+
+## Rate Limiting Algorithms Deep Dive
 
 ### The Token Bucket Algorithm
 
-The token bucket algorithm works by adding tokens to a bucket at a fixed rate. Each request consumes one token. If the bucket is empty, the request is rejected. The bucket has a maximum capacity, allowing bursts up to the bucket size while maintaining the average rate defined by the token refill rate.
+The token bucket algorithm is the most widely used rate limiting algorithm in production systems. It works by maintaining a bucket that holds tokens. Tokens are added to the bucket at a fixed rate (the refill rate). Each incoming request must consume one or more tokens to proceed. If the bucket is empty, the request is rejected or queued.
 
-The key parameters are **capacity** (maximum burst size) and **refill rate** (tokens added per second). A capacity of 10 with a refill rate of 2 tokens/second allows bursts of 10 requests while maintaining an average of 2 requests per second.
+The key parameters are **capacity** (maximum burst size) and **refill rate** (tokens added per second). A capacity of 10 with a refill rate of 2 tokens/second allows bursts of 10 requests while maintaining an average of 2 requests per second over time.
 
-### The Sliding Window Algorithm
+**How it works step by step:**
 
-The sliding window algorithm tracks requests within a rolling time window. Instead of resetting counters at fixed intervals, it considers the current time and counts all requests within the preceding window period. This eliminates the boundary spike problem of fixed window algorithms.
+1. A bucket starts with `capacity` tokens
+2. Every second, `refillRate` tokens are added (up to the capacity)
+3. When a request arrives, check if enough tokens exist
+4. If yes: subtract tokens, allow request
+5. If no: reject request (or queue it)
 
-### The Fixed Window Algorithm
+**Advantages:**
+- Allows burst traffic up to the bucket capacity
+- Smooth average rate over time
+- Memory efficient — only two values to track per client
+- Simple to implement and reason about
 
-The simplest approach: count requests in fixed time intervals (per second, per minute, per hour). When the count exceeds the limit, reject requests until the window resets. Simple to implement but allows up to 2x the intended rate at window boundaries.
+**Disadvantages:**
+- Burst behavior can surprise backends not designed for it
+- Doesn't provide precise per-second limiting
 
-### The Leaky Bucket Algorithm
-
-Requests enter a queue (bucket) and are processed at a fixed rate. If the queue is full, requests are rejected. This produces perfectly smooth output traffic regardless of input burstiness, but adds latency as requests wait in the queue.
-
-![Rate limiting algorithms comparison](https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=800&h=400&fit=crop)
-
-## Architecture and Design Patterns
-
-### The Gateway-Level Pattern
-
-Implement rate limiting at the API gateway level (Kong, AWS API Gateway, NGINX). This protects all backend services uniformly and centralizes rate limit configuration.
-
-### The Application-Level Pattern
-
-Implement rate limiting within your application code. This enables finer-grained control based on business logic (different limits for different user tiers, different endpoints, different operations).
-
-### The Distributed Pattern
-
-Use Redis or a similar distributed cache to coordinate rate limits across multiple application instances. This ensures consistent limiting regardless of which instance handles the request.
-
-### The Tiered Pattern
-
-Implement different rate limits for different client tiers: free (100 req/hour), pro (10K req/hour), enterprise (100K req/hour). This enables monetization while protecting the system.
-
-## Step-by-Step Implementation
-
-### Token Bucket Implementation
+**Real-world usage:** Amazon API Gateway uses token bucket internally. Stripe's rate limiting is based on a token bucket variant. Most cloud load balancers implement token bucket at the connection level.
 
 ```typescript
 class TokenBucket {
@@ -101,9 +107,115 @@ class TokenBucket {
     this.lastRefill = now;
   }
 }
+
+// Usage
+const bucket = new TokenBucket(10, 2); // 10 burst, 2/sec sustained
+const result = bucket.consume(1);
+console.log(result); // { allowed: true, remaining: 9, resetIn: 0 }
 ```
 
-### Distributed Rate Limiting with Redis
+### The Sliding Window Algorithm
+
+The sliding window algorithm tracks requests within a rolling time window. Instead of resetting counters at fixed intervals, it considers the current time and counts all requests within the preceding window period. This eliminates the boundary spike problem of fixed window algorithms.
+
+**Two variants exist:**
+
+1. **Sliding Window Counter:** Combines the current partial window with a weighted portion of the previous window. If you're 30% into the current minute, you count 70% of the previous minute's count plus 100% of the current minute's count.
+
+2. **Sliding Window Log:** Stores a timestamp for each request in a sorted set. Counts requests within the window by querying the sorted set. More precise but uses more memory.
+
+**The weighted formula:**
+
+```
+effectiveCount = (previousWindowCount × overlapPercentage) + currentWindowCount
+```
+
+For example, with a 1-minute window and limit of 100:
+- Previous minute: 80 requests
+- Current minute: 20 requests, 30 seconds elapsed (50% overlap)
+- Effective count: (80 × 0.5) + 20 = 60 requests
+
+**Advantages:**
+- No boundary spike problem
+- Smooth, predictable behavior
+- Memory efficient (counter variant)
+- Easy to understand and debug
+
+**Disadvantages:**
+- Slightly more complex than fixed window
+- Approximate in the counter variant
+- Log variant uses O(n) memory per client
+
+```typescript
+function slidingWindowCounter(
+  previousCount: number,
+  currentCount: number,
+  windowMs: number,
+  elapsedMs: number
+): number {
+  const overlapPercent = 1 - (elapsedMs / windowMs);
+  return Math.floor(previousCount * overlapPercent) + currentCount;
+}
+```
+
+### The Fixed Window Algorithm
+
+The simplest approach: count requests in fixed time intervals (per second, per minute, per hour). When the count exceeds the limit, reject requests until the window resets. Simple to implement but allows up to 2x the intended rate at window boundaries.
+
+**The boundary problem:**
+
+Imagine a limit of 100 requests per minute. A client sends 100 requests at 11:00:59 (end of window) and 100 more at 11:01:00 (start of next window). That's 200 requests in 2 seconds — double the intended rate.
+
+**When to use:** Simple internal services, rate limiting non-critical endpoints, or when you need the simplest possible implementation and can tolerate boundary spikes.
+
+```typescript
+class FixedWindowRateLimiter {
+  private windows: Map<string, { count: number; resetAt: number }> = new Map();
+
+  isAllowed(key: string, limit: number, windowMs: number): boolean {
+    const now = Date.now();
+    const window = this.windows.get(key);
+
+    if (!window || now >= window.resetAt) {
+      this.windows.set(key, { count: 1, resetAt: now + windowMs });
+      return true;
+    }
+
+    if (window.count >= limit) {
+      return false;
+    }
+
+    window.count++;
+    return true;
+  }
+}
+```
+
+### The Leaky Bucket Algorithm
+
+Requests enter a queue (bucket) and are processed at a fixed rate. If the queue is full, requests are rejected. This produces perfectly smooth output traffic regardless of input burstiness, but adds latency as requests wait in the queue.
+
+**Key difference from token bucket:** Leaky bucket shapes outgoing traffic to a fixed rate, while token bucket allows bursts. Leaky bucket is a traffic shaper; token bucket is a rate limiter.
+
+**Use cases:** Network traffic shaping, API gateways that need to protect fragile backends that can't handle any burst traffic, and systems where consistent throughput matters more than latency.
+
+![Rate limiting algorithms comparison](https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=800&h=400&fit=crop)
+
+## Distributed Rate Limiting with Redis
+
+In production, your API runs on multiple servers. In-memory rate limiting on each server is inconsistent — if you have 10 servers each allowing 100 requests/minute, a client can actually make 1,000 requests/minute by distributing across servers. You need a shared state.
+
+### Why Redis?
+
+Redis is the de facto standard for distributed rate limiting because:
+
+- **Sub-millisecond latency:** Rate limit checks add <1ms to each request
+- **Atomic operations:** Lua scripts ensure check-and-increment happen atomically
+- **Built-in data structures:** Sorted sets are perfect for sliding window logs
+- **TTL support:** Keys automatically expire, preventing memory leaks
+- **Cluster support:** Redis Cluster provides high availability for production
+
+### Sliding Window with Redis Sorted Sets
 
 ```typescript
 import Redis from 'ioredis';
@@ -120,45 +232,176 @@ async function slidingWindowRateLimit(
 
   const pipeline = redis.pipeline();
 
-  // Remove expired entries
+  // Remove expired entries outside the window
   pipeline.zremrangebyscore(key, 0, windowStart);
 
-  // Count current window requests
+  // Count requests still in the window
   pipeline.zcard(key);
 
-  // Add current request
+  // Add current request timestamp as a unique member
   pipeline.zadd(key, now.toString(), `${now}:${Math.random()}`);
 
-  // Set expiry on the key
+  // Auto-expire the key to prevent memory leaks
   pipeline.expire(key, Math.ceil(windowMs / 1000));
 
   const results = await pipeline.exec();
   const count = results![1][1] as number;
 
   if (count >= limit) {
-    // Get the oldest entry to calculate reset time
+    // Find when the oldest request in the window expires
     const oldest = await redis.zrange(key, 0, 0, 'WITHSCORES');
     const resetIn = oldest.length >= 2
       ? parseInt(oldest[1]) + windowMs - now
       : windowMs;
+
+    // Remove the request we just added since it's over limit
+    await redis.zrem(key, `${now}:${Math.random()}`);
 
     return { allowed: false, remaining: 0, resetIn: Math.ceil(resetIn) };
   }
 
   return { allowed: true, remaining: limit - count - 1, resetIn: 0 };
 }
+```
 
-// Express middleware
+### Atomic Rate Limiting with Lua Scripts
+
+For production systems, use Lua scripts to make the rate limit check atomic. This prevents race conditions where two concurrent requests both check the count, see it's under the limit, and both increment — exceeding the limit.
+
+```lua
+-- Lua script for atomic sliding window rate limiting
+-- KEYS[1] = rate limit key
+-- ARGV[1] = window size in milliseconds
+-- ARGV[2] = max requests allowed
+-- ARGV[3] = current timestamp
+
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local windowStart = now - window
+
+-- Remove expired entries
+redis.call('ZREMRANGEBYSCORE', key, 0, windowStart)
+
+-- Count current entries
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+  -- Add new entry
+  redis.call('ZADD', key, now, now .. ':' .. math.random())
+  redis.call('EXPIRE', key, math.ceil(window / 1000))
+  return {1, limit - count - 1}
+else
+  -- Get oldest entry for reset time
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local resetIn = window
+  if #oldest >= 2 then
+    resetIn = tonumber(oldest[2]) + window - now
+  end
+  return {0, 0, resetIn}
+end
+```
+
+```typescript
+// Load and execute the Lua script
+const RATE_LIMIT_SCRIPT = `
+  -- (Lua script from above)
+`;
+
+async function atomicRateLimit(
+  key: string,
+  limit: number,
+  windowMs: number
+): Promise<{ allowed: boolean; remaining: number; resetIn?: number }> {
+  const now = Date.now();
+  const result = await redis.eval(
+    RATE_LIMIT_SCRIPT,
+    1,
+    key,
+    windowMs.toString(),
+    limit.toString(),
+    now.toString()
+  ) as number[];
+
+  return {
+    allowed: result[0] === 1,
+    remaining: result[1],
+    resetIn: result[2] || undefined,
+  };
+}
+```
+
+## Architecture Patterns
+
+### Gateway-Level Rate Limiting
+
+Implement rate limiting at the API gateway level (Kong, AWS API Gateway, NGINX, Envoy). This protects all backend services uniformly and centralizes rate limit configuration.
+
+```nginx
+# NGINX rate limiting configuration
+http {
+    # Define rate limit zones
+    limit_req_zone $binary_remote_addr zone=api_general:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=api_expensive:10m rate=1r/s;
+    limit_req_zone $http_api_key zone=api_by_key:10m rate=100r/s;
+
+    server {
+        location /api/ {
+            # General API: 10 req/sec with burst of 20
+            limit_req zone=api_general burst=20 nodelay;
+            limit_req_status 429;
+
+            # Add rate limit headers
+            add_header X-RateLimit-Limit 10 always;
+        }
+
+        location /api/llm/ {
+            # Expensive endpoints: 1 req/sec
+            limit_req zone=api_expensive burst=5 nodelay;
+        }
+    }
+}
+```
+
+**Kong Gateway rate limiting:**
+
+```yaml
+# Kong rate limiting plugin configuration
+plugins:
+  - name: rate-limiting
+    config:
+      minute: 100
+      hour: 5000
+      policy: redis
+      redis:
+        host: redis-cluster.internal
+        port: 6379
+      hide_client_headers: false
+      fault_tolerant: true
+```
+
+### Application-Level Rate Limiting
+
+Implement rate limiting within your application code for finer-grained control based on business logic.
+
+```typescript
+import express from 'express';
+
+const app = express();
+
+// Rate limit middleware with tiered limits
 function rateLimitMiddleware(limit: number, windowMs: number) {
-  return async (req, res, next) => {
-    const key = `ratelimit:${req.ip}:${req.path}`;
-    const result = await slidingWindowRateLimit(key, limit, windowMs);
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const key = `ratelimit:${req.user?.id || req.ip}:${req.path}`;
+    const result = await atomicRateLimit(key, limit, windowMs);
 
+    // Always set rate limit headers
     res.set('X-RateLimit-Limit', limit.toString());
     res.set('X-RateLimit-Remaining', result.remaining.toString());
 
     if (!result.allowed) {
-      res.set('Retry-After', Math.ceil(result.resetIn / 1000).toString());
+      res.set('Retry-After', Math.ceil((result.resetIn || 1000) / 1000).toString());
       return res.status(429).json({
         error: 'Too many requests',
         retryAfter: result.resetIn,
@@ -168,24 +411,32 @@ function rateLimitMiddleware(limit: number, windowMs: number) {
     next();
   };
 }
+
+// Different limits for different endpoints
+app.use('/api/search', rateLimitMiddleware(10, 1000));      // 10/sec
+app.use('/api/data', rateLimitMiddleware(100, 60000));       // 100/min
+app.use('/api/llm/generate', rateLimitMiddleware(1, 1000));  // 1/sec
 ```
 
 ### Tiered Rate Limiting
+
+Implement different rate limits for different client tiers. This enables monetization while protecting the system.
 
 ```typescript
 interface RateLimitTier {
   name: string;
   requestsPerHour: number;
   burstLimit: number;
+  costMultiplier: number;
 }
 
 const TIERS: Record<string, RateLimitTier> = {
-  free: { name: 'free', requestsPerHour: 100, burstLimit: 10 },
-  pro: { name: 'pro', requestsPerHour: 10000, burstLimit: 100 },
-  enterprise: { name: 'enterprise', requestsPerHour: 100000, burstLimit: 1000 },
+  free: { name: 'free', requestsPerHour: 100, burstLimit: 10, costMultiplier: 1 },
+  pro: { name: 'pro', requestsPerHour: 10000, burstLimit: 100, costMultiplier: 0.5 },
+  enterprise: { name: 'enterprise', requestsPerHour: 100000, burstLimit: 1000, costMultiplier: 0.1 },
 };
 
-async function tieredRateLimit(req, res, next) {
+async function tieredRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
   const userTier = req.user?.tier || 'free';
   const tier = TIERS[userTier];
 
@@ -194,14 +445,14 @@ async function tieredRateLimit(req, res, next) {
   }
 
   const key = `ratelimit:${req.user?.id || req.ip}`;
-  const result = await slidingWindowRateLimit(key, tier.requestsPerHour, 3600000);
+  const result = await atomicRateLimit(key, tier.requestsPerHour, 3600000);
 
   res.set('X-RateLimit-Limit', tier.requestsPerHour.toString());
   res.set('X-RateLimit-Remaining', result.remaining.toString());
   res.set('X-RateLimit-Tier', tier.name);
 
   if (!result.allowed) {
-    res.set('Retry-After', Math.ceil(result.resetIn / 1000).toString());
+    res.set('Retry-After', Math.ceil((result.resetIn || 60000) / 1000).toString());
     return res.status(429).json({
       error: `Rate limit exceeded for ${tier.name} tier`,
       limit: tier.requestsPerHour,
@@ -213,43 +464,93 @@ async function tieredRateLimit(req, res, next) {
 }
 ```
 
-![Rate limiting monitoring dashboard](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+### Cost-Based Rate Limiting
 
-## Real-World Use Cases
+Instead of simple request counts, implement cost-based rate limiting where each API call has a cost based on compute, storage, or external service usage.
 
-### API Provider Protection
+```typescript
+const ENDPOINT_COSTS: Record<string, number> = {
+  '/api/search': 1,
+  '/api/data/export': 10,
+  '/api/llm/generate': 50,
+  '/api/llm/analyze': 100,
+};
 
-API providers use rate limiting to protect their services from abuse, ensure fair usage across clients, and enable tiered pricing. Free tiers get limited access, paid tiers get more, and enterprise customers get dedicated capacity.
+async function costBasedRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const cost = ENDPOINT_COSTS[req.path] || 1;
+  const budgetKey = `budget:${req.user?.id}`;
+  const budget = 1000; // Cost units per hour
 
-### DDoS Mitigation
+  const result = await atomicRateLimit(budgetKey, budget, 3600000);
 
-Rate limiting is the first line of defense against distributed denial-of-service attacks. By limiting requests per IP, per API key, and globally, you can prevent attackers from overwhelming your infrastructure.
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: 'Cost budget exceeded',
+      message: `Each request to ${req.path} costs ${cost} units`,
+    });
+  }
 
-### Cost Management
+  next();
+}
+```
 
-For APIs that call expensive downstream services (LLMs, payment processors, external databases), rate limiting controls costs by preventing runaway usage. Set per-client and global limits that align with your budget.
+## Comparison of Rate Limiting Algorithms
 
-### Fair Resource Allocation
-
-In multi-tenant systems, rate limiting ensures that no single tenant can monopolize shared resources. This maintains quality of service for all users, even when one tenant has a traffic spike.
+| Algorithm | Burst Handling | Smoothness | Memory | Complexity | Best For |
+|-----------|---------------|------------|--------|------------|----------|
+| Token Bucket | Allows bursts | Moderate | Low (2 values) | Low | General purpose, API gateways |
+| Sliding Window | Smooth | High | Medium | Medium | Production APIs |
+| Fixed Window | Boundary spikes | Low | Low (1 counter) | Low | Simple internal services |
+| Leaky Bucket | No bursts | Very High | Medium (queue) | Medium | Traffic shaping |
+| Sliding Window Log | Smooth | Very High | High (O(n)) | High | Precise limiting |
 
 ## Best Practices for Production
 
-1. **Use sliding window over fixed window** — Sliding window eliminates the boundary spike problem and provides smoother rate limiting behavior.
+### 1. Return Clear Rate Limit Headers
 
-2. **Return clear rate limit headers** — Include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` headers in every response.
+Always include standard rate limit headers in every response — not just when limits are hit. This lets clients implement proactive backoff.
 
-3. **Use Redis for distributed rate limiting** — In-memory rate limiting doesn't work across multiple instances. Redis provides consistent, shared state.
+```typescript
+// IETF draft standard headers
+res.set('RateLimit-Limit', '100');           // Max requests in window
+res.set('RateLimit-Remaining', '42');         // Requests remaining
+res.set('RateLimit-Reset', '1640000000');     // Unix timestamp when window resets
+res.set('Retry-After', '30');                 // Seconds to wait (on 429)
+```
 
-4. **Implement different limits for different endpoints** — Read endpoints can have higher limits than write endpoints. Expensive operations should have lower limits.
+### 2. Use Redis for Distributed State
 
-5. **Provide upgrade paths** — When a client hits their rate limit, include information about how to upgrade their tier. Turn rate limiting into a business opportunity.
+In-memory rate limiting doesn't work across multiple instances. Redis provides consistent, shared state with sub-millisecond latency. Use Redis Cluster for high availability.
 
-6. **Monitor rate limit hits** — Track which clients hit limits most often. This identifies abusive clients and also legitimate users who might need higher limits.
+### 3. Set Per-Endpoint Limits
 
-7. **Use IP + API key for identification** — Rate limit by API key when available, falling back to IP address. This prevents circumvention while supporting legitimate use cases.
+Read endpoints can have higher limits than write endpoints. Expensive operations (LLM calls, data exports) should have lower limits.
 
-8. **Graceful degradation** — Instead of hard rejection, consider throttling (slowing responses) or serving cached responses when approaching limits.
+### 4. Implement Graceful Degradation
+
+Instead of hard 429 rejection, consider:
+- **Throttling:** Slow responses instead of rejecting
+- **Cached responses:** Serve stale data when approaching limits
+- **Queue and retry:** Queue expensive requests and process them when capacity allows
+
+### 5. Monitor Rate Limit Events
+
+Track which clients hit limits most often. This identifies abusive clients and legitimate users who might need higher limits.
+
+```typescript
+// Log rate limit events for monitoring
+function logRateLimitEvent(key: string, allowed: boolean, remaining: number) {
+  metrics.increment('rate_limit.total', { allowed: allowed.toString() });
+  if (!allowed) {
+    metrics.increment('rate_limit.rejected', { key });
+    logger.warn('Rate limit exceeded', { key, remaining });
+  }
+}
+```
+
+### 6. Handle Clock Skew
+
+In distributed systems, server clocks can drift. Use Redis server time instead of local time for consistent rate limiting across instances.
 
 ## Common Pitfalls and Solutions
 
@@ -262,26 +563,7 @@ In multi-tenant systems, rate limiting ensures that no single tenant can monopol
 | No monitoring | Can't identify abuse or capacity issues | Log all rate limit events |
 | Hard rejection only | Poor user experience | Implement throttling and cached fallbacks |
 | Clock skew in distributed systems | Inconsistent limiting | Use Redis server time, not client time |
-
-### Debugging Rate Limit Issues
-
-When clients report rate limiting issues, check: is the client actually making the expected number of requests? Are rate limits calculated correctly (check Redis state)? Is there clock skew between servers? Are rate limit headers accurate? Use request logging to trace the exact request counts.
-
-## Performance Optimization
-
-Optimize rate limiting performance by using Redis pipelines (batch multiple operations), implementing local caching with short TTLs (check local cache before Redis), and using Lua scripts in Redis for atomic operations.
-
-For high-throughput APIs, implement rate limiting at the edge (CDN or load balancer level) before requests reach your application servers. This reduces the load on your application and provides faster rejection.
-
-## Comparison of Rate Limiting Algorithms
-
-| Algorithm | Burst Handling | Smoothness | Memory | Complexity | Best For |
-|-----------|---------------|------------|--------|------------|----------|
-| Token Bucket | Allows bursts | Moderate | Low | Low | General purpose |
-| Sliding Window | Smooth | High | Medium | Medium | Production APIs |
-| Fixed Window | Boundary spikes | Low | Low | Low | Simple applications |
-| Leaky Bucket | No bursts | Very High | Medium | Medium | Traffic shaping |
-| Sliding Window Log | Smooth | Very High | High | High | Precise limiting |
+| Race conditions | Limits exceeded under concurrency | Use Lua scripts for atomic operations |
 
 ## Advanced Patterns
 
@@ -289,19 +571,127 @@ For high-throughput APIs, implement rate limiting at the edge (CDN or load balan
 
 Dynamically adjust rate limits based on system load. When CPU usage exceeds 80%, reduce rate limits by 50%. When error rates spike, throttle aggressively. This prevents cascading failures under extreme load.
 
+```typescript
+async function adaptiveRateLimit(key: string, baseLimit: number): Promise<boolean> {
+  const cpuUsage = await getSystemCpuUsage();
+  const errorRate = await getRecentErrorRate();
+
+  let adjustedLimit = baseLimit;
+
+  // Reduce limits when system is under stress
+  if (cpuUsage > 0.8) adjustedLimit *= 0.5;
+  else if (cpuUsage > 0.6) adjustedLimit *= 0.75;
+
+  // Reduce limits when error rate is high
+  if (errorRate > 0.1) adjustedLimit *= 0.5;
+
+  return atomicRateLimit(key, Math.floor(adjustedLimit), 60000);
+}
+```
+
 ### Geographic Rate Limiting
 
 Apply different rate limits based on client geography. Clients in regions closer to your data centers might get higher limits due to lower latency costs, while distant regions get lower limits to manage bandwidth.
 
-### Rate Limit Budgets
+### Rate Limit Budgets with Refill
 
-Instead of simple request counts, implement cost-based rate limiting. Each API call has a cost based on compute, storage, or external service usage. Clients have a cost budget that depletes with each call.
+Implement a credit-based system where clients receive a budget that refills over time. This is more flexible than simple windowed limits and maps naturally to API pricing models.
 
-## Future Outlook
+```typescript
+class RateLimitBudget {
+  private redis: Redis;
+  private refillRate: number; // tokens per second
+  private maxBudget: number;
 
-Rate limiting is evolving toward **intent-aware limiting** — understanding the purpose of requests and applying different limits accordingly. A batch data export might count as 100 requests against the limit, while a status check counts as 0.1. This enables more fair and nuanced resource allocation.
+  async consume(key: string, cost: number): Promise<{ allowed: boolean; remaining: number }> {
+    const script = `
+      local key = KEYS[1]
+      local cost = tonumber(ARGV[1])
+      local refill_rate = tonumber(ARGV[2])
+      local max_budget = tonumber(ARGV[3])
+      local now = tonumber(ARGV[4])
 
-The convergence of rate limiting with **AI-powered traffic analysis** will create systems that automatically detect and mitigate abuse patterns, adjust limits based on predicted demand, and provide personalized rate limits based on usage patterns.
+      local data = redis.call('HMGET', key, 'tokens', 'last_refill')
+      local tokens = tonumber(data[1]) or max_budget
+      local last_refill = tonumber(data[2]) or now
+
+      -- Refill tokens based on elapsed time
+      local elapsed = now - last_refill
+      tokens = math.min(max_budget, tokens + elapsed * refill_rate)
+
+      if tokens >= cost then
+        tokens = tokens - cost
+        redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+        redis.call('EXPIRE', key, 3600)
+        return { 1, tokens }
+      else
+        redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+        redis.call('EXPIRE', key, 3600)
+        return { 0, tokens }
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, key, cost, this.refillRate, this.maxBudget, Date.now() / 1000);
+    return { allowed: result[0] === 1, remaining: result[1] };
+  }
+}
+```
+
+### Client-Side Rate Limiting
+
+Server-side rate limiting protects your infrastructure, but client-side rate limiting improves user experience by preventing requests that will be rejected. Implement a client-side rate limiter that tracks request counts and queues or drops requests before they hit the network.
+
+```typescript
+class ClientRateLimiter {
+  private queue: Array<{ resolve: Function; reject: Function }> = [];
+  private tokens: number;
+  private lastRefill: number;
+
+  constructor(
+    private maxTokens: number,
+    private refillRate: number // tokens per second
+  ) {
+    this.tokens = maxTokens;
+    this.lastRefill = Date.now();
+  }
+
+  async acquire(): Promise<void> {
+    this.refill();
+
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return;
+    }
+
+    // Queue the request until tokens are available
+    return new Promise((resolve, reject) => {
+      this.queue.push({ resolve, reject });
+    });
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    this.tokens = Math.min(this.maxTokens, this.tokens + elapsed * this.refillRate);
+    this.lastRefill = now;
+
+    // Process queued requests
+    while (this.queue.length > 0 && this.tokens >= 1) {
+      this.tokens -= 1;
+      const { resolve } = this.queue.shift()!;
+      resolve();
+    }
+  }
+}
+
+// Usage
+const limiter = new ClientRateLimiter(100, 10); // 100 burst, 10/sec sustained
+
+async function callAPI(endpoint: string) {
+  await limiter.acquire();
+  return fetch(endpoint);
+}
+```
 
 ## Conclusion
 
@@ -309,12 +699,15 @@ Rate limiting is a fundamental API protection mechanism that ensures reliability
 
 **Key takeaways:**
 
-1. Use sliding window algorithm for production APIs — it eliminates boundary spikes and provides smooth limiting
-2. Implement distributed rate limiting with Redis for multi-instance deployments
-3. Return clear rate limit headers (`X-RateLimit-*`, `Retry-After`) in every response
-4. Implement tiered rate limits aligned with your business model
-5. Set per-endpoint limits based on operation cost and resource usage
-6. Monitor rate limit events to identify abuse and capacity issues
-7. Provide graceful degradation (throttling, cached responses) instead of hard rejection
+1. Use **token bucket** for general-purpose rate limiting — it handles bursts gracefully and is memory efficient
+2. Use **sliding window** when you need smooth, predictable limiting without boundary spikes
+3. Implement **distributed rate limiting with Redis** for multi-instance deployments using Lua scripts for atomicity
+4. Return **clear rate limit headers** (`RateLimit-*`, `Retry-After`) in every response
+5. Implement **tiered rate limits** aligned with your business model
+6. Set **per-endpoint limits** based on operation cost and resource usage
+7. Monitor rate limit events to identify abuse and capacity issues
+8. Provide **graceful degradation** (throttling, cached responses) instead of hard rejection
+9. Use **cost-based limiting** for APIs with heterogeneous endpoint costs
+10. Consider **adaptive rate limiting** that adjusts based on system health metrics
 
-Start by implementing basic rate limiting at the API gateway level with a simple sliding window algorithm. Once working, add tiered limits, per-endpoint configuration, and monitoring. The investment in rate limiting pays dividends in system reliability and cost control.
+Start by implementing basic rate limiting at the API gateway level with a simple sliding window algorithm. Once working, add tiered limits, per-endpoint configuration, cost-based budgets, and monitoring. The investment in rate limiting pays dividends in system reliability, cost control, and fair resource allocation.
