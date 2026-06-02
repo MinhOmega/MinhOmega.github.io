@@ -1,62 +1,450 @@
 ---
 title: "React Fiber Architecture: How React Works Internally"
 date: "2021-07-20"
-description: "Understand React Fiber: reconciliation, priority scheduling, and concurrent rendering."
-tags: ["React", "Fiber", "Architecture", "Internals"]
+description: "Deep dive into React Fiber: the reconciliation engine, work loop, priority scheduling, and how React renders components efficiently."
+tags: ["React", "Fiber", "Architecture", "Performance"]
 published: true
 author: "MinhVo"
 ---
 
 ## Introduction
 
-React Fiber Architecture: How React Works Internally is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+React Fiber is the reconciliation engine that powers React 16 and beyond. It's the complete rewrite of React's core algorithm that enables features like concurrent rendering, Suspense, and priority-based updates. Understanding Fiber isn't just academic — it explains why React behaves the way it does, why certain patterns are faster than others, and how to write components that leverage React's scheduling capabilities.
 
-## Key Concepts
+Before Fiber, React used a recursive reconciliation algorithm that couldn't pause, abort, or prioritize work. Once rendering started, it had to complete synchronously. Fiber changed this by introducing a linked-list tree structure that allows React to pause work, resume it later, and abandon low-priority updates when higher-priority ones arrive.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![React internals](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## The Problem Fiber Solves
 
-## Practical Implementation
+### Pre-Fiber Reconciliation
 
-Let's look at a practical example:
+In React 15 and earlier, reconciliation was a recursive process:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// Simplified pre-Fiber reconciliation
+function reconcileChildren(element) {
+  // This runs recursively — cannot be interrupted
+  const children = element.props.children;
+  for (const child of children) {
+    updateDOM(child);       // Block until done
+    reconcileChildren(child); // Then recurse into children
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing React solutions in production environments.
+This approach has a critical limitation: if the component tree is large, reconciliation blocks the main thread for potentially hundreds of milliseconds. During this time, the browser can't respond to user input — clicks, scrolls, and animations freeze.
+
+### The 16ms Budget
+
+Browsers render at 60fps, meaning each frame has a 16ms budget. If JavaScript runs for longer than 16ms, frames are dropped and the UI feels janky. With large component trees, React's recursive reconciliation could easily exceed this budget.
+
+## Fiber's Solution: Incremental Rendering
+
+Fiber breaks rendering into small units of work that can be started, paused, and resumed:
+
+```typescript
+// Fiber work loop (simplified)
+function workLoop(deadline) {
+  while (nextUnitOfWork && !shouldYield()) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+  }
+
+  if (nextUnitOfWork) {
+    // Not done — schedule continuation
+    requestIdleCallback(workLoop);
+  } else {
+    // All work done — commit to DOM
+    commitRoot();
+  }
+}
+```
+
+The key insight: React can yield control back to the browser between units of work, allowing the browser to handle high-priority tasks (user input, animations) before React resumes rendering.
+
+## The Fiber Node Structure
+
+Each React element has a corresponding Fiber node. Fiber nodes form a linked-list tree:
+
+```typescript
+interface Fiber {
+  // Identity
+  type: string | Function | null;
+  key: string | null;
+
+  // Tree structure (linked list)
+  child: Fiber | null;    // First child
+  sibling: Fiber | null;  // Next sibling
+  return: Fiber | null;   // Parent fiber
+  index: number;
+
+  // State
+  pendingProps: any;
+  memoizedState: any;
+  memoizedProps: any;
+
+  // Effects
+  effectTag: number;       // Placement, Update, Deletion
+  nextEffect: Fiber | null;
+  firstEffect: Fiber | null;
+  lastEffect: Fiber | null;
+
+  // Work
+  expirationTime: number;
+  mode: number;
+  lanes: number;
+
+  // Alternates
+  alternate: Fiber | null; // Double buffering
+}
+```
+
+### The Linked-List Tree
+
+Unlike the recursive tree structure, Fiber uses a linked-list traversal:
+
+```typescript
+// Traditional tree (recursive)
+//        A
+//       / \
+//      B   C
+//     / \   \
+//    D   E   F
+
+// Fiber linked-list traversal
+// A → child → B → child → D → sibling → E → return → B → sibling → C → child → F
+//
+// Traversal order: A, B, D, E, C, F
+// Always: visit child first, then sibling, then return to parent
+```
+
+This structure allows React to pause at any node, save its position, and resume later — something impossible with the recursive approach.
+
+![Architecture diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## The Two Phases
+
+### Render Phase (Interruptible)
+
+The render phase creates new Fiber nodes, compares them with previous nodes, and determines what changes need to happen. This phase is pure — it doesn't modify the DOM:
+
+```typescript
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // 1. Process this fiber
+  const Component = fiber.type;
+  if (typeof Component === 'function') {
+    // Function component — call it
+    const children = Component(fiber.pendingProps);
+    reconcileChildren(fiber, children);
+  } else {
+    // Host component (div, span, etc.) — reconcile children
+    reconcileChildren(fiber, fiber.pendingProps.children);
+  }
+
+  // 2. Return next unit of work
+  if (fiber.child) return fiber.child;
+
+  let next = fiber;
+  while (next) {
+    if (next.sibling) return next.sibling;
+    next = next.return;
+  }
+
+  return null; // No more work
+}
+```
+
+### Commit Phase (Synchronous)
+
+The commit phase applies all changes to the DOM. This phase is synchronous and cannot be interrupted — partial updates would create inconsistent UI:
+
+```typescript
+function commitRoot() {
+  // 1. Commit mutations
+  commitWork(rootFiber.firstEffect);
+
+  // 2. Run lifecycle effects
+  // componentDidMount, componentDidUpdate, useEffect callbacks
+}
+
+function commitWork(fiber: Fiber | null) {
+  while (fiber) {
+    switch (fiber.effectTag) {
+      case PLACEMENT:
+        fiber.stateNode.appendChild(fiber.child?.stateNode);
+        break;
+      case UPDATE:
+        updateDOMProperties(fiber.stateNode, fiber.memoizedProps, fiber.pendingProps);
+        break;
+      case DELETION:
+        fiber.return?.stateNode.removeChild(fiber.stateNode);
+        break;
+    }
+    fiber = fiber.nextEffect;
+  }
+}
+```
+
+## Double Buffering
+
+React maintains two trees: the **current** tree (what's on screen) and the **work-in-progress** tree (what's being built). This is similar to double buffering in graphics:
+
+```typescript
+// When a component updates:
+function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
+  let workInProgress = current.alternate;
+
+  if (!workInProgress) {
+    // First render — create new fiber
+    workInProgress = new Fiber(current.type, pendingProps);
+    workInProgress.alternate = current;
+    current.alternate = workInProgress;
+  } else {
+    // Reuse fiber from previous render
+    workInProgress.pendingProps = pendingProps;
+    workInProgress.effectTag = UPDATE;
+  }
+
+  return workInProgress;
+}
+```
+
+When the commit phase completes, React swaps the trees: the work-in-progress becomes the current tree, and the old current tree becomes the next work-in-progress.
+
+## Priority Scheduling with Lanes
+
+React 18 introduced the Lanes model for priority scheduling. Different updates have different priorities:
+
+```typescript
+// Priority levels (simplified)
+const SyncLane = 0b0000000000000000000000000000001;
+const InputContinuousLane = 0b0000000000000000000000000000100;
+const DefaultLane = 0b0000000000000000000000000010000;
+const TransitionLane = 0b0000000000000000000000010000000;
+const IdleLane = 0b0100000000000000000000000000000;
+```
+
+Higher-priority updates can interrupt lower-priority work:
+
+```typescript
+// User input — high priority, cannot be deferred
+function handleInput(value) {
+  startTransition(() => {
+    setInputValue(value); // SyncLane — processes immediately
+  });
+}
+
+// Filter results — lower priority, can be deferred
+function handleFilter(filter) {
+  startTransition(() => {
+    setFilter(filter); // TransitionLane — can be interrupted
+  });
+}
+```
+
+## How useEffect Works in Fiber
+
+Fiber nodes track effects using a linked list:
+
+```typescript
+// When useEffect is called during render:
+function useEffect(callback, deps) {
+  const fiber = getCurrentFiber();
+
+  const effect = {
+    tag: PassiveEffect,  // useEffect
+    create: callback,
+    deps: deps,
+    destroy: null,
+  };
+
+  // Add to fiber's effect list
+  if (!fiber.updateQueue) {
+    fiber.updateQueue = { lastEffect: effect };
+    effect.next = effect; // Circular linked list
+  } else {
+    const lastEffect = fiber.updateQueue.lastEffect;
+    effect.next = lastEffect.next;
+    lastEffect.next = effect;
+    fiber.updateQueue.lastEffect = effect;
+  }
+}
+```
+
+During the commit phase, React processes these effects:
+
+```typescript
+function commitPassiveEffects(fiber: Fiber) {
+  const updateQueue = fiber.updateQueue;
+  if (!updateQueue) return;
+
+  let effect = updateQueue.lastEffect.next; // Start of circular list
+
+  do {
+    if (effect.tag === PassiveEffect) {
+      // Run cleanup from previous render
+      if (effect.destroy) {
+        effect.destroy();
+      }
+      // Run new effect
+      effect.destroy = effect.create();
+    }
+    effect = effect.next;
+  } while (effect !== updateQueue.lastEffect.next);
+}
+```
+
+![Performance visualization](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Concurrent Features Enabled by Fiber
+
+### Suspense
+
+Suspense works by allowing a component to "suspend" — telling React to skip it and come back later:
+
+```typescript
+function SuspenseBoundary({ children, fallback }) {
+  try {
+    return children;
+  } catch (promise) {
+    if (promise instanceof Promise) {
+      // Component suspended — show fallback
+      promise.then(() => {
+        // Data ready — re-render
+        scheduleUpdate(fiber);
+      });
+      return fallback;
+    }
+    throw promise; // Re-throw non-promise errors
+  }
+}
+```
+
+### useTransition
+
+```typescript
+function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    // Urgent: update input immediately
+    setQuery(e.target.value);
+
+    // Transition: can be deferred
+    startTransition(() => {
+      setResults(filterResults(e.target.value));
+    });
+  }
+
+  return (
+    <div>
+      <input value={query} onChange={handleChange} />
+      {isPending ? <Spinner /> : <ResultList results={results} />}
+    </div>
+  );
+}
+```
+
+### useDeferredValue
+
+```typescript
+function SearchResults({ query }) {
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery;
+
+  return (
+    <div style={{ opacity: isStale ? 0.7 : 1 }}>
+      <ExpensiveList query={deferredQuery} />
+    </div>
+  );
+}
+```
+
+## Practical Implications
+
+### Why Keys Matter
+
+Fiber uses keys to match old and new children:
+
+```typescript
+// Without keys — React re-renders all items
+<ul>
+  {items.map((item, i) => <li key={i}>{item.name}</li>)}
+</ul>
+
+// With stable keys — React reuses and moves items
+<ul>
+  {items.map(item => <li key={item.id}>{item.name}</li>)}
+</ul>
+```
+
+### Why Functional Updates Matter
+
+```typescript
+// BAD: Stale closure
+setCount(count + 1); // Uses count from render closure
+
+// GOOD: Functional update
+setCount(prev => prev + 1); // Always uses latest value
+```
+
+With concurrent rendering, the `count` variable might be stale by the time the update processes. Functional updates always use the latest state.
+
+### Why Batching Matters
+
+React 18 automatically batches all state updates:
+
+```typescript
+function handleClick() {
+  // Before React 18: two re-renders
+  // React 18: one re-render
+  setA(1);
+  setB(2);
+}
+```
+
+Fiber makes this possible because updates are queued as lanes and processed together.
 
 ## Best Practices
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+1. **Use stable keys** — Help Fiber efficiently match and reuse nodes
+2. **Use functional updates** — Avoid stale closures in concurrent mode
+3. **Use `startTransition`** — Mark non-urgent updates for deferred processing
+4. **Keep components pure** — Side effects in render phase cause bugs
+5. **Avoid large component trees** — Even with Fiber, large trees are expensive
+6. **Use `React.memo` wisely** — Prevent unnecessary re-renders of expensive components
 
 ## Common Pitfalls
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Index as key | Poor list performance | Use stable unique IDs |
+| Side effects in render | Unpredictable behavior | Use useEffect |
+| Stale closures | Wrong values in concurrent mode | Use functional updates |
+| Large component trees | Slow reconciliation | Split into smaller components |
+| Mutating state directly | Skips re-render | Use setState or state setter |
+
+### Render Phase and Commit Phase
+
+React's rendering process is divided into two distinct phases that have very different characteristics and implications for application performance. The render phase is where React calls component functions, compares the results with the previous virtual DOM tree, and determines what changes need to be made. This phase is pure and side-effect free, meaning it can be interrupted, restarted, or discarded without any visible impact on the user interface. React can work on the render phase asynchronously, yielding control back to the browser between processing individual components to ensure that high-priority updates like user input are handled promptly. The commit phase is where React applies the calculated changes to the actual DOM. This phase must be synchronous and cannot be interrupted because partial updates to the real DOM would create visual inconsistencies that users could observe. Understanding this two-phase architecture helps developers write components that work well with React's scheduling system and avoid patterns that force synchronous rendering.
+
+### Concurrent Features and Suspense
+
+The concurrent rendering capabilities enabled by the Fiber architecture represent a fundamental shift in how React handles updates and asynchronous operations. Concurrent features allow React to prepare multiple versions of the user interface simultaneously, switching between them based on priority and user interaction. This capability enables patterns like automatic batching of state updates, transition APIs that keep the current interface responsive while preparing new content, and Suspense boundaries that provide elegant loading states for asynchronous operations. Developers who understand the underlying Fiber mechanics can leverage these concurrent features more effectively, building applications that feel faster and more responsive even when performing complex operations like data fetching, code splitting, and heavy computations.
 
 ## Conclusion
 
-React Fiber Architecture: How React Works Internally is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+React Fiber is a complete rethinking of how React renders. By breaking work into small units, React can prioritize updates, pause rendering, and keep the UI responsive even under heavy load. The linked-list tree structure, double buffering, and lane-based scheduling enable features like Suspense, useTransition, and automatic batching.
+
+Understanding Fiber helps you write better React code: stable keys for efficient reconciliation, functional updates for correctness in concurrent mode, and startTransition for responsive user interfaces. It's the foundation that makes React 18's concurrent features possible.
+
+Key takeaways:
+
+1. **Fiber breaks rendering into interruptible units** — Small units of work that can be paused and resumed
+2. **Two phases: render (interruptible) and commit (synchronous)** — Pure rendering, then DOM mutations
+3. **Double buffering** — Two trees swapped atomically for consistency
+4. **Lanes model** — Priority-based scheduling for different update types
+5. **Suspense and transitions** — Built on Fiber's ability to pause and resume work
+6. **Keys and functional updates** — Critical for correctness in concurrent mode
