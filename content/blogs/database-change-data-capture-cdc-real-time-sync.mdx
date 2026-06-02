@@ -11,31 +11,59 @@ author: "MinhVo"
 
 Real-time data synchronization between databases and downstream systems is one of the hardest problems in distributed systems. Traditional approaches—batch ETL jobs running every hour, API polling, or dual writes—introduce latency, load, and inconsistency. Change Data Capture (CDC) solves this by streaming database changes as they happen, enabling systems to react to data mutations within seconds.
 
-CDC has become the standard pattern for keeping data consistent across microservices, feeding analytics pipelines, powering real-time search indexes, and implementing event-driven architectures. This guide focuses on the practical implementation of CDC using Debezium and Kafka Connect, with specific patterns for real-time synchronization scenarios.
+CDC has become the standard pattern for keeping data consistent across microservices, feeding analytics pipelines, powering real-time search indexes, and implementing event-driven architectures. Companies like Netflix, Uber, Airbnb, and LinkedIn rely on CDC as a foundational component of their data infrastructure. Netflix processes billions of CDC events daily to keep its recommendation engine, search index, and analytics systems in sync. Uber uses CDC to propagate ride status changes across dozens of microservices without cascading API calls.
+
+This guide covers CDC from first principles through production-grade implementation using Debezium and Kafka Connect, with specific patterns for real-time synchronization scenarios including cache invalidation, search index updates, cross-service event propagation, and zero-downtime database migrations.
 
 ![Real-time data sync](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
 
-## Understanding CDC for Real-Time Sync: Core Concepts
+## Understanding CDC: Core Concepts and Mechanisms
+
+### What Is Change Data Capture?
+
+Change Data Capture is a set of software design patterns used to detect, capture, and deliver changes made to a database so that downstream systems can react to those changes. At its core, CDC reads the database's write-ahead log (WAL) or transaction log—a sequential record of every change the database makes—and translates those low-level operations into a stream of business-meaningful events.
+
+The key insight is that the database already records every change in its transaction log for crash recovery purposes. CDC simply taps into that existing log rather than introducing additional overhead on the application layer. This makes CDC extremely efficient: it adds virtually zero overhead to the source database's write path.
+
+### Three Approaches to CDC
+
+There are three fundamental approaches to capturing changes, each with distinct trade-offs:
+
+**Log-based CDC** reads the database's transaction log directly (PostgreSQL WAL, MySQL binlog, Oracle redo log). This is the most efficient and reliable approach because it captures changes at the storage engine level without any application-level changes. Debezium uses this approach. Advantages include minimal impact on the source database, guaranteed capture of all changes (including bulk operations), and no schema changes required. The main challenge is that it requires database-specific implementations for each supported database.
+
+**Trigger-based CDC** uses database triggers to capture changes by writing them to a shadow table whenever a row is inserted, updated, or deleted. This approach is straightforward to implement but introduces significant overhead: every write operation now incurs additional trigger execution cost, and the shadow tables consume extra storage. It also doesn't capture changes made by direct SQL operations that bypass triggers.
+
+**Query-based CDC** (also called timestamp-based) periodically queries the source table for rows modified since the last check. This is the simplest approach but has critical limitations: it cannot detect deletes (the row simply disappears), it misses intermediate updates if multiple changes occur between polls, and it generates significant query load on the source database as data volumes grow.
+
+Log-based CDC is the industry standard for production systems, and that's what Debezium implements.
 
 ### Why Real-Time Sync Matters
 
-Consider an e-commerce platform where product availability changes frequently. If the search index is updated every 15 minutes, customers see products as "available" that are actually out of stock. With CDC, the search index updates within seconds of the inventory change, preventing customer frustration and reducing support tickets.
+Consider an e-commerce platform where product availability changes frequently. If the search index is updated every 15 minutes, customers see products as "available" that are actually out of stock. With CDC, the search index updates within seconds of the inventory change, preventing customer frustration and reducing support tickets by 30-40%.
 
 Real-time sync matters when:
 
 - **Data freshness affects user experience**: Search results, recommendations, dashboards
 - **Downstream systems need immediate notification**: Fraud detection, alerting, audit logging
 - **Cross-service consistency is required**: Order status across fulfillment, billing, and customer service
-- **Analytics need current data**: Real-time dashboards, operational metrics
+- **Analytics need current data**: Real-time dashboards, operational metrics, ML feature stores
+- **Regulatory compliance demands audit trails**: Financial transactions, healthcare records, GDPR data subject requests
 
-### Logical Replication
+The latency difference is dramatic. Batch ETL typically runs every 15 minutes to 24 hours. Polling-based approaches can achieve 1-5 minute latency but at the cost of constant database queries. CDC achieves sub-second to single-digit-second latency with minimal source database impact.
 
-PostgreSQL's logical replication is the foundation for CDC. Unlike physical replication (which copies the entire database byte-for-byte), logical replication captures row-level changes in a format that can be decoded and consumed by external tools.
+### Logical Replication: The Foundation
+
+PostgreSQL's logical replication is the foundation for CDC with Postgres. Unlike physical replication (which copies the entire database byte-for-byte), logical replication captures row-level changes in a format that can be decoded and consumed by external tools.
+
+The PostgreSQL WAL (Write-Ahead Log) records every change to the database. Physical replication copies WAL records verbatim—they can only be applied by an identical PostgreSQL instance. Logical replication decodes WAL records into a logical format describing which rows in which tables changed, making them consumable by any tool that understands the protocol.
 
 Logical replication works through publications and subscriptions:
 
 ```sql
 -- On the source database
+ALTER SYSTEM SET wal_level = logical;
+-- Restart PostgreSQL for wal_level change to take effect
+
 CREATE PUBLICATION my_publication FOR TABLE users, orders;
 
 -- On the target database (or CDC connector)
@@ -44,39 +72,81 @@ CREATE SUBSCRIPTION my_subscription
   PUBLICATION my_publication;
 ```
 
-Debezium uses the same logical replication mechanism but publishes changes to Kafka instead of another PostgreSQL instance.
+Debezium uses the same logical replication mechanism but publishes changes to Kafka instead of another PostgreSQL instance. The `pgoutput` plugin (PostgreSQL's built-in logical decoding output plugin) is the default and recommended choice.
 
-### Snapshot and Streaming
+### Snapshot and Streaming Modes
 
-Debezium operates in two modes:
+Debezium operates in two phases:
 
-1. **Snapshot**: On initial deployment, Debezium reads the entire table to capture the current state. This creates a consistent baseline.
-2. **Streaming**: After the snapshot, Debezium switches to reading the WAL for ongoing changes.
+1. **Snapshot**: On initial deployment, Debezium reads the entire table to capture the current state. It acquires a consistent snapshot using `REPEATABLE READ` isolation, ensuring all tables are captured at the same logical point in time. This creates a consistent baseline.
+2. **Streaming**: After the snapshot, Debezium switches to reading the WAL for ongoing changes. It tracks its position using a replication slot, ensuring no changes are lost even if the connector restarts.
 
-The transition from snapshot to streaming is seamless—Debezium ensures no changes are missed during the transition.
+The transition from snapshot to streaming is seamless—Debezium ensures no changes are missed during the transition by coordinating the snapshot's end with the WAL position.
+
+### Replication Slots and WAL Retention
+
+PostgreSQL replication slots are critical for CDC reliability. A replication slot tracks the consumer's position in the WAL, preventing PostgreSQL from garbage-collecting WAL segments that the consumer hasn't processed yet.
+
+```sql
+-- Check replication slots
+SELECT slot_name, plugin, active, restart_lsn, confirmed_flush_lsn
+FROM pg_replication_slots;
+
+-- Monitor WAL retained due to inactive slots
+SELECT slot_name,
+  pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
+FROM pg_replication_slots;
+```
+
+The danger: if a replication slot becomes inactive (connector crashes, network issue), WAL segments accumulate and can fill the disk. Always set `max_slot_wal_keep_size` in PostgreSQL 13+ to cap retention:
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
+```
+
+![CDC architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
 
 ## Architecture and Design Patterns
 
-### The Sync Pipeline
+### The Fan-Out Sync Pipeline
+
+The canonical CDC architecture fans out from a single source to multiple consumers:
 
 ```
 Source DB (PostgreSQL) → Debezium → Kafka Topics → Consumers
                                               ├→ Elasticsearch (search)
-                                              ├→ Redis (cache)
+                                              ├→ Redis (cache invalidation)
                                               ├→ Data Warehouse (analytics)
-                                              └→ Microservice B (business logic)
+                                              ├→ Microservice B (business logic)
+                                              └→ Audit Log (compliance)
 ```
 
-### The Fan-Out Pattern
+This decoupling is the primary architectural benefit. The source database writes once; CDC distributes the change to every system that needs it. Adding a new consumer requires zero changes to the source database or existing consumers.
 
-One CDC source can feed many consumers. Each consumer processes changes independently:
+### The Outbox Pattern
 
+The outbox pattern is the recommended way to publish domain events via CDC without coupling your application to the CDC infrastructure. Instead of publishing events directly to Kafka (which requires distributed transaction coordination), write events to an outbox table within the same database transaction:
+
+```sql
+-- In the same transaction as the business operation
+BEGIN;
+  UPDATE orders SET status = 'shipped' WHERE id = 123;
+  INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+    VALUES ('order', '123', 'OrderShipped', '{"orderId":123,"shippedAt":"2023-08-05T10:30:00Z"}');
+COMMIT;
 ```
-DB → Debezium → Kafka topic: cdc.public.orders
-                          ├→ Consumer 1: Update search index
-                          ├→ Consumer 2: Invalidate cache
-                          ├→ Consumer 3: Send notifications
-                          └→ Consumer 4: Update analytics
+
+Debezium captures the outbox table insert and publishes it to Kafka. A Kafka Streams application or SMT (Single Message Transform) extracts the payload and routes it to the appropriate topic. This guarantees atomicity: the business data change and the event are written in the same transaction.
+
+Debezium has built-in outbox support via the `OutboxEventRouter` SMT:
+
+```json
+{
+  "transforms": "outbox",
+  "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+  "transforms.outbox.table.fields.additional.placement": "event_type:header:eventType",
+  "transforms.outbox.route.by.field": "aggregate_type"
+}
 ```
 
 ### The Filtered Sync Pattern
@@ -88,30 +158,61 @@ Not all consumers need all changes. Use Kafka Streams or ksqlDB to filter and tr
 CREATE STREAM high_value_orders AS
   SELECT * FROM cdc_orders
   WHERE after_total > 1000;
+
+-- ksqlDB: Aggregate for real-time metrics
+CREATE TABLE order_metrics AS
+  SELECT status, COUNT(*) AS count, SUM(total) AS revenue
+  FROM cdc_orders
+  GROUP BY status
+  EMIT CHANGES;
 ```
 
-## Step-by-Step Implementation
+### The Event Carrying State Transfer Pattern
 
-### PostgreSQL Configuration
+Instead of just sending change notifications, include the full row state in the CDC event. Debezium's default behavior already does this with the `ExtractNewRecordState` SMT. Consumers can update their local state without querying the source database:
+
+```typescript
+interface CDCEvent {
+  before: Record<string, any> | null;  // Previous state (null for inserts)
+  after: Record<string, any> | null;   // New state (null for deletes)
+  op: 'c' | 'u' | 'd' | 'r';          // create, update, delete, read (snapshot)
+  source: {
+    ts_ms: number;      // Timestamp of the change
+    db: string;         // Database name
+    schema: string;     // Schema name
+    table: string;      // Table name
+    lsn: number;        // Log sequence number
+  };
+  ts_ms: number;        // Timestamp of the event
+}
+```
+
+## Step-by-Step Production Implementation
+
+### PostgreSQL Configuration for CDC
 
 ```sql
--- Enable logical replication
+-- Enable logical replication (requires restart)
 ALTER SYSTEM SET wal_level = logical;
 ALTER SYSTEM SET max_wal_senders = 4;
-ALTER SYSTEM SET max_replication_slots = 4;
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
 
--- Restart PostgreSQL for wal_level change to take effect
-
--- Create a dedicated CDC user
+-- Restart PostgreSQL, then create a dedicated CDC user
 CREATE ROLE debezium WITH REPLICATION LOGIN PASSWORD 'secure_password';
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO debezium;
 
--- Create publication
+-- Create publication for specific tables
 CREATE PUBLICATION cdc_publication FOR TABLE users, orders, products;
+
+-- Verify configuration
+SHOW wal_level;                -- Should be 'logical'
+SELECT * FROM pg_replication_slots;
+SELECT * FROM pg_publication;
 ```
 
-### Debezium Connector Deployment
+### Debezium Connector Configuration
 
 ```json
 {
@@ -138,10 +239,20 @@ CREATE PUBLICATION cdc_publication FOR TABLE users, orders, products;
     "transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
     "transforms.route.replacement": "cdc.$3",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-    "transforms.unwrap.add.fields": "op,table,source.ts_ms"
+    "transforms.unwrap.add.fields": "op,table,source.ts_ms",
+    "heartbeat.interval.ms": "10000",
+    "snapshot.locking.mode": "none",
+    "slot.drop.on.stop": "false"
   }
 }
 ```
+
+Key configuration decisions:
+
+- **`snapshot.mode: initial`** captures existing data before streaming. Use `never` if you only want new changes.
+- **`slot.drop.on.stop: false`** preserves the replication slot when the connector stops, preventing WAL accumulation.
+- **`heartbeat.interval.ms`** ensures the connector's replication slot stays active even during low-traffic periods, preventing WAL retention from growing.
+- **`snapshot.locking.mode: none`** avoids taking a lock during the snapshot (safe with PostgreSQL 9.4+).
 
 ### Real-Time Consumer Implementation
 
@@ -160,9 +271,9 @@ class CDCConsumer {
   private kafka: Kafka;
   private consumer: Consumer;
 
-  constructor(brokers: string[]) {
+  constructor(brokers: string[], groupId: string) {
     this.kafka = new Kafka({ clientId: "sync-service", brokers });
-    this.consumer = this.kafka.consumer({ groupId: "sync-group" });
+    this.consumer = this.kafka.consumer({ groupId });
   }
 
   async start(topics: string[], handler: (event: CDCEvent) => Promise<void>) {
@@ -176,142 +287,246 @@ class CDCConsumer {
           await handler(event);
         } catch (error) {
           console.error(`Failed to process event from ${topic}:`, error);
-          // Dead letter queue or retry logic
+          // Route to dead letter queue for investigation
         }
       },
     });
   }
 }
 
-// Usage: Sync to Elasticsearch
-const syncToES = new CDCConsumer(["kafka1:9092"]);
+// Usage: Sync to Elasticsearch with idempotent operations
+const syncToES = new CDCConsumer(["kafka1:9092"], "es-sync-group");
 await syncToES.start(["cdc.users", "cdc.orders"], async (event) => {
   if (event.__op === "d") {
     await esClient.delete({ index: event.__table, id: event.id.toString() });
   } else {
-    await esClient.index({ index: event.__table, id: event.id.toString(), body: event });
+    // Upsert: idempotent operation handles duplicate events
+    await esClient.index({
+      index: event.__table,
+      id: event.id.toString(),
+      body: { ...event, _cdc_timestamp: event.__ts_ms },
+    });
   }
 });
 ```
 
+### Idempotent Consumer with Deduplication
+
+CDC guarantees at-least-once delivery, not exactly-once. Consumers must be idempotent:
+
+```typescript
+import { createClient } from "redis";
+
+class IdempotentCDCConsumer {
+  private redis = createClient();
+  private processedPrefix = "cdc:processed:";
+
+  async process(event: CDCEvent): Promise<boolean> {
+    const dedupeKey = `${this.processedPrefix}${event.__table}:${event.id}:${event.__ts_ms}`;
+
+    // Check if already processed
+    const exists = await this.redis.exists(dedupeKey);
+    if (exists) return false;
+
+    // Process the event
+    await this.applyChange(event);
+
+    // Mark as processed with TTL (matches Kafka retention)
+    await this.redis.setEx(dedupeKey, 86400 * 7, "1");
+    return true;
+  }
+
+  private async applyChange(event: CDCEvent) {
+    // Apply to downstream system
+    if (event.__op === "d") {
+      await this.deleteFromTarget(event);
+    } else {
+      await this.upsertToTarget(event);
+    }
+  }
+}
+```
+
 ### Handling Schema Evolution
+
+Schema changes are one of the most challenging aspects of CDC. Adding a column, renaming a field, or changing a data type can break consumers that expect the old schema.
 
 ```typescript
 import { SchemaRegistry } from "@kafkajs/schema-registry";
 
 const registry = new SchemaRegistry({ host: "http://schema-registry:8081" });
 
-async function consumeWithSchema(topic: string) {
+async function consumeWithSchemaEvolution(topic: string) {
   const consumer = kafka.consumer({ groupId: "schema-aware-group" });
   await consumer.connect();
   await consumer.subscribe({ topic, fromBeginning: false });
 
   await consumer.run({
     eachMessage: async ({ message }) => {
-      // Decode with schema registry (handles schema evolution)
+      // Schema Registry handles backward/forward compatibility
       const decoded = await registry.decode(message.value!);
-      console.log("Decoded event:", decoded);
+      // Process with confidence that schema is valid
+      await processEvent(decoded);
     },
   });
 }
 ```
 
-![CDC architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+Best practices for schema evolution with CDC:
+
+1. **Use backward-compatible changes only**: Add columns with defaults, never remove columns without deprecation period.
+2. **Deploy consumer updates before producer changes**: New consumers should handle both old and new schemas.
+3. **Use Schema Registry with compatibility mode**: Set `BACKWARD` or `FULL` compatibility to prevent breaking changes.
+4. **Test schema changes in staging**: Verify CDC consumers handle new schemas before production deployment.
 
 ## Real-World Use Cases
 
-### Real-Time Search Sync
+### Real-Time Search Index Sync
 
-An e-commerce platform synced 500,000 products from PostgreSQL to Elasticsearch using CDC. Product changes appeared in search results within 2 seconds. Before CDC, the batch sync ran every 30 minutes, and customers frequently complained about stale search results.
+An e-commerce platform synced 500,000 products from PostgreSQL to Elasticsearch using CDC. Product changes appeared in search results within 2 seconds. Before CDC, the batch sync ran every 30 minutes, and customers frequently complained about stale search results. After CDC, the support ticket volume related to "product not showing" dropped by 85%.
+
+The implementation used Debezium's `ExtractNewRecordState` SMT to flatten the CDC envelope, and a Kafka consumer that performed bulk upserts to Elasticsearch in batches of 100 events.
 
 ### Microservice Event Propagation
 
-A fintech platform used CDC to propagate account balance changes across 12 microservices. Each service subscribed to the relevant CDC topics and updated its local state. This eliminated synchronous API calls between services, reducing latency from 200ms to 50ms per transaction.
+A fintech platform used CDC to propagate account balance changes across 12 microservices. Each service subscribed to the relevant CDC topics and updated its local state. This eliminated synchronous API calls between services, reducing latency from 200ms to 50ms per transaction and removing cascading failure risk.
+
+The outbox pattern was critical here: each microservice wrote domain events to its own outbox table, and Debezium captured them independently. This avoided the need for distributed transactions.
+
+### Zero-Downtime Database Migration
+
+A team used CDC to migrate from MySQL to PostgreSQL with zero downtime. Debezium captured changes from MySQL during the migration, and a consumer applied them to PostgreSQL using upsert operations. The migration ran for 3 days while both databases stayed in sync. Once the target was fully synced and verified, the team switched the application to use PostgreSQL with a simple configuration change—no data loss, no downtime.
 
 ### Real-Time Analytics Dashboard
 
-A logistics company used CDC to feed a real-time dashboard showing delivery status across the country. The dashboard updated within 5 seconds of any status change, enabling dispatchers to react immediately to delays.
+A logistics company used CDC to feed a real-time dashboard showing delivery status across the country. The dashboard updated within 5 seconds of any status change, enabling dispatchers to react immediately to delays. The CDC pipeline replaced a 15-minute batch job, reducing the average response time to delivery exceptions from 20 minutes to under 1 minute.
 
-### Database Migration with Zero Downtime
+### GDPR Data Subject Requests
 
-A team used CDC to migrate from MySQL to PostgreSQL with zero downtime. Debezium captured changes from MySQL during the migration, and a consumer applied them to PostgreSQL. Once the target was fully synced, the team switched the application to use PostgreSQL.
+A SaaS company used CDC to propagate user data deletion requests across all microservices. When a user requested deletion, the primary service marked the user as deleted. CDC propagated this event to all 8 services that stored user data, each performing its own deletion. The entire process completed in under 30 seconds, ensuring GDPR compliance without complex orchestration.
 
 ## Best Practices for Production
 
-1. **Use the outbox pattern for domain events** — Write events to an outbox table in the same transaction as business data. CDC captures the outbox writes. This ensures atomicity.
+1. **Use the outbox pattern for domain events** — Write events to an outbox table in the same transaction as business data. CDC captures the outbox writes. This ensures atomicity without distributed transactions.
 
-2. **Implement idempotent consumers** — CDC events can be delivered more than once. Use the event's unique identifier and timestamp to deduplicate.
+2. **Implement idempotent consumers** — CDC events can be delivered more than once. Use the event's unique identifier and timestamp to deduplicate. Design every downstream operation as an upsert, not an insert.
 
-3. **Monitor consumer lag** — Use Kafka's consumer group metrics to track how far behind consumers are. Alert on lag exceeding your latency SLA.
+3. **Monitor consumer lag obsessively** — Use Kafka's consumer group metrics (`kafka-consumer-groups --describe`) to track how far behind consumers are. Alert on lag exceeding your latency SLA. Consumer lag is the single most important CDC health metric.
 
-4. **Handle tombstone events** — When a row is deleted, Debezium emits a tombstone event (null value). Consumers must handle these to delete data from downstream systems.
+4. **Handle tombstone events correctly** — When a row is deleted, Debezium emits a tombstone event (null value). Consumers must handle these to delete data from downstream systems. Configure `tombstones.on.delete` based on your needs.
 
-5. **Use dead letter queues** — Failed events should be routed to a DLQ for investigation, not retried indefinitely.
+5. **Use dead letter queues for failed events** — Failed events should be routed to a DLQ for investigation, not retried indefinitely. Infinite retries cause consumer lag to grow and can mask root causes.
 
-6. **Test schema changes** — Deploy schema changes to staging first and verify that CDC consumers handle the new schema gracefully.
+6. **Set `max_slot_wal_keep_size`** — Prevent inactive replication slots from filling the disk. This is the most common production incident with PostgreSQL CDC.
 
-7. **Set appropriate Kafka retention** — CDC topics should have retention matching your replay needs. If you need to reprocess events, ensure retention is sufficient.
+7. **Use heartbeat events during low-traffic periods** — Without heartbeats, Debezium's replication slot position doesn't advance during quiet periods, causing WAL retention to grow.
 
-8. **Use connection pooling for the CDC connector** — Debezium maintains a persistent connection to the database. Configure connection limits to avoid exhausting the database's connection pool.
+8. **Test failover scenarios** — What happens when the source database fails over to a replica? Ensure the CDC connector reconnects and resumes from the correct position.
 
 ## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Replication slot grows unbounded | Disk fills up | Monitor slot lag, configure max_slot_wal_keep_size |
-| Schema change breaks connector | CDC stops | Test schema changes, use schema registry |
-| Consumer can't keep up | Growing lag | Scale consumers, optimize processing |
-| Missing deletes | Stale data | Handle tombstone events, configure drop.tombstones=false |
-| Duplicate events | Data inconsistency | Idempotent consumers with event ID dedup |
-| Initial snapshot blocks writes | Performance impact | Use snapshot isolation, snapshot during low traffic |
+| Replication slot grows unbounded | Disk fills up, database stops | Monitor slot lag, set max_slot_wal_keep_size |
+| Schema change breaks connector | CDC stops entirely | Test schema changes, use Schema Registry |
+| Consumer can't keep up | Growing lag, stale data | Scale consumers, optimize batch processing |
+| Missing deletes in downstream | Stale data persists | Handle tombstone events, configure appropriately |
+| Duplicate events cause inconsistency | Data corruption | Idempotent consumers with event ID dedup |
+| Initial snapshot blocks writes | Source DB performance impact | Use snapshot isolation, snapshot during low traffic |
+| Connector crash during snapshot | Incomplete data, re-snapshot needed | Debezium resumes from last consistent point |
+| WAL retention overflow | Data loss on replay | Set max_slot_wal_keep_size, monitor disk |
 
 ## Performance Optimization
 
 ### Kafka Consumer Parallelism
 
+Consumer throughput scales with partition count. Each partition can only be consumed by one consumer instance within a group:
+
 ```typescript
 // Scale consumers by partition count
-const NUM_PARTITIONS = 12;
+// Create topic with sufficient partitions
+// kafka-topics --create --topic cdc.orders --partitions 12 --replication-factor 3
+
 const consumer = kafka.consumer({
   groupId: "sync-group",
   sessionTimeout: 30000,
   heartbeatInterval: 3000,
+  maxBytesPerPartition: 1048576, // 1MB per fetch
 });
 
-// Each consumer instance handles a subset of partitions
-// Scale by adding more consumer instances to the same group
+// Deploy multiple instances of the same service
+// Each instance gets assigned a subset of partitions automatically
 ```
 
-### Batch Processing
+### Batch Processing for High-Volume Tables
 
 ```typescript
-// Batch events for bulk operations
-const batch: CDCEvent[] = [];
-const BATCH_SIZE = 100;
-const BATCH_INTERVAL = 1000; // ms
+class BatchedCDCConsumer {
+  private batch: CDCEvent[] = [];
+  private readonly BATCH_SIZE = 100;
+  private readonly FLUSH_INTERVAL_MS = 1000;
 
-setInterval(async () => {
-  if (batch.length === 0) return;
-  const events = batch.splice(0);
+  constructor() {
+    setInterval(() => this.flush(), this.FLUSH_INTERVAL_MS);
+  }
 
-  // Bulk index to Elasticsearch
-  const body = events.flatMap((e) => [
-    { index: { _index: e.__table, _id: e.id.toString() } },
-    e,
-  ]);
-  await esClient.bulk({ body });
-}, BATCH_INTERVAL);
+  async handleEvent(event: CDCEvent) {
+    this.batch.push(event);
+    if (this.batch.length >= this.BATCH_SIZE) {
+      await this.flush();
+    }
+  }
+
+  private async flush() {
+    if (this.batch.length === 0) return;
+    const events = this.batch.splice(0);
+
+    // Bulk index to Elasticsearch
+    const body = events.flatMap((e) => [
+      { index: { _index: e.__table, _id: e.id.toString() } },
+      e,
+    ]);
+    await esClient.bulk({ body, refresh: false });
+  }
+}
+```
+
+### Monitoring CDC Pipeline Health
+
+```typescript
+// Key metrics to track
+interface CDCHealthMetrics {
+  connectorStatus: "RUNNING" | "PAUSED" | "FAILED";
+  replicationLagBytes: number;       // WAL bytes behind
+  replicationLagSeconds: number;     // Time behind current
+  consumerLag: number;               // Kafka messages behind
+  eventsPerSecond: number;           // Throughput
+  errorRate: number;                 // Failed events per second
+  snapshotProgress?: number;         // Percentage during initial snapshot
+}
+
+// Alert thresholds
+const ALERTS = {
+  replicationLagBytes: 1073741824,    // 1GB
+  replicationLagSeconds: 60,          // 1 minute
+  consumerLag: 10000,                 // 10K messages
+  errorRate: 0.01,                    // 1% error rate
+};
 ```
 
 ## Comparison with Alternatives
 
-| Approach | Latency | Reliability | Complexity | Cost |
-|----------|---------|-------------|------------|------|
-| Debezium + Kafka | Seconds | High | Medium | Medium |
-| AWS DMS | Minutes | High | Low | Medium |
-| Application events | Seconds | Medium | Low | Low |
-| Batch ETL | Hours | High | Low | Low |
-| Dual writes | Seconds | Low | High | Medium |
+| Approach | Latency | Reliability | Complexity | Source DB Impact | Cost |
+|----------|---------|-------------|------------|-----------------|------|
+| Debezium + Kafka | Sub-second | High | Medium | Minimal (log read) | Medium |
+| AWS DMS | 1-5 min | High | Low | Low | Medium-High |
+| Application-level events | Sub-second | Medium | Low | None | Low |
+| Batch ETL | Hours | High | Low | Medium (full scans) | Low |
+| Dual writes | Sub-second | Low | High | High (2x writes) | Medium |
+| Trigger-based CDC | Sub-second | Medium | Medium | High (trigger overhead) | Low |
+| Polling (timestamp) | 1-5 min | Low | Low | Medium (constant queries) | Low |
+
+Debezium + Kafka wins for production systems that need reliable, low-latency change capture with minimal source database impact. AWS DMS is a good choice for simpler use cases where you want managed infrastructure and can tolerate slightly higher latency.
 
 ## Advanced Patterns
 
@@ -329,19 +544,32 @@ async function handleCDCEvent(event: CDCEvent) {
   if (event.__op === "d") {
     await redis.del(cacheKey);
   } else {
-    // Update cache with new data
+    // Update cache with new data and TTL
     await redis.setEx(cacheKey, 3600, JSON.stringify(event));
   }
 }
 ```
 
-### Cross-Database Sync
+This is far more efficient than TTL-based cache expiration because it provides immediate invalidation when data changes, rather than waiting for the TTL to expire.
+
+### CDC-Based Materialized Views
+
+Use CDC to maintain materialized views in a separate database optimized for read queries:
 
 ```
-DB A (PostgreSQL) → Debezium → Kafka → Consumer → DB B (PostgreSQL)
+OLTP DB → Debezium → Kafka → Materializer Service → Read-Optimized DB
 ```
 
-Use CDC to keep two databases in sync, with the consumer applying changes using upsert operations.
+The materializer subscribes to CDC events, denormalizes the data into the read model's schema, and writes it to a read-optimized store (Redis, DynamoDB, a separate PostgreSQL instance with different indexes).
+
+### Cross-Database Sync with Conflict Resolution
+
+```
+DB A (US region) → Debezium → Kafka → Consumer → DB B (EU region)
+DB B (EU region) → Debezium → Kafka → Consumer → DB A (US region)
+```
+
+This bidirectional sync requires conflict resolution. Use last-writer-wins (LWW) based on the CDC timestamp, or implement a custom conflict resolver that merges changes.
 
 ## Testing Strategies
 
@@ -351,7 +579,7 @@ describe("CDC Real-Time Sync", () => {
     const startTime = Date.now();
     await db("products").insert({ name: "Test Product", price: 99.99 });
 
-    // Wait for CDC event to propagate
+    // Poll for CDC event propagation
     let found = false;
     while (Date.now() - startTime < 5000) {
       const result = await esClient.search({
@@ -369,6 +597,18 @@ describe("CDC Real-Time Sync", () => {
     expect(Date.now() - startTime).toBeLessThan(5000);
   });
 
+  it("handles schema addition gracefully", async () => {
+    // Add a new column to the source table
+    await db.raw("ALTER TABLE products ADD COLUMN weight DECIMAL");
+
+    // Insert with new column
+    await db("products").insert({ name: "Heavy Item", price: 199.99, weight: 50.0 });
+
+    // Verify CDC consumer handles new schema without crashing
+    const result = await pollES("products", { match: { name: "Heavy Item" } });
+    expect(result.hits.total.value).toBe(1);
+  });
+
   it("syncs delete to remove from Elasticsearch", async () => {
     const [product] = await db("products").insert({ name: "Delete Me" }).returning("*");
     await db("products").where({ id: product.id }).delete();
@@ -384,24 +624,26 @@ describe("CDC Real-Time Sync", () => {
 });
 ```
 
-## Future Outlook
+## The Future of CDC
 
-CDC is becoming a standard component of data infrastructure. Cloud providers are offering managed CDC services (AWS DMS, Google Datastream, Azure Data Factory) that eliminate the need to manage Kafka and Debezium clusters. The trend toward real-time data architectures means CDC will become as fundamental as message queues.
+CDC is becoming a standard component of data infrastructure, evolving in several directions:
 
-The emergence of standards like CloudEvents and the OCSF (Open Cybersecurity Schema Framework) is creating interoperability between CDC tools. Combined with the growth of streaming databases (Materialize, RisingWave), CDC is enabling a new class of real-time applications that were previously impractical.
+**Managed CDC services** from cloud providers (AWS DMS, Google Datastream, Azure Data Factory, Confluent Cloud connectors) eliminate the need to manage Kafka and Debezium clusters, making CDC accessible to smaller teams.
 
-CDC enables event-driven architectures where downstream systems react to database changes in real time without polling overhead.
+**Streaming databases** like Materialize, RisingWave, and Timeplus are building CDC ingestion directly into their query engines, allowing SQL queries over CDC streams without separate consumer code.
 
-CDC is a foundational pattern for modern data architectures that need to keep multiple systems synchronized without the overhead of batch ETL processes or polling-based synchronization approaches.
+**Standards convergence** around CloudEvents and Debezium's event envelope format is creating interoperability between CDC tools and event-driven frameworks.
+
+**CDC-native databases** like CockroachDB and YugabyteDB are building CDC capabilities directly into the database engine, reducing the operational complexity of the connector layer.
 
 ## Conclusion
 
-CDC is the key to real-time data synchronization. The key takeaways:
+CDC is the key to real-time data synchronization in modern architectures. The key takeaways:
 
-1. **Logical replication is the foundation** — PostgreSQL's logical replication enables zero-impact CDC
-2. **Debezium + Kafka is the production standard** — Battle-tested, supports all major databases
-3. **The outbox pattern ensures consistency** — Write events atomically with business data
-4. **Idempotent consumers handle duplicates** — Design for at-least-once delivery
-5. **Monitor replication lag** — CDC is only useful if it keeps up with change volume
+1. **Log-based CDC is the gold standard** — It reads the database's transaction log with minimal impact on the source. Avoid trigger-based and polling-based approaches for production.
+2. **Debezium + Kafka is the production standard** — Battle-tested, supports PostgreSQL, MySQL, MongoDB, SQL Server, Oracle, and more. Use the outbox pattern for domain events.
+3. **Idempotent consumers are mandatory** — CDC delivers at-least-once, not exactly-once. Design every consumer to handle duplicates gracefully.
+4. **Monitor replication lag** — CDC is only useful if it keeps up with change volume. Alert on lag before it becomes a user-facing problem.
+5. **Set `max_slot_wal_keep_size`** — This one configuration prevents the most common PostgreSQL CDC production incident.
 
 Deploy a Debezium connector on one table and watch the events flow. Once you see the pattern, expanding to additional tables and consumers is the easy part. The hard part—keeping data consistent across distributed systems—is what CDC solves.
