@@ -9,54 +9,380 @@ author: "MinhVo"
 
 ## Introduction
 
-Database Concurrency Control: MVCC and Locking is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+When multiple transactions access the same data simultaneously, the database must ensure that concurrent operations do not corrupt data or produce inconsistent results. This is the fundamental challenge of concurrency control, and it is one of the most complex aspects of database engine design. Two dominant approaches have emerged: pessimistic locking (block conflicting operations before they execute) and optimistic concurrency control using Multi-Version Concurrency Control or MVCC (allow concurrent operations to proceed and detect conflicts at commit time).
 
-## Key Concepts
+PostgreSQL uses MVCC as its primary concurrency control mechanism, and its implementation is one of the most sophisticated in any open-source database. Instead of locking rows when they are read, PostgreSQL maintains multiple versions of each row, allowing readers and writers to operate concurrently without blocking each other. This design provides excellent read performance (readers never block writers and writers never block readers) at the cost of increased storage overhead and the need for periodic cleanup via `VACUUM`.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide explores MVCC internals in PostgreSQL, the different isolation levels and their tradeoffs, lock types and deadlock prevention, and practical patterns for building concurrent applications that handle the most challenging edge cases.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Database concurrency and isolation](https://images.unsplash.com/photo-1544383835-bda2bc66a55d?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding MVCC: Core Concepts
 
-Let's look at a practical example:
+### How MVCC Works
+
+In a database without MVCC, concurrent access to the same row requires locks: readers acquire shared locks, writers acquire exclusive locks, and transactions wait for conflicting locks to be released. This creates contention that limits concurrency — a write-heavy workload can block all reads, and long-running reads can block writes.
+
+MVCC eliminates this contention by maintaining multiple versions of each row. When a transaction updates a row, PostgreSQL does not overwrite the existing version in place. Instead, it creates a new version of the row and marks the old version as obsolete. Each transaction sees a consistent snapshot of the database as of the time it started, regardless of concurrent modifications by other transactions.
+
+Each row version (called a "tuple" in PostgreSQL) has two system columns: `xmin` (the transaction ID that created the version) and `xmax` (the transaction ID that deleted or replaced the version, or zero if the version is still current). A transaction can see a row version only if `xmin` is committed and `xmax` is either zero or not yet committed from the transaction's perspective.
+
+### Transaction Isolation Levels
+
+The SQL standard defines four isolation levels, each providing different guarantees about what anomalies are possible:
+
+| Isolation Level | Dirty Read | Non-Repeatable Read | Phantom Read | Serialization Anomaly |
+|----------------|------------|--------------------|--------------|-----------------------|
+| Read Uncommitted | Possible | Possible | Possible | Possible |
+| Read Committed | Not possible | Possible | Possible | Possible |
+| Repeatable Read | Not possible | Not possible | Possible (in theory) | Possible |
+| Serializable | Not possible | Not possible | Not possible | Not possible |
+
+PostgreSQL's implementation of these levels is stronger than the SQL standard requires. `Read Committed` in PostgreSQL never allows dirty reads (unlike some other databases). `Repeatable Read` in PostgreSQL also prevents phantom reads (the standard allows them at this level). `Serializable` uses Serializable Snapshot Isolation (SSI), which detects serialization anomalies at commit time without the performance overhead of traditional two-phase locking.
+
+## Read Committed: The Default
+
+### Behavior
+
+Read Committed is PostgreSQL's default isolation level. Each statement within a transaction sees only data committed before that statement began. This means that if you run the same SELECT query twice within a transaction, you might get different results if another transaction committed changes between your two queries.
+
+```sql
+-- Session 1
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+-- balance is now 400 (was 500)
+-- Transaction NOT committed yet
+
+-- Session 2 (concurrent)
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;
+-- Returns 500 (sees the committed version, not Session 1's uncommitted change)
+
+-- Session 1
+COMMIT;
+
+-- Session 2
+SELECT balance FROM accounts WHERE id = 1;
+-- Now returns 400 (sees Session 1's committed change)
+-- This is a "non-repeatable read"
+COMMIT;
+```
+
+### Use Cases and Limitations
+
+Read Committed is appropriate for most OLTP workloads where each statement operates independently and the application does not need consistent snapshots across multiple queries. It provides the highest concurrency because transactions rarely block each other.
+
+The limitation is that it allows non-repeatable reads and phantom reads, which can cause logical errors in applications that read data, make a decision based on that data, and then write based on the decision. The classic example is a transfer: read both accounts' balances, verify sufficient funds, then debit one and credit the other. Between the read and the write, another transaction could modify the balance.
+
+### Avoiding Lost Updates in Read Committed
+
+```sql
+-- WRONG: Lost update risk
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- Returns 500
+-- Application logic: new_balance = 500 - 100 = 400
+UPDATE accounts SET balance = 400 WHERE id = 1;
+-- If another transaction also modified balance between SELECT and UPDATE,
+-- that modification is LOST
+COMMIT;
+
+-- CORRECT: Use SELECT FOR UPDATE to acquire a row lock
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;
+-- Acquires exclusive lock on the row — other transactions wait
+-- Returns the latest committed balance (500)
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- BETTER: Use atomic update
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance >= 100;
+-- Returns 0 rows affected if insufficient funds — no race condition
+COMMIT;
+```
+
+## Repeatable Read
+
+### Behavior
+
+Repeatable Read provides a consistent snapshot of the database for the entire duration of the transaction. All statements within the transaction see the same snapshot — data committed after the transaction started is invisible. This eliminates non-repeatable reads and (in PostgreSQL's implementation) phantom reads.
+
+```sql
+-- Session 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts WHERE id = 1;  -- Returns 500
+
+-- Session 2 (concurrent)
+BEGIN;
+UPDATE accounts SET balance = 400 WHERE id = 1;
+COMMIT;
+
+-- Session 1
+SELECT balance FROM accounts WHERE id = 1;
+-- Still returns 500! (sees the snapshot from transaction start)
+COMMIT;
+```
+
+### Conflict Detection
+
+In Repeatable Read, if a transaction tries to modify a row that has been modified by another transaction since the snapshot was taken, PostgreSQL raises a serialization error:
+
+```sql
+-- Session 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+UPDATE accounts SET balance = 300 WHERE id = 1;
+-- Succeeds (row hasn't been modified by another committed transaction)
+
+-- Session 2 (concurrent)
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+UPDATE accounts SET balance = 250 WHERE id = 1;
+-- BLOCKS — waits for Session 1 to commit or rollback
+
+-- Session 1
+COMMIT;
+
+-- Session 2
+-- ERROR: could not serialize access due to concurrent update
+-- The application must retry the entire transaction
+```
+
+### Handling Serialization Errors
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+async function transferFunds(
+  fromId: number,
+  toId: number,
+  amount: number,
+  maxRetries = 3
+) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+
+      const from = await db.query(
+        'SELECT balance FROM accounts WHERE id = $1 FOR UPDATE',
+        [fromId]
+      );
+
+      if (from.rows[0].balance < amount) {
+        throw new Error('Insufficient funds');
+      }
+
+      await db.query(
+        'UPDATE accounts SET balance = balance - $1 WHERE id = $2',
+        [amount, fromId]
+      );
+      await db.query(
+        'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+        [amount, toId]
+      );
+
+      await db.query('COMMIT');
+      return { success: true, attempts: attempt + 1 };
+    } catch (error) {
+      await db.query('ROLLBACK');
+
+      if (error.code === '40001' && attempt < maxRetries - 1) {
+        // Serialization failure — retry
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 ```
 
-This pattern demonstrates the core approach to implementing Database solutions in production environments.
+## Serializable Snapshot Isolation (SSI)
 
-## Best Practices
+### How SSI Works
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+PostgreSQL's Serializable isolation level uses Serializable Snapshot Isolation (SSI), an optimistic concurrency control algorithm that detects dangerous structures in the serialization graph at commit time. Unlike traditional two-phase locking (which prevents conflicts by blocking), SSI allows concurrent transactions to proceed and checks for serialization anomalies only when committing.
 
-## Common Pitfalls
+SSI tracks read-write dependencies between transactions. If a cycle is detected in the dependency graph (meaning a serialization anomaly exists), one of the transactions involved is aborted and must be retried. This provides true serializable isolation with significantly better performance than two-phase locking in most workloads.
 
-| Pitfall | Impact | Solution |
-|---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+```sql
+-- Serializable anomaly example (write skew)
+
+-- Two doctors are on call; at least one must remain on call
+-- Initial state: Dr. Alice is on call, Dr. Bob is on call
+
+-- Session 1
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT on_call FROM doctors WHERE name = 'Alice';  -- true
+-- Alice wants to go off call, but only if Bob is on call
+
+-- Session 2 (concurrent)
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT on_call FROM doctors WHERE name = 'Bob';  -- true
+-- Bob wants to go off call, but only if Alice is on call
+
+-- Session 1
+UPDATE doctors SET on_call = false WHERE name = 'Alice';
+COMMIT;  -- Succeeds
+
+-- Session 2
+UPDATE doctors SET on_call = false WHERE name = 'Bob';
+COMMIT;
+-- ERROR: could not serialize access due to read/write dependencies
+-- This prevents the anomaly where both doctors end up off call
+```
+
+### When to Use Serializable
+
+Use Serializable isolation for transactions where correctness requires that the concurrent execution produces the same result as some serial (one-at-a-time) execution. Common cases include:
+
+- Financial transactions with complex business rules
+- Inventory management with constraints across multiple tables
+- Booking systems with availability checks
+- Any transaction where a write skew anomaly is possible
+
+## Lock Types in PostgreSQL
+
+### Row-Level Locks
+
+| Lock Mode | Acquired By | Blocks |
+|-----------|-------------|--------|
+| FOR KEY SHARE | INSERT with ON CONFLICT DO UPDATE | FOR UPDATE, FOR NO KEY UPDATE |
+| FOR SHARE | SELECT FOR SHARE | FOR UPDATE, FOR NO KEY UPDATE, UPDATE, DELETE |
+| FOR NO KEY UPDATE | UPDATE (default) | FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, UPDATE, DELETE |
+| FOR UPDATE | SELECT FOR UPDATE, DELETE | All other row locks |
+
+```sql
+-- Advisory locks for application-level coordination
+SELECT pg_advisory_lock(12345);      -- Session-level lock (blocks until acquired)
+SELECT pg_try_advisory_lock(12345);  -- Non-blocking attempt (returns true/false)
+SELECT pg_advisory_unlock(12345);    -- Release the lock
+
+-- Transaction-level advisory locks (released on COMMIT/ROLLBACK)
+SELECT pg_advisory_xact_lock(12345);
+```
+
+### Deadlock Detection and Prevention
+
+PostgreSQL automatically detects deadlocks and aborts one of the transactions. To minimize deadlocks:
+
+```typescript
+// WRONG: Inconsistent lock ordering causes deadlocks
+async function transfer(fromId: number, toId: number) {
+  await lock(fromId);    // Lock A
+  await lock(toId);      // Lock B — if another transaction holds B and wants A, deadlock
+}
+
+// CORRECT: Always acquire locks in consistent order
+async function transfer(fromId: number, toId: number) {
+  const [first, second] = [fromId, toId].sort((a, b) => a - b);
+  await lock(first);     // Always lock lower ID first
+  await lock(second);    // No deadlock possible
+}
+```
+
+## Real-World Patterns
+
+### Optimistic Locking with Version Column
+
+```sql
+-- Application-level optimistic concurrency control
+ALTER TABLE products ADD COLUMN version INTEGER DEFAULT 1;
+
+-- Read with version
+SELECT id, name, price, version FROM products WHERE id = 42;
+-- Returns: id=42, name="Widget", price=29.99, version=5
+
+-- Update with version check
+UPDATE products
+SET price = 34.99, version = version + 1
+WHERE id = 42 AND version = 5;
+
+-- If another transaction updated the row, version is now 6, and the
+-- WHERE clause matches 0 rows — the application detects the conflict
+```
+
+### SELECT FOR UPDATE SKIP LOCKED
+
+```sql
+-- Job queue pattern: multiple workers process jobs without conflicts
+-- Worker 1
+BEGIN;
+SELECT * FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- Returns job with id=101 and locks it
+
+-- Worker 2 (concurrent)
+BEGIN;
+SELECT * FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+-- Skips job 101 (locked), returns job 102
+
+-- Worker 1 processes and completes job 101
+UPDATE jobs SET status = 'completed' WHERE id = 101;
+COMMIT;
+```
+
+## Performance Optimization
+
+### Minimizing MVCC Overhead
+
+```sql
+-- VACUUM cleans up dead tuples created by MVCC
+-- Run VACUUM ANALYZE regularly (or use autovacuum)
+VACUUM ANALYZE orders;
+
+-- For large bulk deletes, use VACUUM FULL to reclaim disk space
+-- WARNING: VACUUM FULL locks the table
+VACUUM FULL orders;
+
+-- Monitor dead tuple ratio
+SELECT
+    schemaname,
+    relname,
+    n_dead_tup,
+    n_live_tup,
+    ROUND(n_dead_tup::numeric / GREATEST(n_live_tup, 1) * 100, 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+```
+
+### Hot Updates
+
+```sql
+-- HOT (Heap-Only Tuple) updates avoid index maintenance
+-- when the updated column is NOT indexed
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+-- If you update 'status' (not indexed), PostgreSQL can use HOT update
+-- This is much faster because it doesn't need to update indexes
+
+-- FILLFACTOR leaves space on each page for HOT updates
+ALTER TABLE orders SET (fillfactor = 80);
+-- 80% fill, 20% free space for in-page updates
+```
+
+## Comparison: Concurrency Control Approaches
+
+| Feature | MVCC (PostgreSQL) | Locking (MySQL InnoDB) | Optimistic (Application) |
+|---------|-------------------|------------------------|--------------------------|
+| Read-write concurrency | Excellent (no blocking) | Good (gap locks) | Excellent (no locks) |
+| Storage overhead | High (dead tuples) | Low (undo log) | None |
+| Cleanup required | VACUUM | Purge thread | Application logic |
+| Conflict handling | Retry on abort | Wait for lock | Retry on version mismatch |
+| Best for | Mixed read/write OLTP | Write-heavy OLTP | Low-contention systems |
 
 ## Conclusion
 
-Database Concurrency Control: MVCC and Locking is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+MVCC is the foundation of PostgreSQL's excellent concurrency performance. Understanding the isolation levels and their tradeoffs is essential for building correct concurrent applications:
+
+1. **Use Read Committed** (default) for most OLTP workloads — it provides the best concurrency with minimal overhead
+2. **Use Repeatable Read** when you need consistent snapshots across multiple queries within a transaction
+3. **Use Serializable** when correctness requires serializability (write skew prevention, complex business constraints)
+4. **Use SELECT FOR UPDATE** to explicitly lock rows that you will modify, preventing lost updates in Read Committed
+5. **Use SKIP LOCKED** for job queue patterns where multiple workers process tasks concurrently
+6. **Monitor VACUUM** to prevent dead tuple accumulation from degrading performance
+7. **Handle serialization errors** with retry logic — SSI aborts transactions that would cause anomalies
+
+The choice between isolation levels is a tradeoff between correctness and performance. Higher isolation levels provide stronger guarantees but reduce concurrency. For most applications, Read Committed with explicit row locking where needed provides the best balance.
