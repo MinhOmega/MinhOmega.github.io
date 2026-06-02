@@ -13,7 +13,7 @@ React Fiber is the reconciliation engine that powers React 16 and beyond. It's t
 
 Before Fiber, React used a recursive reconciliation algorithm that couldn't pause, abort, or prioritize work. Once rendering started, it had to complete synchronously. Fiber changed this by introducing a linked-list tree structure that allows React to pause work, resume it later, and abandon low-priority updates when higher-priority ones arrive.
 
-![React internals](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+![React code on screen](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
 ## The Problem Fiber Solves
 
@@ -37,7 +37,7 @@ This approach has a critical limitation: if the component tree is large, reconci
 
 ### The 16ms Budget
 
-Browsers render at 60fps, meaning each frame has a 16ms budget. If JavaScript runs for longer than 16ms, frames are dropped and the UI feels janky. With large component trees, React's recursive reconciliation could easily exceed this budget.
+Browsers render at 60fps, meaning each frame has a 16ms budget. If JavaScript runs for longer than 16ms, frames are dropped and the UI feels janky. With large component trees, React's recursive reconciliation could easily exceed this budget. A tree with 10,000 components might take 50-100ms to reconcile, freezing the interface for three to six frames. Users perceive this as stuttering, laggy input fields, and unresponsive buttons.
 
 ## Fiber's Solution: Incremental Rendering
 
@@ -60,42 +60,43 @@ function workLoop(deadline) {
 }
 ```
 
-The key insight: React can yield control back to the browser between units of work, allowing the browser to handle high-priority tasks (user input, animations) before React resumes rendering.
+The key insight: React can yield control back to the browser between units of work, allowing the browser to handle high-priority tasks (user input, animations) before React resumes rendering. The `shouldYield()` function checks how much time has elapsed since the current frame started. If the budget is nearly exhausted, React pauses and lets the browser paint the current frame before resuming.
 
 ## The Fiber Node Structure
 
-Each React element has a corresponding Fiber node. Fiber nodes form a linked-list tree:
+Each React element has a corresponding Fiber node. Fiber nodes form a linked-list tree rather than the recursive tree used in React 15:
 
 ```typescript
 interface Fiber {
   // Identity
-  type: string | Function | null;
+  tag: WorkTag;              // FunctionComponent, ClassComponent, HostComponent, etc.
+  type: string | Function | null;  // The function/class or DOM tag name
   key: string | null;
+  stateNode: any;            // DOM node or class instance
 
   // Tree structure (linked list)
-  child: Fiber | null;    // First child
-  sibling: Fiber | null;  // Next sibling
-  return: Fiber | null;   // Parent fiber
+  child: Fiber | null;       // First child
+  sibling: Fiber | null;     // Next sibling
+  return: Fiber | null;      // Parent fiber
   index: number;
 
-  // State
+  // State and props
   pendingProps: any;
-  memoizedState: any;
-  memoizedProps: any;
+  memoizedProps: any;        // Props from last completed render
+  memoizedState: any;        // State from last completed render
+  updateQueue: UpdateQueue | null;  // Queued state updates
 
   // Effects
-  effectTag: number;       // Placement, Update, Deletion
-  nextEffect: Fiber | null;
-  firstEffect: Fiber | null;
-  lastEffect: Fiber | null;
+  flags: number;             // Placement, Update, Deletion, Passive, etc.
+  subtreeFlags: number;      // Aggregated flags from children
+  deletions: Fiber[] | null; // Child fibers to delete
 
-  // Work
-  expirationTime: number;
-  mode: number;
-  lanes: number;
+  // Work scheduling
+  lanes: Lanes;              // Priority lanes for this fiber
+  childLanes: Lanes;         // Priority lanes for children
 
-  // Alternates
-  alternate: Fiber | null; // Double buffering
+  // Double buffering
+  alternate: Fiber | null;   // The other version of this fiber
 }
 ```
 
@@ -118,9 +119,25 @@ Unlike the recursive tree structure, Fiber uses a linked-list traversal:
 // Always: visit child first, then sibling, then return to parent
 ```
 
-This structure allows React to pause at any node, save its position, and resume later — something impossible with the recursive approach.
+This structure allows React to pause at any node, save its position (the `nextUnitOfWork` pointer), and resume later — something impossible with the recursive approach. The `return` pointer lets React walk back up the tree after completing a subtree, enabling the depth-first traversal without a call stack.
 
-![Architecture diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+### Work Tags
+
+Every Fiber node has a `tag` that tells React how to process it:
+
+```typescript
+export const FunctionComponent = 0;
+export const ClassComponent = 1;
+export const HostRoot = 3;          // Root of the tree
+export const HostComponent = 5;     // DOM element (div, span, etc.)
+export const HostText = 6;          // Text node
+export const SuspenseComponent = 13;
+export const OffscreenComponent = 19; // Offscreen rendering
+```
+
+React's `beginWork` function uses the tag to dispatch to the correct handler — calling the function for `FunctionComponent`, calling `render()` for `ClassComponent`, or creating DOM nodes for `HostComponent`.
+
+![Software architecture diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
 
 ## The Two Phases
 
@@ -130,27 +147,98 @@ The render phase creates new Fiber nodes, compares them with previous nodes, and
 
 ```typescript
 function performUnitOfWork(fiber: Fiber): Fiber | null {
-  // 1. Process this fiber
-  const Component = fiber.type;
-  if (typeof Component === 'function') {
-    // Function component — call it
-    const children = Component(fiber.pendingProps);
-    reconcileChildren(fiber, children);
-  } else {
-    // Host component (div, span, etc.) — reconcile children
-    reconcileChildren(fiber, fiber.pendingProps.children);
+  // 1. beginWork — process this fiber
+  const next = beginWork(fiber);
+
+  // 2. Store finished props
+  fiber.memoizedProps = fiber.pendingProps;
+
+  // 3. Return next unit of work
+  if (next !== null) {
+    return next; // Child exists — process it
   }
 
-  // 2. Return next unit of work
-  if (fiber.child) return fiber.child;
+  // No child — complete this fiber and move to sibling or parent
+  let current = fiber;
+  do {
+    completeWork(current);
+    const sibling = current.sibling;
+    if (sibling !== null) {
+      return sibling; // Process sibling next
+    }
+    current = current.return; // Go back to parent
+  } while (current !== null);
 
-  let next = fiber;
-  while (next) {
-    if (next.sibling) return next.sibling;
-    next = next.return;
+  return null; // All work done
+}
+```
+
+The `beginWork` function handles the core reconciliation logic for each fiber type:
+
+```typescript
+function beginWork(fiber: Fiber): Fiber | null {
+  switch (fiber.tag) {
+    case FunctionComponent: {
+      const Component = fiber.type;
+      const nextProps = fiber.pendingProps;
+      // Reconcile: call the function, get children
+      const nextChildren = Component(nextProps);
+      reconcileChildren(fiber, nextChildren);
+      return fiber.child;
+    }
+    case HostComponent: {
+      const nextProps = fiber.pendingProps;
+      const nextChildren = nextProps.children;
+      reconcileChildren(fiber, nextChildren);
+      return fiber.child;
+    }
+    case HostText: {
+      // Text nodes have no children
+      return null;
+    }
+  }
+}
+```
+
+The `reconcileChildren` function is where the diffing algorithm runs. It compares the new children array against the existing child fibers, creating new fibers for additions, updating existing fibers for changes, and marking fibers for deletion when children are removed:
+
+```typescript
+function reconcileChildren(returnFiber: Fiber, newChildren: any) {
+  if (typeof newChildren === 'string' || typeof newChildren === 'number') {
+    // Text content — no children to reconcile
+    return;
   }
 
-  return null; // No more work
+  const newChildrenArray = Array.isArray(newChildren) ? newChildren : [newChildren];
+  let oldFiber = returnFiber.child;
+  let newIndex = 0;
+  let lastPlacedIndex = 0;
+
+  // Diff algorithm: match old fibers to new elements
+  for (; oldFiber !== null && newIndex < newChildrenArray.length; newIndex++) {
+    const newElement = newChildrenArray[newIndex];
+
+    if (oldFiber.index > newIndex) {
+      // Old fiber is ahead — will be reused later
+      break;
+    }
+
+    if (isSameType(oldFiber, newElement)) {
+      // Same type — update in place
+      const updated = updateSlot(oldFiber, newElement);
+      lastPlacedIndex = placeChild(updated, lastPlacedIndex);
+    } else {
+      // Different type — delete old, create new
+      deleteChild(returnFiber, oldFiber);
+      const created = createFiberFromElement(newElement);
+      lastPlacedIndex = placeChild(created, lastPlacedIndex);
+    }
+
+    oldFiber = oldFiber.sibling;
+  }
+
+  // Handle remaining old fibers (deletion) and new elements (creation)
+  // ...
 }
 ```
 
@@ -160,34 +248,31 @@ The commit phase applies all changes to the DOM. This phase is synchronous and c
 
 ```typescript
 function commitRoot() {
-  // 1. Commit mutations
-  commitWork(rootFiber.firstEffect);
+  const finishedWork = root.finishedWork;
 
-  // 2. Run lifecycle effects
-  // componentDidMount, componentDidUpdate, useEffect callbacks
-}
+  // 1. Commit mutation effects (DOM changes)
+  commitMutationEffects(finishedWork);
 
-function commitWork(fiber: Fiber | null) {
-  while (fiber) {
-    switch (fiber.effectTag) {
-      case PLACEMENT:
-        fiber.stateNode.appendChild(fiber.child?.stateNode);
-        break;
-      case UPDATE:
-        updateDOMProperties(fiber.stateNode, fiber.memoizedProps, fiber.pendingProps);
-        break;
-      case DELETION:
-        fiber.return?.stateNode.removeChild(fiber.stateNode);
-        break;
-    }
-    fiber = fiber.nextEffect;
-  }
+  // 2. Swap trees (double buffering)
+  root.current = finishedWork;
+
+  // 3. Run layout effects (useLayoutEffect)
+  commitLayoutEffects(finishedWork);
+
+  // 4. Schedule passive effects (useEffect) for later
+  schedulePassiveEffects(finishedWork);
 }
 ```
 
+React 18 splits the commit into three sub-phases:
+
+1. **Mutation phase** — DOM insertions, updates, and deletions happen here
+2. **Layout phase** — `useLayoutEffect` callbacks run synchronously after DOM mutations but before the browser paints
+3. **Passive phase** — `useEffect` callbacks are scheduled asynchronously via `MessageChannel`, running after the browser paints
+
 ## Double Buffering
 
-React maintains two trees: the **current** tree (what's on screen) and the **work-in-progress** tree (what's being built). This is similar to double buffering in graphics:
+React maintains two trees: the **current** tree (what's on screen) and the **work-in-progress** tree (what's being built). This is similar to double buffering in graphics rendering:
 
 ```typescript
 // When a component updates:
@@ -196,105 +281,287 @@ function createWorkInProgress(current: Fiber, pendingProps: any): Fiber {
 
   if (!workInProgress) {
     // First render — create new fiber
-    workInProgress = new Fiber(current.type, pendingProps);
+    workInProgress = createFiber(current.type, pendingProps);
     workInProgress.alternate = current;
     current.alternate = workInProgress;
   } else {
-    // Reuse fiber from previous render
+    // Reuse fiber from previous render — reset work fields
     workInProgress.pendingProps = pendingProps;
-    workInProgress.effectTag = UPDATE;
+    workInProgress.type = current.type;
+    workInProgress.child = current.child;
+    workInProgress.memoizedState = current.memoizedState;
+    workInProgress.updateQueue = current.updateQueue;
   }
 
   return workInProgress;
 }
 ```
 
-When the commit phase completes, React swaps the trees: the work-in-progress becomes the current tree, and the old current tree becomes the next work-in-progress.
+When the commit phase completes, React swaps the trees: the work-in-progress becomes the current tree, and the old current tree becomes the next work-in-progress. This atomic swap ensures the user never sees a partially rendered UI. The previous work-in-progress is recycled to avoid garbage collection overhead.
 
 ## Priority Scheduling with Lanes
 
-React 18 introduced the Lanes model for priority scheduling. Different updates have different priorities:
+React 18 introduced the Lanes model for priority scheduling. Lanes are represented as bitmasks, where each bit represents a priority lane:
 
 ```typescript
-// Priority levels (simplified)
-const SyncLane = 0b0000000000000000000000000000001;
-const InputContinuousLane = 0b0000000000000000000000000000100;
-const DefaultLane = 0b0000000000000000000000000010000;
-const TransitionLane = 0b0000000000000000000000010000000;
-const IdleLane = 0b0100000000000000000000000000000;
+// Priority levels (simplified from React source)
+const SyncLane                = 0b0000000000000000000000000000001;
+const InputContinuousLane     = 0b0000000000000000000000000000100;
+const DefaultLane             = 0b0000000000000000000000000010000;
+const TransitionLane1         = 0b0000000000000000000000000100000;
+const TransitionLane2         = 0b0000000000000000000000001000000;
+const IdleLane                = 0b0100000000000000000000000000000;
+```
+
+The bitmask approach allows React to efficiently check for pending work with bitwise operations:
+
+```typescript
+// Check if there are any pending sync lanes
+const hasSyncWork = (pendingLanes & SyncLane) !== 0;
+
+// Check if any transition work is pending
+const transitionMask = TransitionLane1 | TransitionLane2 | TransitionLane3;
+const hasTransitionWork = (pendingLanes & transitionMask) !== 0;
+
+// Get highest priority lane from pending set
+function getHighestPriorityLane(lanes: Lanes): Lane {
+  return lanes & -lanes; // Isolate lowest set bit
+}
 ```
 
 Higher-priority updates can interrupt lower-priority work:
 
 ```typescript
-// User input — high priority, cannot be deferred
 function handleInput(value) {
-  startTransition(() => {
-    setInputValue(value); // SyncLane — processes immediately
-  });
-}
+  // User keystroke — SyncLane, processes immediately, interrupts everything
+  setInputValue(value);
 
-// Filter results — lower priority, can be deferred
-function handleFilter(filter) {
+  // Search results — TransitionLane, can be deferred and interrupted
   startTransition(() => {
-    setFilter(filter); // TransitionLane — can be interrupted
+    setResults(performSearch(value));
   });
 }
 ```
 
-## How useEffect Works in Fiber
-
-Fiber nodes track effects using a linked list:
+### How Lanes Interact with the Work Loop
 
 ```typescript
-// When useEffect is called during render:
-function useEffect(callback, deps) {
-  const fiber = getCurrentFiber();
+function ensureRootIsScheduled(root: FiberRoot) {
+  const nextLanes = getNextLanes(root, NoLanes);
 
-  const effect = {
-    tag: PassiveEffect,  // useEffect
-    create: callback,
-    deps: deps,
-    destroy: null,
-  };
+  if (nextLanes === NoLanes) {
+    return; // Nothing to do
+  }
 
-  // Add to fiber's effect list
-  if (!fiber.updateQueue) {
-    fiber.updateQueue = { lastEffect: effect };
-    effect.next = effect; // Circular linked list
+  // Determine callback priority based on lanes
+  let newCallbackPriority = getHighestPriorityLane(nextLanes);
+
+  if (newCallbackPriority === SyncLane) {
+    // Schedule synchronously — no delay allowed
+    scheduleSyncCallback(performSyncWorkOnRoot.bind(null, root));
+    queueMicrotask(flushSyncCallbacks);
   } else {
-    const lastEffect = fiber.updateQueue.lastEffect;
-    effect.next = lastEffect.next;
-    lastEffect.next = effect;
-    fiber.updateQueue.lastEffect = effect;
+    // Schedule with the Scheduler package
+    const schedulerPriority = lanesToSchedulerPriority(newCallbackPriority);
+    scheduleCallback(schedulerPriority, performConcurrentWorkOnRoot.bind(null, root));
   }
 }
 ```
 
-During the commit phase, React processes these effects:
+When a higher-priority update arrives during a lower-priority render, React checks `shouldYieldToHost()` in the work loop. If true, React pauses the current work, saves the `nextUnitOfWork` pointer, and yields to the browser. After processing the urgent input, React resumes from where it left off or restarts if the higher-priority update invalidated the work-in-progress tree.
+
+## How useState Works in Fiber
+
+Each Fiber node has a `memoizedState` that holds a linked list of hooks. For function components, React maintains a `workInProgressHook` pointer that advances through the list during each render:
 
 ```typescript
-function commitPassiveEffects(fiber: Fiber) {
-  const updateQueue = fiber.updateQueue;
-  if (!updateQueue) return;
+// React's internal hook state (simplified)
+let workInProgressHook: Hook | null = null;
+let currentlyRenderingFiber: Fiber | null = null;
 
-  let effect = updateQueue.lastEffect.next; // Start of circular list
+function mountState<S>(initialState: S): [S, Dispatch<BasicStateAction<S>>] {
+  // Create a new hook object
+  const hook: Hook = {
+    memoizedState: typeof initialState === 'function'
+      ? initialState()
+      : initialState,
+    queue: { pending: null },  // Update queue
+    next: null,                // Linked list pointer
+  };
 
-  do {
-    if (effect.tag === PassiveEffect) {
-      // Run cleanup from previous render
-      if (effect.destroy) {
-        effect.destroy();
-      }
-      // Run new effect
-      effect.destroy = effect.create();
-    }
-    effect = effect.next;
-  } while (effect !== updateQueue.lastEffect.next);
+  // Append to the hook list on the fiber
+  if (workInProgressHook === null) {
+    currentlyRenderingFiber.memoizedState = hook;
+    workInProgressHook = hook;
+  } else {
+    workInProgressHook.next = hook;
+    workInProgressHook = hook;
+  }
+
+  const dispatch = dispatchSetState.bind(null, currentlyRenderingFiber, hook.queue);
+  return [hook.memoizedState, dispatch];
 }
 ```
 
+This is why hooks must be called in the same order every render — React relies on the linked-list order to match each `useState` call with its corresponding hook state. If you call hooks conditionally, the pointer advances incorrectly and you get the wrong state.
+
+When you call `setCount(prev => prev + 1)`, React creates an update object and adds it to the hook's queue:
+
+```typescript
+function dispatchSetState<S>(fiber: Fiber, queue: UpdateQueue, action: BasicStateAction<S>) {
+  const update: Update = {
+    action,           // The new value or updater function
+    next: null,       // Circular linked list
+    lane: requestUpdateLane(fiber),  // Priority lane
+  };
+
+  // Add to circular queue
+  const pending = queue.pending;
+  if (pending === null) {
+    update.next = update;
+  } else {
+    update.next = pending.next;
+    pending.next = update;
+  }
+  queue.pending = update;
+
+  // Schedule the fiber for re-rendering
+  scheduleUpdateOnFiber(fiber, update.lane);
+}
+```
+
+During the next render, React processes the queue and calculates the new state:
+
+```typescript
+function updateState<S>(): [S, Dispatch<S>] {
+  const hook = updateWorkInProgressHook();
+  const queue = hook.queue;
+  let newState = hook.memoizedState;
+
+  // Process all pending updates in order
+  let update = queue.pending?.next; // Start of circular list
+  if (update !== null) {
+    do {
+      const action = update.action;
+      newState = typeof action === 'function'
+        ? action(newState)  // Functional update: setCount(prev => prev + 1)
+        : action;           // Direct value: setCount(5)
+      update = update.next;
+    } while (update !== queue.pending.next);
+  }
+
+  hook.memoizedState = newState;
+  return [newState, dispatch];
+}
+```
+
+The queue processes updates in the order they were dispatched. Functional updates (`prev => prev + 1`) are critical in concurrent mode because they read from the accumulated state rather than a stale closure variable.
+
+## How useEffect Works in Fiber
+
+Fiber nodes track effects using a circular linked list on the `updateQueue`:
+
+```typescript
+function mountEffect(create, deps) {
+  const hook = mountWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+
+  currentlyRenderingFiber.flags |= PassiveEffect;
+
+  hook.memoizedState = pushEffect(
+    HookHasEffect | PassiveEffect,  // Effect tag
+    create,                          // Your callback
+    undefined,                       // Destroy function (set after first run)
+    nextDeps                         // Dependency array
+  );
+}
+
+function pushEffect(tag, create, destroy, deps) {
+  const effect = { tag, create, destroy, deps, next: null };
+  const fiber = currentlyRenderingFiber;
+  let queue = fiber.updateQueue;
+
+  if (queue === null) {
+    queue = { lastEffect: null };
+    fiber.updateQueue = queue;
+    effect.next = effect;
+    queue.lastEffect = effect;
+  } else {
+    const lastEffect = queue.lastEffect;
+    if (lastEffect === null) {
+      effect.next = effect;
+      queue.lastEffect = effect;
+    } else {
+      effect.next = lastEffect.next;
+      lastEffect.next = effect;
+      queue.lastEffect = effect;
+    }
+  }
+
+  return effect;
+}
+```
+
+During the commit phase, React schedules passive effects to run after the browser paints:
+
+```typescript
+function commitPassiveMountEffects(root, finishedWork) {
+  recursivelyTraversePassiveMountEffects(root, finishedWork);
+  commitPassiveMountOnFiber(root, finishedWork);
+}
+
+function commitPassiveMountOnFiber(finishedRoot, fiber) {
+  switch (fiber.tag) {
+    case FunctionComponent: {
+      const updateQueue = fiber.updateQueue;
+      const lastEffect = updateQueue?.lastEffect;
+      if (lastEffect) {
+        let effect = lastEffect.next;
+        do {
+          if (effect.tag & HookHasEffect) {
+            // Destroy previous effect
+            const destroy = effect.destroy;
+            if (destroy !== undefined) {
+              destroy();
+            }
+            // Create new effect
+            effect.destroy = effect.create();
+          }
+          effect = effect.next;
+        } while (effect !== lastEffect);
+      }
+      break;
+    }
+  }
+}
+```
+
+The key distinction: `useLayoutEffect` runs synchronously during the commit phase (after DOM mutations but before the browser paints), while `useEffect` is scheduled asynchronously and runs after the browser paints. This means `useLayoutEffect` blocks painting — use it only when you need to measure DOM layout.
+
 ![Performance visualization](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+
+## Automatic Batching
+
+React 18 automatically batches all state updates, not just those inside event handlers:
+
+```typescript
+function handleClick() {
+  // React 17: TWO re-renders (one for each setState)
+  // React 18: ONE re-render (batched together)
+  setA(1);
+  setB(2);
+}
+
+// React 18 also batches updates in async contexts:
+async function fetchData() {
+  const data = await fetch('/api');
+  // Both updates are batched into one re-render in React 18
+  setLoading(false);
+  setData(data);
+}
+```
+
+Fiber makes this possible because updates are queued as lanes. When multiple updates arrive in the same microtask, React assigns them the same lane and processes them together in a single render pass. In React 17, only updates inside React event handlers were batched — updates in `setTimeout`, `Promise.then`, and native event handlers caused separate re-renders.
 
 ## Concurrent Features Enabled by Fiber
 
@@ -306,21 +573,25 @@ Suspense works by allowing a component to "suspend" — telling React to skip it
 function SuspenseBoundary({ children, fallback }) {
   try {
     return children;
-  } catch (promise) {
-    if (promise instanceof Promise) {
+  } catch (thrownValue) {
+    if (typeof thrownValue?.then === 'function') {
       // Component suspended — show fallback
-      promise.then(() => {
-        // Data ready — re-render
-        scheduleUpdate(fiber);
+      thrownValue.then(() => {
+        // Data ready — schedule re-render of this boundary
+        scheduleUpdate(boundaryFiber);
       });
       return fallback;
     }
-    throw promise; // Re-throw non-promise errors
+    throw thrownValue; // Re-throw non-promise errors
   }
 }
 ```
 
+In Fiber terms, when a child component throws a promise (suspends), React walks up the fiber tree via the `return` pointers to find the nearest Suspense boundary. It marks that boundary's Fiber as having pending work and renders the fallback UI. When the promise resolves, React re-renders just that boundary's children, not the entire tree.
+
 ### useTransition
+
+The `useTransition` hook returns a `startTransition` function that marks updates as non-urgent:
 
 ```typescript
 function SearchPage() {
@@ -329,10 +600,10 @@ function SearchPage() {
   const [isPending, startTransition] = useTransition();
 
   function handleChange(e) {
-    // Urgent: update input immediately
+    // Urgent: update input immediately (SyncLane)
     setQuery(e.target.value);
 
-    // Transition: can be deferred
+    // Transition: can be deferred (TransitionLane)
     startTransition(() => {
       setResults(filterResults(e.target.value));
     });
@@ -346,6 +617,8 @@ function SearchPage() {
   );
 }
 ```
+
+When a transition is in progress and a new urgent update arrives, React can abandon the transition work-in-progress tree, process the urgent update first, and then restart the transition. This keeps the input responsive even when filtering a large dataset takes significant time.
 
 ### useDeferredValue
 
@@ -362,265 +635,140 @@ function SearchResults({ query }) {
 }
 ```
 
+`useDeferredValue` is similar to `useTransition` but works when you don't control the state update — for example, when the value comes from a parent component's prop. It creates a deferred copy of a value that React can update at lower priority.
+
+### Offscreen Rendering
+
+React 19 introduces offscreen rendering, which uses Fiber to hide and show components without unmounting:
+
+```typescript
+// The Activity component keeps the tree mounted but hides it visually
+function TabPanel({ children, activeTab }) {
+  return (
+    <>
+      {tabs.map(tab => (
+        <Activity mode={tab === activeTab ? 'visible' : 'hidden'} key={tab}>
+          <TabContent tab={tab} />
+        </Activity>
+      ))}
+    </>
+  );
+}
+```
+
+When a tab is hidden, React doesn't unmount its Fiber tree — it marks it as offscreen. The component's state is preserved, DOM nodes are hidden via `display: none`, and effects are cleaned up. Switching tabs is instant because there's no reconciliation cost — React simply toggles the visibility flag on the Fiber and runs the appropriate effects.
+
 ## Practical Implications
 
 ### Why Keys Matter
 
-Fiber uses keys to match old and new children:
+Fiber uses keys to match old and new children during reconciliation:
 
 ```typescript
-// Without keys — React re-renders all items
+// Without keys — React matches by index, causing unnecessary updates
 <ul>
   {items.map((item, i) => <li key={i}>{item.name}</li>)}
 </ul>
 
-// With stable keys — React reuses and moves items
+// With stable keys — React correctly identifies moved/inserted/deleted items
 <ul>
   {items.map(item => <li key={item.id}>{item.name}</li>)}
 </ul>
 ```
 
+When you use index keys and the list reorders, React thinks every item changed and re-renders all of them. With stable keys, React can surgically update only the moved items. This matters especially for lists with stateful components — using index keys causes components to lose their state when items are reordered.
+
 ### Why Functional Updates Matter
 
 ```typescript
-// BAD: Stale closure
-setCount(count + 1); // Uses count from render closure
+// BAD: Stale closure in concurrent mode
+setCount(count + 1); // Uses count from render closure — may be stale
 
-// GOOD: Functional update
-setCount(prev => prev + 1); // Always uses latest value
+// GOOD: Functional update always uses latest value
+setCount(prev => prev + 1); // Reads from the queue during processing
 ```
 
-With concurrent rendering, the `count` variable might be stale by the time the update processes. Functional updates always use the latest state.
+With concurrent rendering, multiple renders can happen before an update is committed. The `count` variable in the closure might reference an outdated value. Functional updates read from the hook's pending queue, ensuring they always operate on the latest state.
 
-### Why Batching Matters
+## React DevTools and Fiber
 
-React 18 automatically batches all state updates:
+The React DevTools Profiler hooks into Fiber's commit phase to record timing:
 
 ```typescript
-function handleClick() {
-  // Before React 18: two re-renders
-  // React 18: one re-render
-  setA(1);
-  setB(2);
+// What DevTools records during profiling:
+{
+  componentName: "UserProfile",
+  duration: 4.2,      // Time in ms for this component's render phase
+  phases: {
+    "render": 3.1,    // beginWork + completeWork
+    "commit": 1.1,    // commitMutationEffects + commitLayoutEffects
+  },
+  actualDuration: 4.2,  // Time to render this fiber (including memoized children)
+  selfBaseDuration: 1.1 // Time to render this fiber alone (excluding children)
 }
 ```
 
-Fiber makes this possible because updates are queued as lanes and processed together.
+The flamegraph view shows the component tree as Fiber sees it — each bar represents a Fiber node, and the width represents how long that node took to render. A wide bar at the top with narrow children indicates the component itself is expensive, not its children. The ranked chart sorts components by `actualDuration`, helping you identify optimization targets.
+
+## The React Compiler
+
+The React Compiler (formerly React Forget), released alongside React 19, analyzes component code at build time and inserts memoization automatically. It understands Fiber's reconciliation rules and determines when a component's output is guaranteed to be the same for the same inputs:
+
+```typescript
+// You write this:
+function TodoList({ todos }) {
+  const activeTodos = todos.filter(t => !t.completed);
+  return <ul>{activeTodos.map(t => <Todo key={t.id} todo={t} />)}</ul>;
+}
+
+// The compiler generates equivalent to:
+function TodoList({ todos }) {
+  const activeTodos = useMemo(
+    () => todos.filter(t => !t.completed),
+    [todos]
+  );
+  return useMemo(
+    () => <ul>{activeTodos.map(t => <Todo key={t.id} todo={t} />)}</ul>,
+    [activeTodos]
+  );
+}
+```
+
+This eliminates the need for manual `React.memo`, `useMemo`, and `useCallback` calls. The compiler understands that `todos.filter()` returns a new array reference every render, so it wraps it in `useMemo`. It also understands that JSX returns a new element reference, so it memoizes the entire return value.
 
 ## Best Practices
 
-1. **Use stable keys** — Help Fiber efficiently match and reuse nodes
-2. **Use functional updates** — Avoid stale closures in concurrent mode
-3. **Use `startTransition`** — Mark non-urgent updates for deferred processing
-4. **Keep components pure** — Side effects in render phase cause bugs
-5. **Avoid large component trees** — Even with Fiber, large trees are expensive
-6. **Use `React.memo` wisely** — Prevent unnecessary re-renders of expensive components
+1. **Use stable keys** — Help Fiber efficiently match and reuse nodes during reconciliation
+2. **Use functional updates** — Avoid stale closures in concurrent mode with `setCount(prev => prev + 1)`
+3. **Use `startTransition`** — Mark non-urgent updates for deferred processing via TransitionLane
+4. **Keep components pure** — Side effects in render phase cause bugs in StrictMode and concurrent rendering
+5. **Prefer `useEffect` over `useLayoutEffect`** — Layout effects block painting and should only be used for DOM measurements
+6. **Use `React.memo` wisely** — Prevent unnecessary re-renders of expensive components with stable props
 
 ## Common Pitfalls
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Index as key | Poor list performance | Use stable unique IDs |
-| Side effects in render | Unpredictable behavior | Use useEffect |
+| Index as key | Poor list performance, lost state | Use stable unique IDs |
+| Side effects in render | Unpredictable behavior, double-invocation | Use useEffect |
 | Stale closures | Wrong values in concurrent mode | Use functional updates |
 | Large component trees | Slow reconciliation | Split into smaller components |
 | Mutating state directly | Skips re-render | Use setState or state setter |
-
-### Render Phase and Commit Phase
-
-React's rendering process is divided into two distinct phases that have very different characteristics and implications for application performance. The render phase is where React calls component functions, compares the results with the previous virtual DOM tree, and determines what changes need to be made. This phase is pure and side-effect free, meaning it can be interrupted, restarted, or discarded without any visible impact on the user interface. React can work on the render phase asynchronously, yielding control back to the browser between processing individual components to ensure that high-priority updates like user input are handled promptly. The commit phase is where React applies the calculated changes to the actual DOM. This phase must be synchronous and cannot be interrupted because partial updates to the real DOM would create visual inconsistencies that users could observe. Understanding this two-phase architecture helps developers write components that work well with React's scheduling system and avoid patterns that force synchronous rendering.
-
-### Concurrent Features and Suspense
-
-The concurrent rendering capabilities enabled by the Fiber architecture represent a fundamental shift in how React handles updates and asynchronous operations. Concurrent features allow React to prepare multiple versions of the user interface simultaneously, switching between them based on priority and user interaction. This capability enables patterns like automatic batching of state updates, transition APIs that keep the current interface responsive while preparing new content, and Suspense boundaries that provide elegant loading states for asynchronous operations. Developers who understand the underlying Fiber mechanics can leverage these concurrent features more effectively, building applications that feel faster and more responsive even when performing complex operations like data fetching, code splitting, and heavy computations.
-
-## React DevTools and Fiber
-
-The React DevTools Profiler is built on top of the Fiber architecture. When you profile a React application, DevTools hooks into Fiber's commit phase to record timing information for each component:
-
-```javascript
-// What DevTools records during profiling:
-{
-  componentName: "UserProfile",
-  duration: 4.2,      // Time in ms for this component's render phase
-  startTime: 1234.5,  // When rendering began
-  commitTime: 1240.1, // When commit phase reached this component
-  phases: {
-    "render": 3.1,    // Time spent in render phase
-    "commit": 1.1,    // Time spent in commit phase
-  }
-}
-```
-
-The Profiler's flamegraph view shows the component tree as Fiber sees it — each bar represents a Fiber node, and the width represents how long that node took to render. The ranked chart sorts components by render time, helping you identify the most expensive components. Understanding Fiber's two-phase architecture helps you interpret these profiles correctly: a long render phase suggests expensive component logic, while a long commit phase suggests expensive DOM mutations.
-
-### Why Components Re-render
-
-Understanding Fiber explains why certain patterns trigger unnecessary re-renders. When a parent Fiber node receives new props during reconciliation, React creates a new work-in-progress Fiber for it. If the component returns the same element structure with the same props, React can skip re-rendering children — but only if `React.memo` or the component's comparison logic says the props haven't changed. Without memoization, React traverses the entire subtree even if nothing changed:
-
-```typescript
-// This component re-renders whenever Parent re-renders
-function ExpensiveChild({ data }) {
-  return <div>{heavyComputation(data)}</div>;
-}
-
-// This component only re-renders when data actually changes
-const ExpensiveChild = React.memo(function ExpensiveChild({ data }) {
-  return <div>{heavyComputation(data)}</div>;
-});
-```
-
-The React Compiler (React Forget), announced alongside React 19, aims to automate this memoization. It analyzes component code at build time and inserts memoization where it's safe to do so, eliminating the need for manual `React.memo`, `useMemo`, and `useCallback` calls. This works because the compiler understands Fiber's reconciliation rules and can determine when a component's output is guaranteed to be the same for the same inputs.
-
-## Performance Optimization Patterns
-
-### Avoiding Fiber Tree Thrashing
-
-Certain patterns force React to do more work in the Fiber tree than necessary. Changing a component's position in the tree causes React to unmount the old Fiber and mount a new one, which destroys all state and DOM nodes:
-
-```typescript
-// BAD: Conditional rendering changes tree structure
-function Page({ isLoggedIn }) {
-  if (isLoggedIn) {
-    return <Dashboard />;
-  }
-  return <Login />;
-}
-// Switching between these unmounts one and mounts the other
-
-// BETTER: Same component, conditional content
-function Page({ isLoggedIn }) {
-  return isLoggedIn ? <DashboardContent /> : <LoginContent />;
-}
-// Both are always mounted, only content changes
-```
-
-### Fragment Keys in Lists
-
-When rendering lists with multiple elements per item, use Fragment with a key to help Fiber match items correctly:
-
-```typescript
-// BAD: Each <li> gets a separate key, Fiber can't group them
-items.map(item => [
-  <li key={`${item.id}-name`}>{item.name}</li>,
-  <li key={`${item.id}-value`}>{item.value}</li>,
-]);
-
-// GOOD: Fragment groups the elements with a single key
-items.map(item => (
-  <Fragment key={item.id}>
-    <li>{item.name}</li>
-    <li>{item.value}</li>
-  </Fragment>
-));
-```
-
-### Lazy Loading with Suspense
-
-Fiber's ability to pause rendering enables code splitting with Suspense. When a lazy component hasn't loaded yet, Fiber suspends that subtree and renders the fallback:
-
-```typescript
-const HeavyChart = React.lazy(() => import('./HeavyChart'));
-
-function Dashboard() {
-  return (
-    <Suspense fallback={<ChartSkeleton />}>
-      <HeavyChart data={chartData} />
-    </Suspense>
-  );
-}
-```
-
-When `HeavyChart` finishes loading, Fiber resumes rendering that subtree without re-rendering the rest of the Dashboard. This is only possible because Fiber can pause and resume work at any node in the tree.
-
-## React 19 and the Future of Fiber
-
-React 19 builds on the Fiber architecture with several enhancements that further leverage its capabilities. The React Compiler (formerly React Forget) automatically memoizes components and hooks, reducing the need for manual `useMemo` and `useCallback` calls. This works by analyzing component code during compilation and inserting memoization where the Fiber architecture would benefit from it.
-
-Server Components integrate with Fiber by allowing components to render on the server and stream their results to the client. The Fiber tree on the client receives these pre-rendered components and incorporates them without re-executing the render phase. This reduces the amount of JavaScript sent to the browser and improves initial page load performance.
-
-The `use()` hook in React 19 is a new primitive that works with Fiber's suspense mechanism. Unlike `useEffect` or `useMemo`, `use()` can be called conditionally and during rendering, allowing components to suspend based on promises or context values without wrapping in `Suspense` boundaries at every level:
-
-```typescript
-// React 19 use() hook
-function UserProfile({ userId }) {
-  const user = use(fetchUser(userId)); // Suspends if promise is pending
-  const theme = use(ThemeContext);      // Reads context during render
-
-  return (
-    <div style={{ color: theme.primary }}>
-      <h1>{user.name}</h1>
-      <p>{user.email}</p>
-    </div>
-  );
-}
-```
-
-React 19 also introduces Actions — functions that handle form submissions and async transitions natively. Actions integrate with Fiber's lane system to provide automatic pending states, error handling, and optimistic updates:
-
-```typescript
-// React 19 Actions
-function UpdateName() {
-  const [error, action, isPending] = useActionState(async (prev, formData) => {
-    const newName = formData.get('name');
-    const error = await updateName(newName);
-    if (error) return error;
-    redirect('/profile');
-    return null;
-  }, null);
-
-  return (
-    <form action={action}>
-      <input type="text" name="name" />
-      <button disabled={isPending}>{isPending ? 'Updating...' : 'Update'}</button>
-      {error && <p>{error}</p>}
-    </form>
-  );
-}
-```
-
-These additions demonstrate that Fiber's architecture continues to evolve, enabling new patterns that improve developer experience and application performance.
-
-## Debugging Fiber
-
-Understanding Fiber internals helps when debugging performance issues. React DevTools Profiler visualizes the render phase, showing which components rendered and how long each took:
-
-```typescript
-// Measure render performance with Profiler API
-import { Profiler } from 'react';
-
-function onRenderCallback(id, phase, actualDuration, baseDuration, startTime, commitTime) {
-  console.log(`Component ${id} ${phase}: ${actualDuration}ms (base: ${baseDuration}ms)`);
-  // actualDuration: time spent rendering this update
-  // baseDuration: estimated time for full re-render without memoization
-}
-
-function App() {
-  return (
-    <Profiler id="App" onRender={onRenderCallback}>
-      <Dashboard />
-    </Profiler>
-  );
-}
-```
-
-When components render unexpectedly, check for missing keys in lists causing full re-renders, object or array literals in JSX props creating new references each render, context value changes propagating to all consumers, and state updates in render causing infinite loops. Use `React.StrictMode` in development to detect side effects in the render phase. StrictMode intentionally double-invokes component functions to surface impure render logic that would cause bugs in concurrent mode.
-
-The React DevTools flamegraph chart shows the render duration of each component. Components that take longer than 16ms to render are candidates for optimization. The ranked chart sorts components by render time, making it easy to identify the most expensive components. Use these tools to guide optimization efforts rather than prematurely memoizing everything.
+| Layout effect for async work | Blocks painting | Use useEffect instead |
 
 ## Conclusion
 
-React Fiber is a complete rethinking of how React renders. By breaking work into small units, React can prioritize updates, pause rendering, and keep the UI responsive even under heavy load. The linked-list tree structure, double buffering, and lane-based scheduling enable features like Suspense, useTransition, and automatic batching.
+React Fiber is a complete rethinking of how React renders. By breaking work into small units stored in a linked-list tree, React can prioritize updates, pause rendering, and keep the UI responsive even under heavy load. The double buffering pattern, lane-based scheduling, and three-phase commit architecture enable features like Suspense, useTransition, and automatic batching.
 
-Understanding Fiber helps you write better React code: stable keys for efficient reconciliation, functional updates for correctness in concurrent mode, and startTransition for responsive user interfaces. It's the foundation that makes React 18's concurrent features possible.
+Understanding Fiber helps you write better React code: stable keys for efficient reconciliation, functional updates for correctness in concurrent mode, and startTransition for responsive user interfaces. It's the foundation that makes React 18's and React 19's concurrent features possible.
 
 Key takeaways:
 
-1. **Fiber breaks rendering into interruptible units** — Small units of work that can be paused and resumed
-2. **Two phases: render (interruptible) and commit (synchronous)** — Pure rendering, then DOM mutations
-3. **Double buffering** — Two trees swapped atomically for consistency
-4. **Lanes model** — Priority-based scheduling for different update types
-5. **Suspense and transitions** — Built on Fiber's ability to pause and resume work
-6. **Keys and functional updates** — Critical for correctness in concurrent mode
-7. **DevTools Profiler** reveals Fiber's two-phase timing for each component
-8. **React Compiler** automates memoization based on Fiber's reconciliation rules
+1. **Fiber breaks rendering into interruptible units** — Small units of work that can be paused and resumed via the linked-list tree
+2. **Two phases: render (interruptible) and commit (synchronous)** — Pure rendering, then atomic DOM mutations
+3. **Double buffering** — Two trees (current and work-in-progress) swapped atomically
+4. **Lanes model** — Bitmask-based priority scheduling for different update types
+5. **Hooks are linked lists on the Fiber** — useState and useEffect track state via a hook list on memoizedState
+6. **Automatic batching** — Multiple updates in the same microtask are batched into one render
+7. **Suspense and transitions** — Built on Fiber's ability to pause, abandon, and resume work
+8. **React Compiler** automates memoization by analyzing Fiber's reconciliation rules at build time
