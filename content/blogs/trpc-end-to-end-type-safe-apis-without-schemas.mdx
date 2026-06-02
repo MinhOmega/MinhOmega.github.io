@@ -9,54 +9,608 @@ author: "MinhVo"
 
 ## Introduction
 
-tRPC: End-to-End Type-Safe APIs Without Schemas is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+In the world of full-stack TypeScript development, tRPC has emerged as a game-changing library that eliminates the gap between your backend and frontend. Unlike traditional REST or GraphQL APIs that require schema definitions, code generation, or runtime validation layers, tRPC leverages TypeScript's type system to provide end-to-end type safety with zero runtime overhead. When you change a backend procedure, your frontend code immediately reflects the change—no code generation, no schema synchronization, no manual type definitions.
 
-## Key Concepts
+This comprehensive guide explores tRPC's architecture, implementation patterns, and best practices for building production-ready APIs. We'll cover everything from basic setup to advanced patterns like middleware chains, subscription handling, and integration with popular frameworks. By the end, you'll understand why tRPC has become the go-to choice for TypeScript monorepos and how to leverage its full potential in your projects.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Type-safe API development](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding tRPC: Core Concepts
 
-## Practical Implementation
+### The Problem tRPC Solves
 
-Let's look at a practical example:
+Traditional API development in TypeScript projects suffers from a fundamental type disconnect. Your backend defines routes and data shapes, your frontend consumes them, but there's no compile-time guarantee they match. This leads to:
+
+- **Runtime errors** when API responses don't match frontend expectations
+- **Manual type duplication** between backend models and frontend interfaces
+- **Code generation overhead** with tools like GraphQL Code Generator or OpenAPI generators
+- **Synchronization issues** when backend changes aren't reflected in frontend types
+
+tRPC solves this by treating your TypeScript types as the single source of truth. Your API procedures are just TypeScript functions, and their input/output types flow automatically to the client.
+
+### Architecture Overview
+
+tRPC follows a layered architecture:
+
+1. **Router Layer**: Defines your API structure using nested routers
+2. **Procedure Layer**: Individual API endpoints (queries, mutations, subscriptions)
+3. **Middleware Layer**: Cross-cutting concerns like auth, logging, validation
+4. **Adapter Layer**: Connects to your HTTP framework (Express, Fastify, Next.js)
+5. **Client Layer**: Type-safe client that mirrors your router structure
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// The core tRPC concept - types flow from server to client
+import { initTRPC } from '@trpc/server';
+
+const t = initTRPC.create();
+
+const appRouter = t.router({
+  getUser: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(({ input }) => {
+      return { id: input.id, name: 'John', email: 'john@example.com' };
+    }),
+});
+
+// On the client - full type safety, zero code generation
+const user = await trpc.getUser.query({ id: '123' });
+// user is automatically typed as { id: string; name: string; email: string }
+```
+
+## Step-by-Step Implementation
+
+### Setting Up the Server
+
+Let's build a complete tRPC server with a real-world example: a task management API.
+
+```typescript
+// server/trpc.ts
+import { initTRPC, TRPCError } from '@trpc/server';
+import { z } from 'zod';
+import superjson from 'superjson';
+
+// Context type for dependency injection
+interface Context {
+  userId: string | null;
+  db: Database;
+}
+
+const t = initTRPC.context<Context>().create({
+  transformer: superjson, // Handles Date, Map, Set, etc.
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError: error.cause instanceof z.ZodError ? error.cause.flatten() : null,
+      },
+    };
+  },
+});
+
+// Base router and procedure helpers
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const middleware = t.middleware;
+```
+
+### Defining Routers and Procedures
+
+```typescript
+// server/routers/task.ts
+import { z } from 'zod';
+import { router, publicProcedure, protectedProcedure } from '../trpc';
+
+const taskSchema = z.object({
+  title: z.string().min(1).max(200),
+  description: z.string().optional(),
+  priority: z.enum(['low', 'medium', 'high', 'urgent']),
+  dueDate: z.string().datetime().optional(),
+  assigneeId: z.string().uuid().optional(),
+});
+
+export const taskRouter = router({
+  // Query - read operation
+  list: protectedProcedure
+    .input(
+      z.object({
+        status: z.enum(['todo', 'in-progress', 'done']).optional(),
+        priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+        limit: z.number().min(1).max(100).default(20),
+        cursor: z.string().optional(),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { status, priority, limit, cursor } = input;
+      
+      const tasks = await ctx.db.task.findMany({
+        where: {
+          userId: ctx.userId,
+          ...(status && { status }),
+          ...(priority && { priority }),
+        },
+        take: limit + 1,
+        cursor: cursor ? { id: cursor } : undefined,
+        orderBy: { createdAt: 'desc' },
+      });
+
+      let nextCursor: string | undefined;
+      if (tasks.length > limit) {
+        const next = tasks.pop();
+        nextCursor = next?.id;
+      }
+
+      return { tasks, nextCursor };
+    }),
+
+  // Query - single item
+  byId: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .query(async ({ input, ctx }) => {
+      const task = await ctx.db.task.findUnique({
+        where: { id: input.id, userId: ctx.userId },
+        include: { assignee: true, comments: true },
+      });
+
+      if (!task) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: `Task ${input.id} not found`,
+        });
+      }
+
+      return task;
+    }),
+
+  // Mutation - create
+  create: protectedProcedure
+    .input(taskSchema)
+    .mutation(async ({ input, ctx }) => {
+      return ctx.db.task.create({
+        data: {
+          ...input,
+          userId: ctx.userId,
+          status: 'todo',
+        },
+      });
+    }),
+
+  // Mutation - update with optimistic updates support
+  update: protectedProcedure
+    .input(
+      z.object({
+        id: z.string().uuid(),
+        data: taskSchema.partial(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const { id, data } = input;
+      
+      return ctx.db.task.update({
+        where: { id, userId: ctx.userId },
+        data,
+      });
+    }),
+
+  // Mutation - delete
+  delete: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      await ctx.db.task.delete({
+        where: { id, userId: ctx.userId },
+      });
+      return { success: true };
+    }),
+});
+```
+
+![tRPC architecture diagram](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+### Composing the Root Router
+
+```typescript
+// server/root.ts
+import { router } from './trpc';
+import { taskRouter } from './routers/task';
+import { userRouter } from './routers/user';
+import { projectRouter } from './routers/project';
+
+export const appRouter = router({
+  task: taskRouter,
+  user: userRouter,
+  project: projectRouter,
+});
+
+// Export type definition for client usage
+export type AppRouter = typeof appRouter;
+```
+
+### Client Integration with React
+
+```typescript
+// client/trpc.ts
+import { createTRPCReact } from '@trpc/react-query';
+import type { AppRouter } from '../server/root';
+
+export const trpc = createTRPCReact<AppRouter>();
+
+// client/providers.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink } from '@trpc/client';
+import { trpc } from './trpc';
+import superjson from 'superjson';
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient({
+    defaultOptions: {
+      queries: {
+        staleTime: 5 * 60 * 1000,
+        retry: 2,
+      },
+    },
+  }));
+
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        httpBatchLink({
+          url: '/api/trpc',
+          transformer: superjson,
+          headers() {
+            const token = localStorage.getItem('auth-token');
+            return token ? { authorization: `Bearer ${token}` } : {};
+          },
+        }),
+      ],
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
 }
 ```
 
-This pattern demonstrates the core approach to implementing tRPC solutions in production environments.
+### Using tRPC in Components
 
-## Best Practices
+```typescript
+// client/components/TaskList.tsx
+import { trpc } from '../trpc';
+import { useState } from 'react';
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+export function TaskList() {
+  const [status, setStatus] = useState<'todo' | 'in-progress' | 'done'>('todo');
+  
+  // Fully typed query - TypeScript knows the exact return shape
+  const { data, isLoading, fetchNextPage, hasNextPage } = trpc.task.list.useInfiniteQuery(
+    { status, limit: 20 },
+    { getNextPageParam: (lastPage) => lastPage.nextCursor }
+  );
 
-## Common Pitfalls
+  // Fully typed mutation with optimistic updates
+  const utils = trpc.useUtils();
+  
+  const updateTask = trpc.task.update.useMutation({
+    onMutate: async ({ id, data }) => {
+      await utils.task.list.cancel();
+      const previous = utils.task.list.getInfiniteData({ status });
+      
+      utils.task.list.setInfiniteData({ status }, (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          pages: old.pages.map((page) => ({
+            ...page,
+            tasks: page.tasks.map((task) =>
+              task.id === id ? { ...task, ...data } : task
+            ),
+          })),
+        };
+      });
+      
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) {
+        utils.task.list.setInfiniteData({ status }, context.previous);
+      }
+    },
+    onSettled: () => {
+      utils.task.list.invalidate();
+    },
+  });
+
+  if (isLoading) return <TaskListSkeleton />;
+
+  return (
+    <div>
+      <StatusFilter value={status} onChange={setStatus} />
+      {data?.pages.flatMap((page) =>
+        page.tasks.map((task) => (
+          <TaskCard
+            key={task.id}
+            task={task}
+            onStatusChange={(newStatus) =>
+              updateTask.mutate({ id: task.id, data: { status: newStatus } })
+            }
+          />
+        ))
+      )}
+      {hasNextPage && (
+        <button onClick={() => fetchNextPage()}>Load more</button>
+      )}
+    </div>
+  );
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: SaaS Dashboard with Complex Data Requirements
+
+A project management SaaS needs to display tasks, projects, team members, and analytics—all with real-time updates. tRPC's composability shines here:
+
+```typescript
+// Complex query with related data
+const dashboardRouter = router({
+  overview: protectedProcedure
+    .input(z.object({ projectId: z.string().uuid() }))
+    .query(async ({ input, ctx }) => {
+      const [tasks, members, activity] = await Promise.all([
+        ctx.db.task.groupBy({
+          by: ['status'],
+          where: { projectId: input.projectId },
+          _count: true,
+        }),
+        ctx.db.membership.findMany({
+          where: { projectId: input.projectId },
+          include: { user: true },
+        }),
+        ctx.db.activity.findMany({
+          where: { projectId: input.projectId },
+          take: 10,
+          orderBy: { createdAt: 'desc' },
+          include: { user: true },
+        }),
+      ]);
+
+      return { tasks, members, activity };
+    }),
+});
+```
+
+### Use Case 2: Multi-Tenant Application
+
+tRPC middleware makes multi-tenancy straightforward:
+
+```typescript
+const enforceTenantAccess = middleware(async ({ ctx, next, input }) => {
+  const tenantId = (input as any).tenantId;
+  
+  if (!tenantId) {
+    throw new TRPCError({ code: 'BAD_REQUEST', message: 'tenantId required' });
+  }
+
+  const membership = await ctx.db.membership.findUnique({
+    where: {
+      userId_tenantId: { userId: ctx.userId!, tenantId },
+    },
+  });
+
+  if (!membership) {
+    throw new TRPCError({ code: 'FORBIDDEN', message: 'No access to this tenant' });
+  }
+
+  return next({
+    ctx: { ...ctx, tenantId, role: membership.role },
+  });
+});
+
+const tenantProcedure = protectedProcedure.use(enforceTenantAccess);
+```
+
+### Use Case 3: Real-Time Collaboration
+
+tRPC subscriptions enable real-time features:
+
+```typescript
+import { observable } from '@trpc/server/observable';
+
+const collaborationRouter = router({
+  onTaskChange: protectedProcedure
+    .input(z.object({ projectId: z.string() }))
+    .subscription(({ input, ctx }) => {
+      return observable<{ type: string; task: Task }>((emit) => {
+        const listener = (event: TaskChangeEvent) => {
+          if (event.projectId === input.projectId) {
+            emit.next(event);
+          }
+        };
+        
+        eventEmitter.on('taskChange', listener);
+        
+        return () => {
+          eventEmitter.off('taskChange', listener);
+        };
+      });
+    }),
+});
+```
+
+## Best Practices for Production
+
+1. **Use Zod for all inputs**: Validates data at the boundary and provides excellent error messages
+2. **Implement proper error handling**: Use tRPC's error codes (NOT_FOUND, FORBIDDEN, etc.) consistently
+3. **Add authentication middleware early**: Create a `protectedProcedure` base that all authenticated routes use
+4. **Use infinite queries for lists**: Provides better UX with pagination and cursor-based navigation
+5. **Implement optimistic updates**: Improves perceived performance for mutations
+6. **Add request logging middleware**: Track procedure calls, duration, and errors
+7. **Use SuperJSON transformer**: Handles Date, Map, Set, and other non-JSON-serializable types
+8. **Structure routers by domain**: Group related procedures into domain-specific routers
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| No input validation | Security vulnerabilities, runtime errors | Always use Zod schemas for procedure inputs |
+| Exposing sensitive data | Data leaks | Use output transformers to strip sensitive fields |
+| N+1 queries | Performance degradation | Use DataLoader or batch queries in resolvers |
+| Missing error handling | Unhelpful error messages | Use tRPC error codes and custom error formatter |
+| Over-fetching data | Slow responses | Use `.select()` to only return needed fields |
+| No rate limiting | API abuse | Add rate limiting middleware |
+
+## Performance Optimization
+
+### Request Batching
+
+tRPC automatically batches multiple procedure calls into a single HTTP request using `httpBatchLink`. This reduces network overhead significantly:
+
+```typescript
+// These 3 calls become 1 HTTP request
+const [user, tasks, projects] = await Promise.all([
+  trpc.user.me.query(),
+  trpc.task.list.query({ limit: 10 }),
+  trpc.project.list.query(),
+]);
+```
+
+### Caching Strategies
+
+```typescript
+// Configure React Query for optimal caching
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000, // 5 minutes
+      cacheTime: 30 * 60 * 1000, // 30 minutes
+      refetchOnWindowFocus: false,
+    },
+  },
+});
+
+// Prefetch data for instant navigation
+function TaskPage() {
+  const utils = trpc.useUtils();
+  
+  const prefetchTask = (id: string) => {
+    utils.task.byId.prefetch({ id });
+  };
+  
+  return (
+    <TaskList onHover={prefetchTask} />
+  );
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | tRPC | REST | GraphQL | OpenAPI |
+|---------|------|------|---------|---------|
+| Type safety | Automatic | Manual | Code gen | Code gen |
+| Runtime overhead | Zero | Low | Medium | Low |
+| Learning curve | Low | Low | High | Medium |
+| Schema definition | TypeScript only | OpenAPI spec | GraphQL SDL | OpenAPI spec |
+| Tooling required | Minimal | Minimal | Heavy | Medium |
+| Real-time support | Subscriptions | WebSockets | Subscriptions | N/A |
+| Bundle size | ~15KB | 0 | ~30KB+ | Varies |
+
+## Advanced Patterns
+
+### Conditional Middleware
+
+```typescript
+const rateLimitMiddleware = middleware(async ({ ctx, next, type, path }) => {
+  const rateLimitKey = `${ctx.userId}:${path}`;
+  const current = await redis.incr(rateLimitKey);
+  
+  if (current === 1) {
+    await redis.expire(rateLimitKey, 60);
+  }
+  
+  if (current > 100) {
+    throw new TRPCError({
+      code: 'TOO_MANY_REQUESTS',
+      message: 'Rate limit exceeded',
+    });
+  }
+  
+  return next();
+});
+```
+
+### Output Transformers
+
+```typescript
+const stripSensitive = middleware(async ({ ctx, next }) => {
+  const result = await next();
+  
+  if (result.data && 'email' in result.data) {
+    const { email, ...rest } = result.data;
+    return { ...result, data: { ...rest, email: maskEmail(email) } };
+  }
+  
+  return result;
+});
+```
+
+## Testing Strategies
+
+```typescript
+import { appRouter } from './server/root';
+import { createInnerTRPCContext } from './server/trpc';
+
+describe('Task Router', () => {
+  const ctx = createInnerTRPCContext({
+    userId: 'test-user-id',
+    db: mockDb,
+  });
+  
+  const caller = appRouter.createCaller(ctx);
+
+  test('creates task with valid input', async () => {
+    const task = await caller.task.create({
+      title: 'Test Task',
+      priority: 'high',
+    });
+
+    expect(task.id).toBeDefined();
+    expect(task.title).toBe('Test Task');
+    expect(task.status).toBe('todo');
+  });
+
+  test('rejects unauthorized access', async () => {
+    const unauthedCtx = createInnerTRPCContext({ userId: null, db: mockDb });
+    const unauthedCaller = appRouter.createCaller(unauthedCtx);
+
+    await expect(
+      unauthedCaller.task.list({})
+    ).rejects.toThrow('UNAUTHORIZED');
+  });
+});
+```
+
+## Future Outlook
+
+tRPC continues to evolve rapidly. Key developments to watch:
+
+- **tRPC v11**: Improved middleware patterns, better error handling, and enhanced subscription support
+- **Framework integrations**: Deeper integration with Next.js App Router, SvelteKit, and SolidStart
+- **Edge runtime support**: Better compatibility with Cloudflare Workers and Vercel Edge Functions
+- **OpenAPI generation**: Automatic REST API generation from tRPC routers for external consumers
 
 ## Conclusion
 
-tRPC: End-to-End Type-Safe APIs Without Schemas is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+tRPC represents a paradigm shift in how we build APIs in TypeScript projects. By eliminating the type gap between client and server, it reduces bugs, improves developer experience, and removes entire categories of boilerplate code. The zero-runtime-overhead approach means you get all these benefits without sacrificing performance.
+
+Key takeaways:
+1. **Type safety without code generation**: tRPC leverages TypeScript's type system directly
+2. **Minimal boilerplate**: Define procedures, get automatic client types
+3. **Excellent DX**: Hot reloading, autocomplete, and compile-time error checking
+4. **Production-ready**: Middleware, error handling, and caching patterns built-in
+5. **Perfect for monorepos**: Shared types between packages with zero configuration
+
+If you're building a full-stack TypeScript application, tRPC should be at the top of your evaluation list. The developer experience improvements alone justify the adoption, and the type safety guarantees will save you countless hours of debugging.

@@ -9,54 +9,641 @@ author: "MinhVo"
 
 ## Introduction
 
-tRPC v10: Simplified API Layer is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+tRPC v10, released in late 2022, represented a significant evolution of the library that had already revolutionized TypeScript API development. While tRPC v9 proved the concept of zero-overhead type safety, v10 refined the developer experience with a simplified builder pattern, improved middleware composition, enhanced subscription support, and deeper React Query integration. The release wasn't just incremental—it was a thoughtful reimagining of how type-safe APIs should feel to write.
 
-## Key Concepts
+This guide covers everything you need to know about tRPC v10: the new syntax, migration strategies from v9, advanced patterns with middleware and subscriptions, and production-ready integration with React Query v4. Whether you're upgrading an existing project or starting fresh, this comprehensive walkthrough will help you leverage v10's full potential.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Modern API development](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding tRPC v10: What Changed
 
-## Practical Implementation
+### The New Builder Pattern
 
-Let's look at a practical example:
+The most immediately visible change in v10 is the new builder pattern. Instead of the functional approach of v9, v10 uses an instance-based approach that feels more natural and enables better TypeScript inference.
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
+// tRPC v9 (old way)
+import { createRouter } from '@trpc/server';
+
+export const appRouter = createRouter()
+  .query('hello', {
+    input: z.object({ name: z.string() }),
+    resolve({ input }) {
+      return `Hello ${input.name}`;
+    },
+  });
+
+// tRPC v10 (new way)
+import { initTRPC } from '@trpc/server';
+
+const t = initTRPC.create();
+
+export const appRouter = t.router({
+  hello: t.procedure
+    .input(z.object({ name: z.string() }))
+    .query(({ input }) => {
+      return `Hello ${input.name}`;
+    }),
+});
+```
+
+### Key Improvements in v10
+
+| Feature | v9 | v10 |
+|---------|-----|------|
+| Router definition | Chained `.query()` / `.mutation()` | Object-based `t.router({})` |
+| Procedure creation | String keys | `t.procedure` builder |
+| Middleware | Manual composition | `.use()` chain |
+| Subscriptions | Basic support | Full WebSocket support |
+| Error handling | Custom error classes | Standardized error codes |
+| Context typing | Manual generics | Automatic inference |
+| React Query integration | Separate package | Built-in with v4 |
+
+### Why the Breaking Changes?
+
+The v9 API had several pain points:
+1. String-based procedure names didn't provide good autocomplete
+2. Middleware composition was verbose and error-prone
+3. Context typing required manual generic parameters
+4. Subscription support was experimental
+
+v10 addressed all of these while maintaining tRPC's core promise of zero runtime overhead.
+
+## Step-by-Step Implementation
+
+### Server Setup with v10
+
+```typescript
+// server/trpc.ts
+import { initTRPC, TRPCError } from '@trpc/server';
+import { z } from 'zod';
+import superjson from 'superjson';
+
+interface Context {
+  userId: string | null;
+  req: Request;
+  db: Database;
+}
+
+const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError: error.cause instanceof z.ZodError 
+          ? error.cause.flatten() 
+          : null,
+      },
+    };
+  },
+});
+
+// Export building blocks
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const middleware = t.middleware;
+```
+
+### Middleware Composition in v10
+
+v10's middleware system is significantly more composable. You can chain middleware, access the previous context, and transform results:
+
+```typescript
+// Logging middleware
+const loggerMiddleware = middleware(async ({ path, type, next, ctx }) => {
+  const start = Date.now();
+  const result = await next();
+  const duration = Date.now() - start;
   
-  // Process data
-  const result = transform(input);
+  console.log(`${type} ${path} - ${duration}ms`);
   
-  // Return formatted output
-  return format(result);
+  return result;
+});
+
+// Authentication middleware
+const authMiddleware = middleware(async ({ ctx, next }) => {
+  if (!ctx.userId) {
+    throw new TRPCError({
+      code: 'UNAUTHORIZED',
+      message: 'You must be logged in',
+    });
+  }
+  
+  return next({
+    ctx: {
+      ...ctx,
+      userId: ctx.userId, // Non-nullable after auth
+    },
+  });
+});
+
+// Rate limiting middleware
+const rateLimitMiddleware = middleware(async ({ ctx, next, path }) => {
+  const key = `rate:${ctx.userId ?? ctx.req.headers.get('x-forwarded-for')}:${path}`;
+  const current = await redis.incr(key);
+  
+  if (current === 1) {
+    await redis.expire(key, 60);
+  }
+  
+  if (current > 100) {
+    throw new TRPCError({
+      code: 'TOO_MANY_REQUESTS',
+      message: 'Rate limit exceeded. Try again in 60 seconds.',
+    });
+  }
+  
+  return next();
+});
+
+// Compose middleware into procedure builders
+export const protectedProcedure = publicProcedure
+  .use(loggerMiddleware)
+  .use(authMiddleware);
+
+export const rateLimitedProcedure = protectedProcedure
+  .use(rateLimitMiddleware);
+```
+
+![Middleware architecture](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+### Router Definition Patterns
+
+v10 encourages organizing routers by domain and composing them:
+
+```typescript
+// routers/user.ts
+import { z } from 'zod';
+import { router, protectedProcedure } from '../trpc';
+
+export const userRouter = router({
+  me: protectedProcedure.query(({ ctx }) => {
+    return ctx.db.user.findUnique({
+      where: { id: ctx.userId },
+      include: { profile: true, settings: true },
+    });
+  }),
+
+  update: protectedProcedure
+    .input(
+      z.object({
+        name: z.string().min(2).max(50).optional(),
+        bio: z.string().max(500).optional(),
+        avatar: z.string().url().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      return ctx.db.user.update({
+        where: { id: ctx.userId },
+        data: input,
+      });
+    }),
+
+  byId: protectedProcedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const user = await ctx.db.user.findUnique({
+        where: { id: input.id },
+        select: { id: true, name: true, avatar: true, bio: true },
+      });
+      
+      if (!user) {
+        throw new TRPCError({ code: 'NOT_FOUND' });
+      }
+      
+      return user;
+    }),
+});
+```
+
+### Root Router Composition
+
+```typescript
+// root.ts
+import { router } from './trpc';
+import { userRouter } from './routers/user';
+import { postRouter } from './routers/post';
+import { commentRouter } from './routers/comment';
+import { notificationRouter } from './routers/notification';
+
+export const appRouter = router({
+  user: userRouter,
+  post: postRouter,
+  comment: commentRouter,
+  notification: notificationRouter,
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+### React Query Integration
+
+v10 deepened the integration with React Query v4, providing a more seamless experience:
+
+```typescript
+// utils/trpc.ts
+import { createTRPCReact } from '@trpc/react-query';
+import type { AppRouter } from '../server/root';
+
+export const trpc = createTRPCReact<AppRouter>();
+
+// providers.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { trpc } from './utils/trpc';
+import { useState } from 'react';
+import superjson from 'superjson';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: {
+            staleTime: 5 * 60 * 1000,
+            retry: (failureCount, error) => {
+              if (error.data?.code === 'UNAUTHORIZED') return false;
+              return failureCount < 3;
+            },
+          },
+        },
+      })
+  );
+
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        loggerLink({
+          enabled: (opts) =>
+            process.env.NODE_ENV === 'development' ||
+            (opts.direction === 'down' && opts.result instanceof Error),
+        }),
+        httpBatchLink({
+          url: '/api/trpc',
+          transformer: superjson,
+          headers() {
+            const token = localStorage.getItem('token');
+            return token ? { authorization: `Bearer ${token}` } : {};
+          },
+        }),
+      ],
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
 }
 ```
 
-This pattern demonstrates the core approach to implementing tRPC solutions in production environments.
+### Using Hooks in Components
 
-## Best Practices
+```typescript
+// components/PostFeed.tsx
+import { trpc } from '../utils/trpc';
+import { useInView } from 'react-intersection-observer';
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+export function PostFeed() {
+  const { ref, inView } = useInView();
 
-## Common Pitfalls
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+  } = trpc.post.feed.useInfiniteQuery(
+    { limit: 10 },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+    }
+  );
+
+  // Auto-fetch next page when sentinel is visible
+  useEffect(() => {
+    if (inView && hasNextPage && !isFetchingNextPage) {
+      fetchNextPage();
+    }
+  }, [inView, hasNextPage, isFetchingNextPage, fetchNextPage]);
+
+  const likePost = trpc.post.like.useMutation({
+    onMutate: async ({ postId }) => {
+      await utils.post.feed.cancel();
+      const previous = utils.post.feed.getInfiniteData({ limit: 10 });
+      
+      utils.post.feed.setInfiniteData({ limit: 10 }, (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          pages: old.pages.map((page) => ({
+            ...page,
+            posts: page.posts.map((post) =>
+              post.id === postId
+                ? { ...post, likes: post.likes + 1, isLiked: true }
+                : post
+            ),
+          })),
+        };
+      });
+      
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) {
+        utils.post.feed.setInfiniteData({ limit: 10 }, context.previous);
+      }
+    },
+  });
+
+  if (isLoading) return <PostFeedSkeleton />;
+
+  return (
+    <div>
+      {data?.pages.flatMap((page) =>
+        page.posts.map((post) => (
+          <PostCard
+            key={post.id}
+            post={post}
+            onLike={() => likePost.mutate({ postId: post.id })}
+          />
+        ))
+      )}
+      <div ref={ref} />
+      {isFetchingNextPage && <LoadingSpinner />}
+    </div>
+  );
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: E-Commerce Platform
+
+tRPC v10's middleware system shines in e-commerce where you need role-based access:
+
+```typescript
+const roleMiddleware = (allowedRoles: string[]) =>
+  middleware(async ({ ctx, next }) => {
+    if (!ctx.user || !allowedRoles.includes(ctx.user.role)) {
+      throw new TRPCError({ code: 'FORBIDDEN' });
+    }
+    return next({ ctx: { ...ctx, user: ctx.user } });
+  });
+
+const adminProcedure = protectedProcedure.use(roleMiddleware(['ADMIN']));
+const sellerProcedure = protectedProcedure.use(roleMiddleware(['SELLER', 'ADMIN']));
+
+const productRouter = router({
+  create: sellerProcedure
+    .input(productSchema)
+    .mutation(async ({ input, ctx }) => {
+      return ctx.db.product.create({
+        data: { ...input, sellerId: ctx.user.id },
+      });
+    }),
+
+  approve: adminProcedure
+    .input(z.object({ productId: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      return ctx.db.product.update({
+        where: { id: input.productId },
+        data: { status: 'APPROVED', approvedBy: ctx.user.id },
+      });
+    }),
+});
+```
+
+### Use Case 2: Real-Time Chat Application
+
+v10's improved subscription support enables real-time features:
+
+```typescript
+import { observable } from '@trpc/server/observable';
+import { EventEmitter } from 'events';
+
+const ee = new EventEmitter();
+
+const chatRouter = router({
+  sendMessage: protectedProcedure
+    .input(z.object({
+      channelId: z.string(),
+      content: z.string().min(1).max(5000),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const message = await ctx.db.message.create({
+        data: {
+          channelId: input.channelId,
+          content: input.content,
+          authorId: ctx.userId,
+        },
+        include: { author: true },
+      });
+
+      ee.emit('message', message);
+      return message;
+    }),
+
+  onMessage: protectedProcedure
+    .input(z.object({ channelId: z.string() }))
+    .subscription(({ input }) => {
+      return observable<Message>((emit) => {
+        const onMessage = (message: Message) => {
+          if (message.channelId === input.channelId) {
+            emit.next(message);
+          }
+        };
+
+        ee.on('message', onMessage);
+        return () => {
+          ee.off('message', onMessage);
+        };
+      });
+    }),
+});
+```
+
+## Best Practices for Migration from v9
+
+1. **Use the codemod**: tRPC provides an official codemod for automated migration
+2. **Migrate router by router**: Don't try to convert everything at once
+3. **Update client code incrementally**: The client API changes are simpler
+4. **Test thoroughly after migration**: Type errors are caught at compile time, but runtime behavior should be verified
+5. **Update React Query to v4**: tRPC v10 requires React Query v4
+
+```bash
+# Official codemod for automated migration
+npx @trpc/v10-migrate
+```
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Mixing v9 and v10 syntax | Confusing errors | Complete migration per router |
+| Missing `superjson` transformer | Date/Map objects serialized incorrectly | Add transformer to both client and server |
+| Circular router imports | Build errors | Use barrel exports and lazy loading |
+| Over-nesting middleware | Performance overhead | Keep middleware focused and minimal |
+| Not handling subscription cleanup | Memory leaks | Always return cleanup function in subscriptions |
+
+## Performance Optimization
+
+### Selective Batching
+
+```typescript
+// Disable batching for large responses
+const trpcClient = trpc.createClient({
+  links: [
+    httpBatchLink({
+      url: '/api/trpc',
+      maxURLLength: 2048, // Prevent URL too long errors
+    }),
+  ],
+});
+```
+
+### Query Optimization
+
+```typescript
+// Configure per-query options
+const { data } = trpc.post.byId.useQuery(
+  { id: postId },
+  {
+    staleTime: 60 * 1000, // 1 minute for individual posts
+    cacheTime: 5 * 60 * 1000, // 5 minutes in cache
+    refetchOnWindowFocus: false,
+  }
+);
+```
+
+## Comparison with Alternatives
+
+| Feature | tRPC v10 | GraphQL | REST + OpenAPI |
+|---------|----------|---------|----------------|
+| Type safety | Automatic | Code gen | Code gen |
+| Learning curve | Low | High | Medium |
+| Boilerplate | Minimal | High | Medium |
+| Bundle size | ~15KB | 30KB+ | 0 |
+| Real-time | Built-in | Built-in | Custom |
+| Caching | React Query | Apollo | Custom |
+| File uploads | Supported | Multipart | Multipart |
+
+## Advanced Patterns
+
+### Procedure-Level Authorization
+
+```typescript
+// Dynamic authorization based on resource ownership
+const withOwnership = (getResourceOwnerId: (input: any, ctx: Context) => Promise<string>) =>
+  middleware(async ({ input, ctx, next }) => {
+    const ownerId = await getResourceOwnerId(input, ctx);
+    
+    if (ownerId !== ctx.userId && ctx.user.role !== 'ADMIN') {
+      throw new TRPCError({
+        code: 'FORBIDDEN',
+        message: 'You do not own this resource',
+      });
+    }
+    
+    return next();
+  });
+
+const postRouter = router({
+  update: protectedProcedure
+    .use(
+      withOwnership(async (input, ctx) => {
+        const post = await ctx.db.post.findUnique({
+          where: { id: input.id },
+          select: { authorId: true },
+        });
+        return post?.authorId ?? '';
+      })
+    )
+    .input(z.object({ id: z.string(), title: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      return ctx.db.post.update({
+        where: { id: input.id },
+        data: { title: input.title },
+      });
+    }),
+});
+```
+
+### Output Validation
+
+```typescript
+// Validate outputs with Zod schemas
+const withOutputValidation = <T extends z.ZodType>(schema: T) =>
+  middleware(async ({ next }) => {
+    const result = await next();
+    const parsed = schema.parse(result.data);
+    return { ...result, data: parsed };
+  });
+```
+
+## Testing Strategies
+
+```typescript
+import { appRouter } from './root';
+import { createInnerTRPCContext } from './trpc';
+
+describe('tRPC v10 Router', () => {
+  const createTestContext = (userId?: string) =>
+    createInnerTRPCContext({
+      userId: userId ?? null,
+      db: mockDb,
+      req: new Request('http://localhost'),
+    });
+
+  test('procedure with middleware chain', async () => {
+    const ctx = createTestContext('user-1');
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.user.me();
+    expect(result.id).toBe('user-1');
+  });
+
+  test('middleware rejects unauthorized access', async () => {
+    const ctx = createTestContext(); // No user
+    const caller = appRouter.createCaller(ctx);
+
+    await expect(caller.user.me()).rejects.toThrow('UNAUTHORIZED');
+  });
+
+  test('input validation works correctly', async () => {
+    const ctx = createTestContext('user-1');
+    const caller = appRouter.createCaller(ctx);
+
+    await expect(
+      caller.user.update({ name: '' }) // Too short
+    ).rejects.toThrow();
+  });
+});
+```
+
+## Future Outlook
+
+tRPC v10 laid the groundwork for future innovations:
+
+- **v11 roadmap**: Improved error handling, better edge runtime support, enhanced subscription patterns
+- **Framework expansion**: Deeper integrations with SvelteKit, SolidStart, and Fresh
+- **Developer tools**: Better debugging, request tracing, and API documentation generation
+- **Performance improvements**: Smaller bundle size, faster type inference
 
 ## Conclusion
 
-tRPC v10: Simplified API Layer is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+tRPC v10 represents a significant step forward in type-safe API development. The simplified builder pattern, composable middleware, and deep React Query integration make it the most productive way to build full-stack TypeScript applications.
+
+Key takeaways:
+1. **Simplified syntax**: The builder pattern is more intuitive and provides better autocomplete
+2. **Composable middleware**: Chain middleware for auth, logging, rate limiting, and more
+3. **Deep React Query integration**: First-class hooks with optimistic updates and infinite queries
+4. **Production-ready**: Error handling, caching, and performance optimizations built-in
+5. **Easy migration**: Official codemods and incremental migration strategies
+
+If you're starting a new TypeScript project or looking to improve your existing API layer, tRPC v10 offers the best developer experience in the ecosystem today.
