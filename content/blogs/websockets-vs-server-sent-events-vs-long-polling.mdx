@@ -440,6 +440,159 @@ The right real-time protocol depends on your communication direction needs, scal
 
 The right real-time protocol depends on your communication direction needs, scalability requirements, and infrastructure constraints, so evaluate each option against your specific use case before committing to an implementation.
 
+## Scaling WebSocket Connections
+
+Scaling WebSockets across multiple servers introduces challenges because each server maintains its own set of client connections. When a message arrives on one server, it needs to reach clients connected to other servers. This requires a pub/sub message broker.
+
+### Redis Pub/Sub for WebSocket Scaling
+
+```javascript
+import { createClient } from 'redis';
+import { WebSocketServer } from 'ws';
+
+const pubClient = createClient({ url: process.env.REDIS_URL });
+const subClient = pubClient.duplicate();
+await Promise.all([pubClient.connect(), subClient.connect()]);
+
+const wss = new WebSocketServer({ port: 8080 });
+const rooms = new Map();
+
+wss.on('connection', (ws) => {
+  ws.on('message', async (data) => {
+    const msg = JSON.parse(data);
+
+    if (msg.type === 'subscribe') {
+      rooms.set(msg.channel, ws);
+      await subClient.subscribe(msg.channel, (message) => {
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ channel: msg.channel, data: message }));
+        }
+      });
+    }
+
+    if (msg.type === 'publish') {
+      await pubClient.publish(msg.channel, JSON.stringify(msg.data));
+    }
+  });
+
+  ws.on('close', async () => {
+    for (const [channel, client] of rooms) {
+      if (client === ws) {
+        await subClient.unsubscribe(channel);
+        rooms.delete(channel);
+      }
+    }
+  });
+});
+```
+
+### Sticky Sessions with Load Balancers
+
+When using WebSocket behind a load balancer, you need sticky sessions because the WebSocket handshake starts as an HTTP upgrade request. If subsequent packets reach a different server, the connection fails. Configure your load balancer for sticky sessions using IP hash or cookie-based affinity:
+
+```nginx
+# NGINX sticky session configuration for WebSocket
+upstream websocket_backend {
+    ip_hash;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+    server 10.0.0.3:8080;
+}
+
+server {
+    location /ws {
+        proxy_pass http://websocket_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+### Connection Draining and Graceful Shutdown
+
+When deploying new versions of your WebSocket server, gracefully drain connections before shutting down. Stop accepting new connections, send a close frame to existing clients with a reconnect URL, and wait for clients to disconnect or migrate:
+
+```javascript
+async function gracefulShutdown(wss) {
+  // Stop accepting new connections
+  wss.close();
+
+  // Notify all clients to reconnect
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'reconnect',
+        url: 'wss://server-2.example.com/ws',
+        delay: 5000,
+      }));
+      // Give clients time to receive the message
+      setTimeout(() => ws.close(1001, 'Server shutting down'), 3000);
+    }
+  }
+
+  // Wait for all connections to close
+  await new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (wss.clients.size === 0) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 100);
+  });
+}
+
+process.on('SIGTERM', () => gracefulShutdown(wss));
+```
+
+## WebSocket Security
+
+WebSocket connections bypass many traditional HTTP security measures. Implement these security practices to protect your WebSocket endpoints:
+
+```javascript
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 1024 * 16, // 16KB max message size
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 6 },
+    threshold: 1024, // Only compress messages > 1KB
+  },
+});
+
+server.on('upgrade', (req, socket, head) => {
+  // Validate origin
+  const origin = req.headers.origin;
+  if (!isValidOrigin(origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Rate limit connections per IP
+  if (connectionCount.get(req.socket.remoteAddress) > MAX_CONNECTIONS) {
+    socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Authenticate during upgrade
+  const token = new URL(req.url, 'http://localhost').searchParams.get('token');
+  if (!validateToken(token)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws.userId = getUserId(token);
+    wss.emit('connection', ws, req);
+  });
+});
+```
+
 ## Conclusion
 
 Choose the right real-time technology based on your needs: WebSockets for bidirectional communication, SSE for server-to-client updates, and long polling as a compatibility fallback. In production, a hybrid approach that tries the best transport first and falls back gracefully provides the best user experience.
@@ -451,3 +604,5 @@ Key takeaways:
 3. **Long polling** provides maximum compatibility as a fallback
 4. **Hybrid approaches** combine the best of all three
 5. **All transports** need reconnection and heartbeat logic for production use
+6. **Scale WebSockets** with Redis Pub/Sub and sticky sessions on the load balancer
+7. **Secure WebSocket endpoints** with origin validation, authentication, and rate limiting
