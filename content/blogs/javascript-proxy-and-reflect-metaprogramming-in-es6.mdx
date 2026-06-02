@@ -528,6 +528,276 @@ Avoid proxies for:
 
 Proxies enable powerful metaprogramming patterns like validation, logging, and access control, but should be used judiciously due to their performance overhead.
 
+## Vue 3's Reactivity System: Proxy in Action
+
+Vue 3's reactivity system is the most prominent real-world application of Proxy. Understanding how Vue uses Proxy helps you appreciate both the framework and the metaprogramming technique:
+
+```javascript
+// Simplified version of Vue 3's reactive system
+const targetMap = new WeakMap();  // target -> depsMap
+const effectStack = [];
+let activeEffect = null;
+
+function track(target, key) {
+    if (!activeEffect) return;
+    let depsMap = targetMap.get(target);
+    if (!depsMap) targetMap.set(target, (depsMap = new Map()));
+    let deps = depsMap.get(key);
+    if (!deps) depsMap.set(key, (deps = new Set()));
+    deps.add(activeEffect);
+}
+
+function trigger(target, key) {
+    const depsMap = targetMap.get(target);
+    if (!depsMap) return;
+    const deps = depsMap.get(key);
+    if (deps) deps.forEach(effect => effect());
+}
+
+function reactive(target) {
+    return new Proxy(target, {
+        get(target, key, receiver) {
+            track(target, key);
+            const result = Reflect.get(target, key, receiver);
+            // Deep reactivity: wrap nested objects
+            if (typeof result === 'object' && result !== null) {
+                return reactive(result);
+            }
+            return result;
+        },
+        set(target, key, value, receiver) {
+            const oldValue = target[key];
+            const result = Reflect.set(target, key, value, receiver);
+            if (oldValue !== value) {
+                trigger(target, key);
+            }
+            return result;
+        },
+        deleteProperty(target, key) {
+            const hadKey = key in target;
+            const result = Reflect.deleteProperty(target, key);
+            if (hadKey) trigger(target, key);
+            return result;
+        }
+    });
+}
+
+function effect(fn) {
+    activeEffect = fn;
+    fn();  // Run to collect dependencies
+    activeEffect = null;
+}
+
+// Usage
+const state = reactive({ count: 0, user: { name: 'Alice' } });
+
+effect(() => {
+    console.log('Count is:', state.count);
+});
+
+state.count++;  // Triggers the effect, logs "Count is: 1"
+state.user.name = 'Bob';  // Triggers effects watching user.name
+```
+
+Vue 3's reactive system uses WeakMap for automatic garbage collection—when the target object is garbage collected, its dependency map is also collected. This prevents memory leaks that plagued Vue 2's `Object.defineProperty`-based system.
+
+### Comparison: Proxy vs Object.defineProperty
+
+| Feature | Proxy (Vue 3) | Object.defineProperty (Vue 2) |
+|---------|--------------|-------------------------------|
+| Array index detection | ✅ Automatic | ❌ Requires override |
+| Property addition | ✅ Automatic | ❌ Requires `$set` |
+| Property deletion | ✅ Automatic | ❌ Requires `$delete` |
+| Nested object tracking | ✅ Lazy (on access) | ❌ Eager (on init) |
+| Performance | Better for large objects | Better for small objects |
+| Browser support | ES6+ (all modern) | IE9+ |
+
+## Advanced Patterns: Computed Properties with Proxy
+
+```javascript
+function computed(getter) {
+    let cachedValue;
+    let dirty = true;
+
+    const effect = new Proxy({ value: undefined }, {
+        get(target, key) {
+            if (key === 'value') {
+                if (dirty) {
+                    cachedValue = getter();
+                    dirty = false;
+                }
+                return cachedValue;
+            }
+        }
+    });
+
+    // Mark as dirty when dependencies change
+    // (In real implementation, this connects to the reactive system)
+    return effect;
+}
+
+// Usage
+const state = reactive({ firstName: 'John', lastName: 'Doe' });
+const fullName = computed(() => `${state.firstName} ${state.lastName}`);
+console.log(fullName.value);  // "John Doe"
+```
+
+## Real-World Pattern: API Client with Proxy
+
+```javascript
+function createApiClient(baseUrl, options = {}) {
+    const cache = new Map();
+    const { cacheTimeout = 60000, headers = {} } = options;
+
+    return new Proxy({}, {
+        get(target, resource) {
+            if (target[resource]) return target[resource];
+
+            target[resource] = new Proxy({}, {
+                get(_, action) {
+                    return async (...args) => {
+                        const cacheKey = `${resource}:${action}:${JSON.stringify(args)}`;
+
+                        // Check cache
+                        if (cache.has(cacheKey)) {
+                            const { data, timestamp } = cache.get(cacheKey);
+                            if (Date.now() - timestamp < cacheTimeout) return data;
+                        }
+
+                        const url = `${baseUrl}/${resource}`;
+                        let response;
+
+                        switch (action) {
+                            case 'list':
+                                response = await fetch(url, { headers });
+                                break;
+                            case 'get':
+                                response = await fetch(`${url}/${args[0]}`, { headers });
+                                break;
+                            case 'create':
+                                response = await fetch(url, {
+                                    method: 'POST',
+                                    headers: { ...headers, 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(args[0])
+                                });
+                                break;
+                            case 'update':
+                                response = await fetch(`${url}/${args[0]}`, {
+                                    method: 'PUT',
+                                    headers: { ...headers, 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(args[1])
+                                });
+                                break;
+                            case 'delete':
+                                response = await fetch(`${url}/${args[0]}`, { method: 'DELETE' });
+                                return response.ok;
+                        }
+
+                        const data = await response.json();
+                        cache.set(cacheKey, { data, timestamp: Date.now() });
+                        return data;
+                    };
+                }
+            });
+
+            return target[resource];
+        }
+    });
+}
+
+const api = createApiClient('https://api.example.com', { cacheTimeout: 30000 });
+const users = await api.users.list();
+const user = await api.users.get(1);
+await api.users.update(1, { name: 'Updated' });
+```
+
+## Security: Proxy for Access Control
+
+```javascript
+function createSecureObject(target, permissions) {
+    return new Proxy(target, {
+        get(target, property, receiver) {
+            if (property === 'toJSON' || property === 'toString') {
+                return Reflect.get(target, property, receiver);
+            }
+
+            const perm = permissions[property];
+            if (!perm) {
+                throw new Error(`Access denied: property '${property}' does not exist`);
+            }
+            if (!perm.read) {
+                throw new Error(`Access denied: no read permission for '${property}'`);
+            }
+
+            return Reflect.get(target, property, receiver);
+        },
+
+        set(target, property, value, receiver) {
+            const perm = permissions[property];
+            if (!perm || !perm.write) {
+                throw new Error(`Access denied: no write permission for '${property}'`);
+            }
+
+            return Reflect.set(target, property, value, receiver);
+        },
+
+        has(target, property) {
+            return property in permissions && permissions[property].read;
+        },
+
+        ownKeys(target) {
+            return Object.keys(permissions).filter(k => permissions[k].read);
+        }
+    });
+}
+
+const sensitiveData = createSecureObject(
+    { username: 'alice', password: 'secret123', email: 'alice@example.com' },
+    {
+        username: { read: true, write: false },
+        password: { read: false, write: false },
+        email: { read: true, write: true }
+    }
+);
+
+console.log(sensitiveData.username);  // "alice"
+console.log(sensitiveData.password);  // Error: Access denied
+sensitiveData.email = 'new@example.com';  // Works
+```
+
+## Debugging Proxies
+
+Proxies can be difficult to debug because they intercept operations invisibly. Here are techniques for debugging proxy-based code:
+
+```javascript
+// Debug proxy: logs all intercepted operations
+function debugProxy(target, name = 'Target') {
+    return new Proxy(target, {
+        get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            console.log(`[${name}] GET ${String(prop)} =>`, typeof value === 'function' ? 'function' : value);
+            return value;
+        },
+        set(target, prop, value, receiver) {
+            console.log(`[${name}] SET ${String(prop)} =`, value);
+            return Reflect.set(target, prop, value, receiver);
+        },
+        apply(target, thisArg, args) {
+            console.log(`[${name}] CALL with`, args);
+            return Reflect.apply(target, thisArg, args);
+        },
+        has(target, prop) {
+            console.log(`[${name}] HAS ${String(prop)}`);
+            return Reflect.has(target, prop);
+        }
+    });
+}
+
+// Usage during development
+const state = debugProxy(reactive({ count: 0 }), 'State');
+state.count++;  // Logs: [State] GET count => 0, [State] SET count = 1
+```
+
 ## Conclusion
 
 Proxy and Reflect are essential JavaScript metaprogramming tools. They enable patterns like reactive systems, validation layers, and API abstractions that form the foundation of modern frameworks like Vue 3.
