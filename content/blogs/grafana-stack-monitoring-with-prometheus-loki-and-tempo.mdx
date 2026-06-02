@@ -9,54 +9,592 @@ author: "MinhVo"
 
 ## Introduction
 
-Grafana Stack: Monitoring with Prometheus, Loki, and Tempo is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Observability is the ability to understand the internal state of a system from its external outputs. In the context of modern distributed systems—microservices running on Kubernetes, communicating through message queues, and scaling dynamically—observability is not optional. When a request fails, you need to trace it across multiple services, correlate errors with logs, and identify which metric spike preceded the failure. Without a unified observability stack, this investigation involves switching between multiple tools, manually correlating timestamps, and guessing at causality.
 
-## Key Concepts
+The Grafana observability stack—Prometheus for metrics, Loki for logs, and Tempo for traces—provides a unified platform for all three pillars of observability. Prometheus scrapes and stores time-series metrics with a powerful query language (PromQL). Loki indexes metadata (labels) rather than log content, making it dramatically cheaper than traditional log aggregation systems. Tempo provides distributed tracing with the ability to reconstruct the full journey of a request across services. Grafana ties everything together with dashboards, alerting, and the ability to correlate between metrics, logs, and traces seamlessly.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+This guide walks through building a complete observability stack from scratch. We cover Prometheus setup with service discovery and alerting rules, Loki configuration with LogQL for log querying, Tempo for distributed tracing with trace-to-logs correlation, and Grafana dashboards that bring all three data sources together. We also cover production hardening, high availability, retention policies, and cost optimization. By the end, you will have a production-ready observability stack that gives you complete visibility into your systems.
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+![Observability and monitoring dashboard](https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=800&h=400&fit=crop)
 
-## Practical Implementation
+## Understanding the Grafana Stack: Core Concepts
 
-Let's look at a practical example:
+The Grafana stack is built around the three pillars of observability: metrics, logs, and traces. Each tool is designed to excel at its specific data type while integrating tightly with the others.
 
-```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+### Prometheus: Metrics
+
+Prometheus is a time-series database and monitoring system that scrapes metrics from instrumented targets. It stores data as time series—streams of timestamped values belonging to the same metric and the same set of label dimensions. PromQL, Prometheus's query language, lets you filter, aggregate, and compute over these time series.
+
+```yaml
+# Prometheus scrapes targets on a configured interval
+# Each target exposes a /metrics endpoint
+# Example: http://api-server:9090/metrics returns:
+# http_requests_total{method="GET", path="/api/users", status="200"} 14523
+# http_requests_total{method="POST", path="/api/users", status="201"} 892
+# http_request_duration_seconds{method="GET", path="/api/users", quantile="0.99"} 0.234
+```
+
+### Loki: Logs
+
+Loki is a horizontally scalable log aggregation system inspired by Prometheus. Instead of indexing the full text of log lines (like Elasticsearch), Loki only indexes labels (metadata) and stores log content in compressed chunks. This makes Loki an order of magnitude cheaper to operate while still supporting powerful queries through LogQL.
+
+### Tempo: Traces
+
+Tempo is a distributed tracing backend that stores and queries traces. It accepts traces in multiple formats (Jaeger, Zipkin, OpenTelemetry) and provides trace ID lookup, as well as the ability to generate metrics from traces (TraceQL). Tempo integrates with Loki to enable trace-to-logs correlation—click a trace, see the associated logs.
+
+### The Correlation Power
+
+The real value of the Grafana stack is correlation. When you see a latency spike in a Prometheus metric, you can click through to the relevant traces in Tempo, and from those traces, jump to the specific log lines in Loki. This seamless navigation across all three pillars turns investigation from a multi-tool guessing game into a guided exploration.
+
+![Three pillars of observability](https://images.unsplash.com/photo-1518186285589-2f7649de83e0?w=800&h=400&fit=crop)
+
+## Architecture and Design Patterns
+
+### Stack Architecture
+
+A production Grafana stack typically runs on Kubernetes with each component as a separate deployment, connected through internal services.
+
+```
+                    ┌─────────────┐
+                    │   Grafana   │
+                    │  (dashboards│
+                    │   & alerts) │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+       ┌──────▼──────┐ ┌──▼────┐ ┌─────▼─────┐
+       │ Prometheus   │ │ Loki  │ │  Tempo    │
+       │ (metrics)    │ │(logs) │ │ (traces)  │
+       └──────┬──────┘ └──┬────┘ └─────┬─────┘
+              │            │            │
+    ┌─────────▼──────┐ ┌──▼────────┐ ┌─▼──────────┐
+    │  Targets:      │ │  Agents:  │ │  SDKs:     │
+    │  app /metrics  │ │  Promtail │ │  OTel SDK  │
+    │  node-exporter │ │  Fluentd  │ │  Jaeger    │
+    │  kube-state    │ │  Vector   │ │  Zipkin    │
+    └────────────────┘ └───────────┘ └────────────┘
+```
+
+### Label Strategy
+
+Labels are the backbone of Prometheus and Loki. A well-designed label strategy is critical for performance and cost. Labels should be low-cardinality (few distinct values) and represent dimensions you want to filter or aggregate by.
+
+```yaml
+# GOOD labels (low cardinality)
+environment: "production"     # 3-5 values
+service: "api-server"         # 10-100 values
+method: "GET"                 # 4-5 values
+status_code: "200"            # 10-20 values
+
+# BAD labels (high cardinality - explodes storage)
+user_id: "12345"              # Millions of values
+request_id: "abc-def-ghi"    # Every request is unique
+ip_address: "10.0.1.234"     # Millions of values
+```
+
+## Step-by-Step Implementation
+
+### Deploying Prometheus with Helm
+
+```bash
+# Add the Prometheus community Helm repository
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# Install Prometheus with custom values
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --values prometheus-values.yaml
+```
+
+```yaml
+# prometheus-values.yaml
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    retentionSize: "50GB"
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+      limits:
+        memory: "4Gi"
+        cpu: "1000m"
+    # Service discovery
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+# Alertmanager configuration
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'slack-notifications'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'pagerduty'
+          repeat_interval: 1h
+    receivers:
+      - name: 'slack-notifications'
+        slack_configs:
+          - api_url: '${SLACK_WEBHOOK_URL}'
+            channel: '#alerts'
+            title: '{{ .GroupLabels.alertname }}'
+            text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+      - name: 'pagerduty'
+        pagerduty_configs:
+          - service_key: '${PAGERDUTY_SERVICE_KEY}'
+```
+
+### Recording Rules for Dashboard Performance
+
+Recording rules pre-compute frequently used or expensive PromQL expressions and store the results as new time series. This makes dashboards load instantly.
+
+```yaml
+# recording-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-recording-rules
+  namespace: monitoring
+spec:
+  groups:
+    - name: api.rules
+      interval: 30s
+      rules:
+        # Pre-compute request rate per service
+        - record: job:http_requests:rate5m
+          expr: |
+            sum by (job, status_code) (
+              rate(http_requests_total[5m])
+            )
+
+        # Pre-compute error ratio per service
+        - record: job:http_errors:ratio5m
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{status_code=~"5.."}[5m])
+            ) / sum by (job) (
+              rate(http_requests_total[5m])
+            )
+
+        # Pre-compute P99 latency
+        - record: job:http_latency:p99_5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, le) (
+                rate(http_request_duration_seconds_bucket[5m])
+              )
+            )
+```
+
+### Alerting Rules
+
+```yaml
+# alerting-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: api.alerts
+      rules:
+        - alert: HighErrorRate
+          expr: job:http_errors:ratio5m > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High error rate on {{ $labels.job }}"
+            description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+        - alert: HighLatency
+          expr: job:http_latency:p99_5m > 1.0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High P99 latency on {{ $labels.job }}"
+            description: "P99 latency is {{ $value }}s (threshold: 1s)"
+
+        - alert: PodCrashLooping
+          expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping"
+```
+
+### Deploying Loki
+
+```yaml
+# loki-values.yaml (Helm chart)
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: s3
+    s3:
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      bucketnames: loki-chunks
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+
+# Retention and limits
+limits_config:
+  retention_period: 30d
+  max_query_length: 721h
+  max_query_parallelism: 32
+  ingestion_rate_mb: 10
+  ingestion_burst_size_mb: 20
+
+# Deploy Promtail as DaemonSet for log collection
+promtail:
+  config:
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    snippets:
+      pipelineStages:
+        - cri: {}
+        - json:
+            expressions:
+              level: level
+              msg: message
+        - labels:
+            level:
+```
+
+### LogQL Examples
+
+```promql
+# Basic log search
+{namespace="production", app="api-server"} |= "error"
+
+# Filter by log level
+{namespace="production"} | json | level="error"
+
+# Count errors per minute
+sum(rate({namespace="production"} |= "error" [1m])) by (app)
+
+# Extract and aggregate JSON fields
+{app="api-server"} | json
+  | latency = request_duration
+  | latency > 1000
+  | line_format "{{.method}} {{.path}} took {{.latency}}ms"
+
+# Top 10 error messages
+topk(10,
+  sum(rate({namespace="production"} | json | level="error" [5m])) by (msg)
+)
+```
+
+### Deploying Tempo
+
+```yaml
+# tempo-values.yaml
+tempo:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+    jaeger:
+      protocols:
+        thrift_http:
+          endpoint: "0.0.0.0:14268"
+    zipkin:
+      endpoint: "0.0.0.0:9411"
+
+  storage:
+    trace:
+      backend: s3
+      s3:
+        bucket: tempo-traces
+        endpoint: s3.us-east-1.amazonaws.com
+      wal:
+        path: /var/tempo/wal
+      local:
+        path: /var/tempo/blocks
+
+  retention: 168h  # 7 days
+
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: "http://prometheus:9090/api/v1/write"
+```
+
+### OpenTelemetry SDK Integration
+
+```go
+package main
+
+import (
+	"context"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+)
+
+func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint("tempo:4317"),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("api-server"),
+			semconv.ServiceVersion("2.1.0"),
+			semconv.DeploymentEnvironment("production"),
+		)),
+		sdktrace.WithSampler(sdktrace.ParentBased(
+			sdktrace.TraceIDRatioBased(0.1), // Sample 10% of new traces
+		)),
+	)
+
+	otel.SetTracerProvider(tp)
+	return tp, nil
 }
 ```
 
-This pattern demonstrates the core approach to implementing Grafana solutions in production environments.
+![Grafana dashboard visualization](https://images.unsplash.com/photo-1504868584819-f8e8b4b6d7e3?w=800&h=400&fit=crop)
 
-## Best Practices
+## Real-World Use Cases
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+### Use Case 1: SLI/SLO Monitoring
 
-## Common Pitfalls
+Defining and monitoring Service Level Indicators (SLIs) and Service Level Objectives (SOs) for error budget tracking.
+
+```yaml
+# SLI: 99.9% of requests complete within 1 second
+# SLO: 99.9% availability over 30 days
+# Error budget: 0.1% = ~43 minutes of downtime per month
+
+# Recording rule for error budget
+- record: slo:error_budget_remaining:30d
+  expr: |
+    1 - (
+      sum(increase(http_requests_total{status_code=~"5.."}[30d]))
+      / sum(increase(http_requests_total[30d]))
+    ) / 0.001  # 99.9% target
+```
+
+### Use Case 2: Kubernetes Cluster Monitoring
+
+Monitoring cluster health, resource utilization, and pod scheduling with kube-state-metrics and node-exporter. Key metrics include node CPU and memory utilization, pod count per node, pending pods, and persistent volume usage.
+
+### Use Case 3: Application Performance Monitoring
+
+Combining metrics (request rate, latency, error rate), logs (structured application logs), and traces (distributed request flows) for complete application visibility. The RED method—Rate, Errors, Duration—provides the metric foundation, while traces reveal the exact execution path.
+
+### Use Case 4: Cost Monitoring with Metrics
+
+Using Prometheus to track cloud resource costs by monitoring usage metrics and correlating with pricing data. Track CPU hours per service, storage consumption per namespace, and network egress per application.
+
+## Best Practices for Production
+
+1. **Use recording rules for expensive queries**: Pre-compute any PromQL expression used in dashboards that aggregates across many time series. This reduces query time from seconds to milliseconds.
+2. **Design labels carefully**: Keep label cardinality low. Use service, environment, and method labels. Avoid user IDs, request IDs, or IP addresses as labels.
+3. **Set retention based on data type**: Metrics: 30-90 days (cheap to store). Logs: 7-30 days (expensive). Traces: 3-7 days (most expensive). Use tiered storage (S3/GCS) for older data.
+4. **Use exemplars to link metrics to traces**: Configure Prometheus to store exemplars (trace IDs alongside metric samples). This enables clicking a metric spike in Grafana to see the associated traces in Tempo.
+5. **Deploy with HA for production**: Run 2+ replicas of Prometheus with Thanos or Cortex for long-term storage and HA. Run Loki and Tempo in microservices mode for horizontal scaling.
+6. **Implement proper alerting hierarchy**: Use alert severity levels (info, warning, critical) with different routing (Slack for warning, PagerDuty for critical). Avoid alert fatigue.
+7. **Use LogQL pipelines for log processing**: Parse, filter, and transform log lines at query time rather than at ingestion time. This keeps ingestion fast and lets you change parsing logic without re-ingesting data.
+8. **Monitor the monitoring stack**: Set up separate alerts for Prometheus, Loki, and Tempo health—scrape errors, ingestion lag, storage capacity, and query performance.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| High-cardinality labels | Prometheus OOM, storage explosion | Reject high-cardinality labels; use bucketing for histograms |
+| Indexing full log text in Loki | Elasticsearch-level costs | Loki only indexes labels; use structured logging (JSON) |
+| No retention policy | Storage costs grow unbounded | Set retention per data type; use tiered storage |
+| No alerting rules | Silent failures, missed incidents | Define alerts for SLO breaches, pod restarts, resource exhaustion |
+| Querying across entire time range | Slow dashboards, OOM queries | Use recording rules, limit time ranges, use step intervals |
+| Missing trace context in logs | Cannot correlate traces and logs | Inject trace_id and span_id into log context |
+
+## Performance Optimization
+
+```yaml
+# Prometheus: optimize for large-scale scraping
+global:
+  scrape_interval: 30s      # Scrape every 30s instead of 15s
+  evaluation_interval: 30s
+
+# Loki: optimize chunk storage
+chunk_store_config:
+  max_look_back_period: 720h
+  chunk_cache_config:
+    memcached:
+      batch_size: 100
+      parallelism: 100
+
+# Tempo: optimize trace ingestion
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          max_recv_msg_size_mib: 4
+
+# Grafana: optimize dashboard queries
+# Use $__rate_interval instead of fixed intervals
+# Use recording rules for heavy aggregations
+# Limit max data points per panel
+```
+
+## Comparison with Alternatives
+
+| Feature | Grafana Stack | ELK Stack | Datadog | New Relic |
+|---------|--------------|-----------|---------|-----------|
+| Cost | Open source (self-hosted) | Open source (self-hosted) | $23/host/month+ | $0.30/GB+ |
+| Metrics | Prometheus | Elasticsearch | Built-in | Built-in |
+| Logs | Loki | Elasticsearch | Built-in | Built-in |
+| Traces | Tempo | APM | Built-in | Built-in |
+| Log indexing | Labels only | Full text | Full text | Full text |
+| Storage cost | Low (labels only) | High (full text) | N/A (SaaS) | N/A (SaaS) |
+| Query language | PromQL + LogQL + TraceQL | KQL | Proprietary | NRQL |
+| Learning curve | Moderate | Steep | Low | Low |
+| Self-hosted | Yes | Yes | No | No |
+
+## Advanced Patterns
+
+### Thanos for Long-Term Storage and HA
+
+```yaml
+# Thanos sidecar uploads blocks to object storage
+# Thanos Query aggregates data from multiple Prometheus instances
+thanos:
+  objectStorageConfig:
+    type: S3
+    config:
+      bucket: thanos-metrics
+      endpoint: s3.us-east-1.amazonaws.com
+      sse_config:
+        type: SSE-S3
+```
+
+### Grafana Dashboard as Code
+
+```json
+{
+  "dashboard": {
+    "title": "API Server Dashboard",
+    "panels": [
+      {
+        "title": "Request Rate",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{job=\"api-server\"}[5m])) by (status_code)",
+            "legendFormat": "{{status_code}}"
+          }
+        ]
+      },
+      {
+        "title": "P99 Latency",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "p99"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Trace-to-Logs Correlation
+
+Configure Grafana data source relationships to enable clicking a trace span and seeing the corresponding logs.
+
+```yaml
+# In Grafana data source configuration
+apiVersion: 1
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        filterByTraceID: true
+        filterBySpanID: true
+        tags: ['app', 'namespace']
+  - name: Loki
+    type: loki
+    uid: loki
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: "trace_id=(\\w+)"
+          name: TraceID
+          url: '$${__value.raw}'
+```
+
+## Testing Strategies
+
+```bash
+# Test Prometheus rules
+promtool check rules recording-rules.yaml
+promtool test rules tests.yaml
+
+# Test alerting rules with sample data
+promtool test rules alert-tests.yaml
+
+# Test Loki queries
+logcli query '{app="api-server"} |= "error"' --limit=10
+
+# Validate Grafana dashboards
+grafana-cli admin dashboard-import dashboard.json
+
+# Test Tempo queries
+curl http://tempo:3200/api/traces/<trace-id>
+```
+
+## Future Outlook
+
+The Grafana ecosystem continues to evolve with Grafana Beyla for automatic instrumentation, Grafana Alloy as a unified telemetry collector, and TraceQL for advanced trace querying. The trend is toward OpenTelemetry as the universal instrumentation standard, with Grafana providing the best open-source platform for storing, querying, and visualizing OpenTelemetry data. The Mimir project brings horizontally scalable, highly available Prometheus-compatible metrics storage.
 
 ## Conclusion
 
-Grafana Stack: Monitoring with Prometheus, Loki, and Tempo is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+The Grafana observability stack—Prometheus, Loki, and Tempo—provides a complete, open-source solution for the three pillars of observability. Prometheus metrics give you real-time visibility into system behavior through counters, gauges, and histograms. Loki provides cost-effective log aggregation by indexing labels instead of full text. Tempo enables distributed tracing that reconstructs request flows across services. Grafana ties them all together with dashboards, alerting, and seamless correlation between metrics, logs, and traces.
+
+The key takeaways are: design your label strategy carefully to control cardinality and cost, use recording rules for dashboard performance, implement proper retention policies per data type, configure exemplars and trace-to-logs correlation for seamless investigation, and monitor the monitoring stack itself. With this stack, you gain the visibility needed to operate distributed systems with confidence—detecting issues before users notice, investigating incidents in minutes instead of hours, and making data-driven decisions about system performance and reliability.
