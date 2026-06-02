@@ -13,7 +13,7 @@ React Server Components (RSC) represent a fundamental shift in how React applica
 
 However, moving from theory to production reveals challenges that documentation rarely covers. This guide distills real-world lessons from deploying RSC in production applications: what works, what doesn't, and the patterns that emerge when you're building with RSC at scale.
 
-![Server-side rendering](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
+![Server-side rendering architecture](https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=400&fit=crop)
 
 ## Understanding the RSC Mental Model
 
@@ -75,6 +75,27 @@ async function DashboardPage() {
       <ActivityFeed items={recentActivity} /> {/* client component */}
       <DateRangePicker />                    {/* client component */}
     </DashboardLayout>
+  );
+}
+```
+
+### Serialization Boundary Deep Dive
+
+The RSC protocol serializes component output as a special wire format—a tree of references to server components, client components, and rendered HTML fragments. When a server component renders, its output is serialized and streamed to the client. Props passed from server to client must be serializable: strings, numbers, booleans, arrays, plain objects, and React elements. Functions, class instances, and circular references cannot cross this boundary.
+
+Understanding this serialization boundary is critical for avoiding runtime errors. A common mistake is passing a Date object from a server component to a client component—Date is not serializable and will throw. The fix is to convert it to an ISO string on the server side:
+
+```typescript
+// Server component — serialize non-serializable types
+async function EventCard({ eventId }: { eventId: string }) {
+  const event = await db.events.findUnique({ where: { id: eventId } });
+
+  return (
+    <ClientEventCard
+      title={event.title}
+      date={event.date.toISOString()} // Serialize Date to string
+      attendees={event.attendees.map(a => ({ name: a.name, avatar: a.avatar }))}
+    />
   );
 }
 ```
@@ -158,7 +179,97 @@ async function ProductPage({ params }: { params: { id: string } }) {
 
 The user sees the product header immediately while reviews and recommendations load in the background. Each Suspense boundary streams independently.
 
+### Pattern 4: Parallel Data Fetching with Promise.all
+
+When a server component needs multiple independent data sources, fetch them in parallel rather than sequentially:
+
+```typescript
+async function DashboardPage() {
+  const [user, notifications, analytics, recentOrders] = await Promise.all([
+    getUser(session.userId),
+    getNotifications(session.userId),
+    getAnalytics(session.userId, 'last-30-days'),
+    getRecentOrders(session.userId, { limit: 5 }),
+  ]);
+
+  return (
+    <DashboardLayout user={user}>
+      <NotificationBell count={notifications.unread} />
+      <AnalyticsChart data={analytics} />
+      <RecentOrders orders={recentOrders} />
+    </DashboardLayout>
+  );
+}
+```
+
+Without `Promise.all`, these four fetches would run sequentially, adding up their latencies. With parallel fetching, the total time equals the slowest single fetch.
+
+### Pattern 5: Request Deduplication
+
+Next.js automatically deduplicates identical `fetch()` calls within a single render pass. If two server components both call `fetch('/api/user/123')`, only one network request is made. This works because Next.js patches `fetch` to maintain an in-memory cache during rendering. However, this deduplication does not extend to database calls—you must implement your own deduplication layer:
+
+```typescript
+import { cache } from 'react';
+
+// React's cache() deduplicates within a single render
+const getUser = cache(async (userId: string) => {
+  return db.users.findUnique({ where: { id: userId } });
+});
+
+// Multiple components can call getUser('123') — only one DB query
+async function Header() {
+  const user = await getUser('123');
+  return <nav>{user.name}</nav>;
+}
+
+async function Sidebar() {
+  const user = await getUser('123'); // Same cache hit
+  return <aside>{user.email}</aside>;
+}
+```
+
 ![Caching strategies](https://images.unsplash.com/photo-1516116216624-53e697fedbea?w=800&h=400&fit=crop)
+
+## Streaming SSR Architecture
+
+### How Streaming Works Under the Hood
+
+When a request hits a Next.js application using RSC, the server begins rendering the component tree from the root. It encounters Suspense boundaries and immediately sends the fallback for unresolved boundaries while continuing to render. As each Suspense boundary resolves, the server sends a chunk that replaces the fallback with the actual content—all within the same HTTP response using a streaming format.
+
+This means the user sees content progressively rather than waiting for the entire page. The HTML shell arrives in the first chunk, followed by each Suspense boundary's content as it becomes available. The browser parses and inserts these chunks using a technique called "out-of-order streaming," where the server sends `<script>` tags that swap placeholder content with real content at the right position in the DOM.
+
+### Strategic Suspense Boundary Placement
+
+The placement of Suspense boundaries is a key architectural decision:
+
+```typescript
+// Page shell loads instantly, content streams in
+async function EcommercePage({ params }: { params: { slug: string } }) {
+  return (
+    <PageLayout>
+      {/* Critical: renders immediately */}
+      <ProductHero productId={params.slug} />
+
+      {/* Secondary: streams after reviews fetch completes */}
+      <Suspense fallback={<ReviewsSectionSkeleton />}>
+        <ReviewsSection productId={params.slug} />
+      </Suspense>
+
+      {/* Tertiary: streams after recommendation engine responds */}
+      <Suspense fallback={<RecommendationsSkeleton />}>
+        <PersonalizedRecommendations userId={session.userId} />
+      </Suspense>
+
+      {/* Low priority: streams after analytics loads */}
+      <Suspense fallback={<ActivityFeedSkeleton />}>
+        <RecentActivity productId={params.slug} />
+      </Suspense>
+    </PageLayout>
+  );
+}
+```
+
+Too many Suspense boundaries create visual "popping" as content streams in. Too few defeats the purpose of streaming. The sweet spot for most pages is 2-4 boundaries, grouped by user-perceived priority.
 
 ## Error Handling in Production
 
@@ -187,7 +298,26 @@ export default function ProductError({
 }
 ```
 
-### Graceful Degradation
+### Error Granularity with Nested Boundaries
+
+Place error boundaries at the right granularity. A single `error.tsx` at the route level catches everything, but a more granular approach prevents one failing widget from taking down the whole page:
+
+```typescript
+// app/dashboard/page.tsx
+async function DashboardPage() {
+  return (
+    <DashboardLayout>
+      <DashboardStats />        {/* Has its own error.tsx */}
+      <RecentActivity />        {/* Has its own error.tsx */}
+      <TeamCalendar />          {/* Has its own error.tsx */}
+    </DashboardLayout>
+  );
+}
+```
+
+Each sub-route (`dashboard/stats`, `dashboard/activity`, etc.) can have its own `error.tsx`. When the stats component fails, the calendar and activity feed still render.
+
+### Graceful Degradation Patterns
 
 When a server component fails, provide fallbacks that maintain the page layout:
 
@@ -200,6 +330,34 @@ async function Sidebar() {
     // Fallback to static content
     return <StaticSidebar />;
   }
+}
+```
+
+A production-grade pattern is to wrap non-critical data fetches with a timeout:
+
+```typescript
+async function WithTimeout<T>(
+  promise: Promise<T>,
+  fallback: T,
+  ms: number = 3000
+): Promise<T> {
+  const timeout = new Promise<T>((_, reject) =>
+    setTimeout(() => reject(new Error('Timeout')), ms)
+  );
+  try {
+    return await Promise.race([promise, timeout]);
+  } catch {
+    return fallback;
+  }
+}
+
+async function Sidebar() {
+  const recommendations = await WithTimeout(
+    getRecommendations(),
+    [],           // Empty fallback
+    2000          // 2-second timeout
+  );
+  return <RecommendationList items={recommendations} />;
 }
 ```
 
@@ -220,6 +378,31 @@ async function ProductPage({ params }: { params: { id: string } }) {
   return <ProductDetails product={product} />;
 }
 ```
+
+### Error Logging and Monitoring
+
+Server components run on your server, so you have full access to logging infrastructure. Always log errors with enough context to diagnose them:
+
+```typescript
+import { logger } from '@/lib/logger';
+
+async function ProductPage({ params }: { params: { id: string } }) {
+  try {
+    const product = await getProduct(params.id);
+    return <ProductDetails product={product} />;
+  } catch (error) {
+    logger.error('ProductPage render failed', {
+      productId: params.id,
+      error: error.message,
+      stack: error.stack,
+      requestId: headers().get('x-request-id'),
+    });
+    throw error; // Re-throw to let error.tsx handle the UI
+  }
+}
+```
+
+![Production deployment](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
 
 ## Performance Lessons
 
@@ -320,7 +503,83 @@ npx @next/bundle-analyzer
 
 Look for heavy libraries that accidentally crossed the `'use client'` boundary. Common culprits: date libraries, rich text editors, chart libraries.
 
-![Production deployment](https://images.unsplash.com/photo-1461749280684-dccba630e2f6?w=800&h=400&fit=crop)
+### Lesson 5: Edge vs. Node.js Runtime
+
+Server components can run in different runtimes. Edge runtime offers lower cold-start times and global distribution but has restrictions—no native Node.js APIs, limited `node_modules` compatibility, and smaller execution limits. Node.js runtime gives full API access but with higher latency for globally distributed users.
+
+A practical strategy is to run critical path components (navigation, layout, SEO metadata) at the edge and move heavy data-fetching components to Node.js:
+
+```typescript
+// This component runs at the edge
+export const runtime = 'edge';
+
+async function Navigation() {
+  const categories = await getCategories(); // From edge-compatible KV store
+  return <Nav categories={categories} />;
+}
+```
+
+```typescript
+// This component runs on Node.js (default)
+async function ProductAnalytics({ productId }: { productId: string }) {
+  const analytics = await db.analytics.aggregate({ /* complex query */ });
+  return <AnalyticsChart data={analytics} />;
+}
+```
+
+## Caching Strategies Deep Dive
+
+### Cache Layers in RSC
+
+Production RSC applications have multiple cache layers:
+
+1. **React Component Cache** — Caches server component rendered output. Controlled by `fetch` cache options and `unstable_cache`.
+2. **Full Route Cache** — Caches the RSC payload for statically rendered routes at build time. Invalidated by `revalidatePath` or `revalidateTag`.
+3. **Router Cache** — Client-side in-memory cache of visited routes. Prefetched via `<Link>` components.
+4. **Data Cache** — Persistent cache of `fetch` responses on the server. Survives across requests.
+
+```typescript
+// Fine-grained cache control
+async function ProductPage({ params }: { params: { id: string } }) {
+  // This fetch is cached by default (static data)
+  const product = await fetch(`https://api.example.com/products/${params.id}`);
+
+  // This fetch opts out of caching (dynamic data)
+  const stock = await fetch(`https://api.example.com/stock/${params.id}`, {
+    cache: 'no-store',
+  });
+
+  // This fetch revalidates every 60 seconds
+  const reviews = await fetch(`https://api.example.com/reviews/${params.id}`, {
+    next: { revalidate: 60 },
+  });
+
+  // ...
+}
+```
+
+### Tag-Based Invalidation
+
+Tags provide surgical cache invalidation:
+
+```typescript
+// Cached with tags
+const getProduct = unstable_cache(
+  async (id: string) => db.products.findUnique({ where: { id } }),
+  ['product'],
+  { tags: ['products', `product-${id}`] }
+);
+
+// Server action invalidates specific tags
+'use server';
+async function updateProduct(id: string, data: ProductUpdate) {
+  await db.products.update({ where: { id }, data });
+  revalidateTag(`product-${id}`); // Only this product's cache
+  revalidateTag('products');       // All product lists
+}
+```
+
+![Web development workflow](https://images.unsplash.com/photo-1498050108023-c5249f4df085?w=800&h=400&fit=crop)
 
 ## Common Anti-Patterns
 
@@ -349,6 +608,137 @@ async function Page() {
 
 Very large server component trees can increase TTFB. Split into smaller Suspense boundaries for streaming.
 
+### Anti-Pattern 4: Fetching in Client Components by Habit
+
+A subtle anti-pattern is continuing to fetch in `useEffect` inside client components when the data could be fetched on the server. This creates unnecessary loading states and waterfalls:
+
+```typescript
+// ANTI-PATTERN: Client fetches user profile
+'use client';
+function UserCard() {
+  const [user, setUser] = useState(null);
+  useEffect(() => {
+    fetch('/api/user').then(r => r.json()).then(setUser);
+  }, []);
+  if (!user) return <Skeleton />;
+  return <div>{user.name}</div>;
+}
+
+// BETTER: Server component fetches directly
+async function UserCard() {
+  const user = await getUser();
+  return <div>{user.name}</div>;
+}
+```
+
+### Anti-Pattern 5: Over-Nesting Suspense Boundaries
+
+Every Suspense boundary adds a visual "pop" as content streams in. Over-nesting creates a jarring experience where the page continuously shifts as small pieces arrive:
+
+```typescript
+// BAD: Each tiny component wrapped in Suspense
+<div>
+  <Suspense fallback={<Skeleton />}><UserName /></Suspense>
+  <Suspense fallback={<Skeleton />}><UserEmail /></Suspense>
+  <Suspense fallback={<Skeleton />}><UserAvatar /></Suspense>
+  <Suspense fallback={<Skeleton />}><UserBio /></Suspense>
+</div>
+
+// BETTER: Group related content in one boundary
+<Suspense fallback={<UserProfileSkeleton />}>
+  <UserName />
+  <UserEmail />
+  <UserAvatar />
+  <UserBio />
+</Suspense>
+```
+
+## Testing Strategies
+
+### Unit Testing Server Components
+
+Server components are async functions that return JSX—they can be tested by mocking their dependencies and asserting on the rendered output:
+
+```typescript
+import { render } from '@testing-library/react';
+import ProductPage from './page';
+
+// Mock the database
+jest.mock('@/lib/db', () => ({
+  products: {
+    findUnique: jest.fn().mockResolvedValue({
+      id: '1',
+      name: 'Test Product',
+      description: 'A test product',
+      price: 29.99,
+    }),
+  },
+}));
+
+// Mock next/navigation
+jest.mock('next/navigation', () => ({
+  notFound: jest.fn(),
+}));
+
+test('renders product details', async () => {
+  const jsx = await ProductPage({ params: { id: '1' } });
+  const { getByText } = render(jsx);
+  expect(getByText('Test Product')).toBeInTheDocument();
+  expect(getByText('A test product')).toBeInTheDocument();
+});
+```
+
+### Integration Testing with Real Databases
+
+For production confidence, run integration tests against a real database:
+
+```typescript
+import { setupTestDb, seedTestData } from '@/test-utils';
+
+let db: TestDatabase;
+
+beforeAll(async () => {
+  db = await setupTestDb();
+  await seedTestData(db);
+});
+
+afterAll(async () => {
+  await db.cleanup();
+});
+
+test('ProductPage renders real product data', async () => {
+  const product = await db.products.findFirst();
+  const jsx = await ProductPage({ params: { id: product.id } });
+  const { getByText } = render(jsx);
+  expect(getByText(product.name)).toBeInTheDocument();
+});
+```
+
+### E2E Testing with Playwright
+
+The most reliable way to test RSC applications is end-to-end tests that exercise the full request lifecycle:
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('product page loads and streams content', async ({ page }) => {
+  await page.goto('/products/1');
+
+  // Header loads immediately (no Suspense boundary)
+  await expect(page.locator('h1')).toBeVisible();
+
+  // Reviews stream in after a delay
+  await expect(page.locator('[data-testid="reviews"]')).toBeVisible({
+    timeout: 5000,
+  });
+
+  // Recommendations stream in independently
+  await expect(page.locator('[data-testid="recommendations"]')).toBeVisible({
+    timeout: 10000,
+  });
+});
+```
+
 ## Comparison: RSC vs Traditional SSR
 
 | Aspect | Traditional SSR | RSC |
@@ -359,47 +749,72 @@ Very large server component trees can increase TTFB. Split into smaller Suspense
 | Bundle size | Full app hydrated | Only interactive parts |
 | Interactivity | After full hydration | Progressive |
 | Complexity | Simpler mental model | Server/client boundary |
+| Cache granularity | Page-level | Component-level |
+| Code splitting | Manual | Automatic at client boundary |
 
-## Best Practices
+## Production Monitoring
 
-1. **Default to server components** — Only add `'use client'` when you need interactivity
-2. **Push client boundaries down** — Keep client components as leaf nodes
-3. **Colocate data fetching** — Each component fetches its own data
-4. **Use Suspense for streaming** — Wrap slow fetches for progressive rendering
-5. **Cache aggressively** — Use `unstable_cache` and `revalidateTag` for control
-6. **Use server actions** — Handle mutations server-side
-7. **Monitor bundle size** — Watch for libraries crossing the client boundary
-8. **Handle errors gracefully** — Use `error.tsx` and try/catch in server components
+### Metrics to Track
 
-## Common Pitfalls
+Monitor your Server Component rendering pipeline to detect issues early:
 
-| Pitfall | Impact | Solution |
-|---------|--------|----------|
-| `'use client'` everywhere | No RSC benefits | Restrict to interactive components |
-| Client-side waterfalls | Slow page loads | Fetch in server components |
-| Passing non-serializable props | Runtime errors | Pass plain data only |
-| No error boundaries | White screen on errors | Add `error.tsx` files |
-| Large client bundles | Slow hydration | Analyze and split bundles |
+- **TTFB (Time to First Byte)** — Measures how fast the server starts responding. With streaming, this should be under 200ms.
+- **FCP (First Contentful Paint)** — When the user first sees content. Should be under 1.5s.
+- **LCP (Largest Contentful Paint)** — When the main content is visible. Should be under 2.5s.
+- **Server render time per component** — Track slow server components with distributed tracing.
+- **Serialization payload size** — Monitor the size of the RSC payload. Large payloads slow down streaming.
+- **Error rate by component** — Track which server components fail most often.
 
-### Monitoring and Observability
+```typescript
+// Instrument server components with OpenTelemetry
+import { trace } from '@opentelemetry/api';
 
-Monitor your Server Component rendering pipeline to detect issues early. Track server rendering time for each page type to identify slow components. Monitor the size of serialized Server Component payloads to ensure they do not exceed reasonable limits. Set up alerts for server rendering errors that may indicate data fetching failures or component bugs. Use distributed tracing to follow requests from the server through data fetching to rendering and response delivery. Log performance metrics including time to first byte, time to interactive, and total blocking time to understand the end-to-end user experience. Use these metrics to identify optimization opportunities and track the impact of changes over time.
+async function ProductPage({ params }: { params: { id: string } }) {
+  const tracer = trace.getTracer('rsc');
 
-### Team Collaboration
+  return tracer.startActiveSpan('ProductPage.render', async (span) => {
+    try {
+      span.setAttribute('product.id', params.id);
+      const product = await getProduct(params.id);
+      span.setAttribute('product.name', product.name);
+      return <ProductDetails product={product} />;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
 
-Server Components change how teams collaborate on web applications. Frontend developers need to understand server-side concepts like database queries, API calls, and caching. Backend developers need to understand component rendering, serialization, and client hydration. Establish clear conventions for where data fetching happens and how data flows between server and client components. Create shared utilities for common patterns like authentication, error handling, and data transformation. Document your Server Component architecture and onboarding process so that new team members can contribute effectively. Regular knowledge sharing sessions help bridge the gap between frontend and backend perspectives.
+## Team Collaboration
 
-Understanding the practical implications of Server Components helps teams avoid common pitfalls and build reliable production applications.
+Server Components change how teams collaborate on web applications. Frontend developers need to understand server-side concepts like database queries, API calls, and caching. Backend developers need to understand component rendering, serialization, and client hydration.
 
-Teams adopting Server Components benefit from understanding the practical challenges and solutions discovered through real-world production deployments across the industry.
+Establish clear conventions for where data fetching happens and how data flows between server and client components. Create shared utilities for common patterns like authentication, error handling, and data transformation. Document your Server Component architecture and onboarding process so that new team members can contribute effectively. Regular knowledge sharing sessions help bridge the gap between frontend and backend perspectives.
 
-Teams that have deployed Server Components to production report significant improvements in bundle size, initial load performance, and developer experience when the patterns are applied correctly.
+### Recommended File Structure
 
-Production deployments of Server Components have revealed important patterns around caching, error handling, and team coordination that are critical for success at scale.
-
-Implementing Server Components in production requires a thoughtful approach to architecture, testing, and deployment that accounts for the unique characteristics of server-client hybrid rendering.
-
-Production deployments of server components require careful monitoring of server response times and client hydration metrics to ensure optimal user experience.
+```
+app/
+├── layout.tsx           # Server: Root layout
+├── page.tsx             # Server: Home page
+├── products/
+│   ├── page.tsx         # Server: Product listing
+│   ├── [id]/
+│   │   ├── page.tsx     # Server: Product detail
+│   │   ├── error.tsx    # Client: Error boundary
+│   │   ├── loading.tsx  # Client: Loading skeleton
+│   │   └── not-found.tsx
+│   └── _components/
+│       ├── product-card.tsx     # Server
+│       ├── add-to-cart.tsx      # Client
+│       └── review-form.tsx      # Client
+├── actions/
+│   ├── cart.ts          # Server actions
+│   └── reviews.ts       # Server actions
+└── lib/
+    ├── db.ts            # Database client
+    └── cache.ts         # Cache utilities
+```
 
 ## Conclusion
 
@@ -414,3 +829,8 @@ Key takeaways:
 5. **Use server actions** — Handle mutations server-side
 6. **Cache with tags** — Fine-grained cache invalidation control
 7. **Handle errors at every level** — `error.tsx`, try/catch, and `notFound()`
+8. **Monitor server render time** — Use distributed tracing for production visibility
+9. **Test at multiple levels** — Unit, integration, and E2E for full confidence
+10. **Document your patterns** — Help your team navigate the server/client boundary
+
+Teams adopting Server Components benefit from understanding the practical challenges and solutions discovered through real-world production deployments across the industry. The investment in learning these patterns pays dividends in performance, developer experience, and user satisfaction.
