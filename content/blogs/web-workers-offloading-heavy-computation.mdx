@@ -435,11 +435,108 @@ const processed = await parallelMap(data, './transform-worker.js');
 
 ### Memory Management
 
-Workers have their own memory space, which means they do not share memory with the main thread by default. This isolation prevents many concurrency bugs but can lead to increased memory usage when multiple workers need the same data. Use SharedArrayBuffer to share read-only data between workers without duplication. Implement memory pooling within workers to reuse allocations rather than creating new objects for each task. Monitor worker memory usage and implement memory limits to prevent individual workers from consuming excessive memory. When a worker's memory usage exceeds its limit, gracefully terminate it and create a fresh worker to continue processing. These memory management practices are essential for long-running applications that process large amounts of data.
+Workers have their own memory space, which means they do not share memory with the main thread by default. This isolation prevents many concurrency bugs but can lead to increased memory usage when multiple workers need the same data. Use SharedArrayBuffer to share read-only data between workers without duplication. Implement memory pooling within workers to reuse allocations rather than creating new objects for each task. Monitor worker memory usage and implement memory limits to prevent individual workers from consuming excessive memory.
+
+```javascript
+// Memory-conscious worker with pooling
+class PooledWorker {
+  constructor() {
+    this.bufferPool = [];
+  }
+
+  getBuffer(size) {
+    // Reuse existing buffers when possible
+    const existing = this.bufferPool.find(b => b.byteLength >= size);
+    if (existing) {
+      this.bufferPool.splice(this.bufferPool.indexOf(existing), 1);
+      return existing;
+    }
+    return new ArrayBuffer(size);
+  }
+
+  releaseBuffer(buffer) {
+    if (this.bufferPool.length < 10) {
+      this.bufferPool.push(buffer);
+    }
+  }
+
+  process(data) {
+    const buffer = this.getBuffer(data.byteLength);
+    // Process data using the buffer
+    const result = transform(data, buffer);
+    this.releaseBuffer(buffer);
+    return result;
+  }
+}
+```
+
+### WebGPU Compute in Workers
+
+WebGPU enables GPU-accelerated computation directly from workers, opening up massive parallelism for tasks like matrix operations, physics simulations, and data processing. Combining WebGPU compute shaders with workers keeps both the main thread and the GPU free for rendering while performing heavy computation in the background.
+
+```javascript
+// gpu-worker.js — WebGPU compute in a worker
+self.onmessage = async (event) => {
+  const { data, operation } = event.data;
+
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+
+  const inputBuffer = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    mappedAtCreation: true
+  });
+  new Float32Array(inputBuffer.getMappedRange()).set(data);
+  inputBuffer.unmap();
+
+  const shaderModule = device.createShaderModule({
+    code: `
+      @group(0) @binding(0) var<storage, read> input: array<f32>;
+      @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+      @compute @workgroup_size(256)
+      fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        let i = id.x;
+        if (i < arrayLength(&input)) {
+          output[i] = input[i] * input[i]; // Square each element
+        }
+      }
+    `
+  });
+
+  const outputBuffer = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 1, resource: { buffer: outputBuffer } }
+    ]
+  });
+
+  const commandEncoder = device.createCommandEncoder();
+  const passEncoder = commandEncoder.beginComputePass();
+  passEncoder.setPipeline(pipeline);
+  passEncoder.setBindGroup(0, bindGroup);
+  passEncoder.dispatchWorkgroups(Math.ceil(data.length / 256));
+  passEncoder.end();
+
+  device.queue.submit([commandEncoder.finish()]);
+
+  const result = await readBuffer(device, outputBuffer);
+  self.postMessage({ result }, [result.buffer]);
+};
+```
 
 ## Conclusion
 
-Web Workers enable true parallel processing in the browser. By offloading heavy computations to background threads, you can keep your UI responsive and performant. Combined with transferable objects and SharedArrayBuffer, workers can handle even the most demanding workloads.
+Web Workers enable true parallel processing in the browser. By offloading heavy computations to background threads, you can keep your UI responsive and performant. Combined with transferable objects and SharedArrayBuffer, workers can handle even the most demanding workloads. The key is choosing the right communication pattern for your use case: simple postMessage for basic tasks, transferable objects for large binary data, SharedArrayBuffer for shared state, and streaming for continuous data processing.
+
+Modern tooling has also made workers easier to use. Libraries like Comlink eliminate the boilerplate of message passing, module workers enable clean code sharing between threads, and bundlers like Webpack and Vite handle worker bundling automatically. The browser ecosystem continues to evolve with features like OffscreenCanvas and the upcoming Web Locks API, making workers more powerful with each release.
 
 Key takeaways:
 
@@ -448,3 +545,6 @@ Key takeaways:
 3. **SharedArrayBuffer** allows shared memory between threads
 4. **Worker pools** reuse workers for better performance
 5. **Comlink** simplifies worker communication with async/await syntax
+6. **OffscreenCanvas** enables rendering in workers without blocking the UI
+
+Web Workers are no longer an advanced technique—they are a fundamental tool for building responsive web applications that handle complex computation without sacrificing user experience. Start by identifying the heaviest computations in your application and move them to a worker; the performance improvement is immediate and significant.
