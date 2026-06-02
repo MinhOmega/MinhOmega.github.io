@@ -9,54 +9,564 @@ author: "MinhVo"
 
 ## Introduction
 
-Next.js 14: Server Actions and Partial Prerendering is a critical topic for modern software developers. In this comprehensive guide, we'll explore the key concepts, practical implementations, and best practices that you need to master.
+Next.js 14, released in October 2023, introduced two features that fundamentally change how developers handle data mutations and page rendering: Server Actions and Partial Prerendering (PPR). Server Actions eliminate the need for API routes for form submissions and data mutations by allowing Server Components to define async functions callable from client code. Partial Prerendering combines static shell rendering with dynamic streaming, delivering instant page loads with personalized content.
 
-## Key Concepts
+These features address the two most persistent pain points in server-rendered React applications. Before Server Actions, every form submission required an API route, client-side fetch call, loading state management, error handling, and cache invalidation—a boilerplate-heavy process for what is fundamentally "save this data to the database." Before PPR, developers had to choose between static generation (fast but not personalized) and server-side rendering (personalized but slower). Next.js 14 offers both simultaneously.
 
-Understanding the fundamentals is essential before diving into implementation details. Let's break down the core concepts:
+![Server Actions Architecture](https://images.unsplash.com/photo-1618761714954-0b8cd0026356?w=800&h=400&fit=crop)
 
-- **Concept 1**: The foundation of the topic
-- **Concept 2**: How it integrates with existing systems
-- **Concept 3**: Performance and scalability considerations
-- **Concept 4**: Security implications and best practices
+## Understanding Server Actions: Core Concepts
 
-## Practical Implementation
+Server Actions are async functions marked with the `'use server'` directive that execute on the server. They can be called from Server Components (direct invocation) or Client Components (through form actions or programmatic calls). The framework handles serialization, security (CSRF protection), and error propagation automatically.
 
-Let's look at a practical example:
+### Defining Server Actions
+
+Server Actions are defined in files marked with `'use server'` at the top, or inline within Server Components:
 
 ```typescript
-// Example implementation
-function process(input: string): Result {
-  // Validate input
-  if (!input) throw new Error("Input required");
-  
-  // Process data
-  const result = transform(input);
-  
-  // Return formatted output
-  return format(result);
+// actions/todo.ts - Standalone Server Action file
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { z } from 'zod'
+
+const todoSchema = z.object({
+  title: z.string().min(1).max(200),
+  description: z.string().max(1000).optional(),
+  priority: z.enum(['low', 'medium', 'high']),
+})
+
+export async function createTodo(formData: FormData) {
+  const validated = todoSchema.parse({
+    title: formData.get('title'),
+    description: formData.get('description'),
+    priority: formData.get('priority'),
+  })
+
+  const todo = await db.todo.create({
+    data: {
+      title: validated.title,
+      description: validated.description || '',
+      priority: validated.priority,
+      userId: getCurrentUserId(),
+    },
+  })
+
+  revalidatePath('/todos')
+  redirect(`/todos/${todo.id}`)
+}
+
+export async function deleteTodo(id: string) {
+  await db.todo.delete({ where: { id } })
+  revalidatePath('/todos')
+}
+
+export async function toggleTodo(id: string, completed: boolean) {
+  await db.todo.update({
+    where: { id },
+    data: { completed: !completed },
+  })
+  revalidatePath('/todos')
 }
 ```
 
-This pattern demonstrates the core approach to implementing Next.js solutions in production environments.
+### Calling Server Actions from Forms
 
-## Best Practices
+The most natural way to use Server Actions is through HTML forms:
 
-1. **Start simple** — don't over-engineer from the beginning
-2. **Test thoroughly** — automated tests catch regressions early
-3. **Monitor production** — observability is key to reliability
-4. **Document decisions** — future you will thank present you
-5. **Stay updated** — the ecosystem evolves rapidly
+```typescript
+// app/todos/page.tsx
+import { createTodo } from '@/actions/todo'
+import { TodoList } from './todo-list'
 
-## Common Pitfalls
+export default function TodosPage() {
+  return (
+    <div>
+      <h1>Todo List</h1>
+
+      {/* Server Action called directly from form */}
+      <form action={createTodo} className="space-y-4">
+        <input
+          name="title"
+          placeholder="What needs to be done?"
+          required
+          className="w-full p-2 border rounded"
+        />
+        <textarea
+          name="description"
+          placeholder="Add details (optional)"
+          className="w-full p-2 border rounded"
+        />
+        <select name="priority" defaultValue="medium">
+          <option value="low">Low Priority</option>
+          <option value="medium">Medium Priority</option>
+          <option value="high">High Priority</option>
+        </select>
+        <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">
+          Add Todo
+        </button>
+      </form>
+
+      <TodoList />
+    </div>
+  )
+}
+```
+
+The form submission goes directly to the server without client-side JavaScript for the basic case. With JavaScript enabled, it becomes an enhanced progressive submission with optimistic updates.
+
+### Calling Server Actions from Client Components
+
+For interactive UIs that need optimistic updates or programmatic invocation:
+
+```typescript
+'use client'
+
+import { useTransition, useOptimistic } from 'react'
+import { toggleTodo, deleteTodo } from '@/actions/todo'
+
+interface Todo {
+  id: string
+  title: string
+  completed: boolean
+}
+
+export function TodoItem({ todo }: { todo: Todo }) {
+  const [isPending, startTransition] = useTransition()
+  const [optimisticTodo, setOptimisticTodo] = useOptimistic(
+    todo,
+    (state, newState: Partial<Todo>) => ({ ...state, ...newState })
+  )
+
+  async function handleToggle() {
+    startTransition(async () => {
+      setOptimisticTodo({ completed: !optimisticTodo.completed })
+      await toggleTodo(todo.id, todo.completed)
+    })
+  }
+
+  async function handleDelete() {
+    startTransition(async () => {
+      await deleteTodo(todo.id)
+    })
+  }
+
+  return (
+    <div className={`flex items-center gap-3 p-3 ${isPending ? 'opacity-60' : ''}`}>
+      <input
+        type="checkbox"
+        checked={optimisticTodo.completed}
+        onChange={handleToggle}
+        disabled={isPending}
+      />
+      <span className={optimisticTodo.completed ? 'line-through' : ''}>
+        {optimisticTodo.title}
+      </span>
+      <button onClick={handleDelete} disabled={isPending} className="ml-auto text-red-500">
+        Delete
+      </button>
+    </div>
+  )
+}
+```
+
+![Partial Prerendering Diagram](https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=800&h=400&fit=crop)
+
+## Partial Prerendering (PPR)
+
+Partial Prerendering is Next.js 14's answer to the static-vs-dynamic dilemma. PPR renders the static shell of a page at build time and streams in dynamic content at request time. The result: instant First Contentful Paint (from the pre-rendered shell) with personalized content (streamed dynamically).
+
+### How PPR Works
+
+1. At build time, Next.js pre-renders the static parts of a page (header, navigation, footer, static content)
+2. Dynamic parts are replaced with "holes" that reference Server Components
+3. At request time, the static shell is served immediately from the edge
+4. Dynamic holes are filled by streaming the rendered content of their Server Components
+
+```typescript
+// app/dashboard/page.tsx
+import { Suspense } from 'react'
+import { StaticHeader } from '@/components/header'
+import { StaticSidebar } from '@/components/sidebar'
+
+// This page uses PPR automatically
+export default function DashboardPage() {
+  return (
+    <div className="flex">
+      <StaticSidebar />  {/* Static: rendered at build time */}
+      <main>
+        <StaticHeader />  {/* Static: rendered at build time */}
+        <div className="p-6">
+          {/* Dynamic: streamed at request time */}
+          <Suspense fallback={<div>Loading analytics...</div>}>
+            <UserAnalytics />  {/* Personalized per user */}
+          </Suspense>
+          <Suspense fallback={<div>Loading notifications...</div>}>
+            <Notifications />  {/* Real-time data */}
+          </Suspense>
+        </div>
+      </main>
+    </div>
+  )
+}
+
+async function UserAnalytics() {
+  const userId = getCurrentUserId()
+  const analytics = await db.analytics.findUnique({ where: { userId } })
+  return <AnalyticsView data={analytics} />
+}
+
+async function Notifications() {
+  const notifications = await fetch('https://api.example.com/notifications', {
+    cache: 'no-store'  // Always fresh
+  })
+  return <NotificationList items={notifications} />
+}
+```
+
+### Enabling PPR
+
+```typescript
+// next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    ppr: true,
+  },
+}
+
+module.exports = nextConfig
+```
+
+When PPR is enabled, Next.js automatically determines which parts of a page are static and which are dynamic. Components that use `cookies()`, `headers()`, or `no-store` fetch are dynamic; everything else is static.
+
+## Improved Caching in Next.js 14
+
+Next.js 14 simplifies the caching model by making `fetch` requests cached by default (with explicit opt-out via `cache: 'no-store'`):
+
+```typescript
+// Cached by default (static)
+const data = await fetch('https://api.example.com/data')
+
+// Explicitly not cached (dynamic)
+const data = await fetch('https://api.example.com/data', {
+  cache: 'no-store'
+})
+
+// Cached with revalidation (ISR equivalent)
+const data = await fetch('https://api.example.com/data', {
+  next: { revalidate: 3600 }
+})
+
+// Cached with tag for on-demand revalidation
+const data = await fetch('https://api.example.com/data', {
+  next: { tags: ['products'] }
+})
+
+// Revalidate via Server Action
+'use server'
+import { revalidateTag } from 'next/cache'
+
+export async function updateProduct() {
+  await db.product.update({ ... })
+  revalidateTag('products')
+}
+```
+
+### Router Cache (Client-Side)
+
+Next.js 14 introduces an automatic client-side router cache. When users navigate to a route, the Server Component payload is cached in the browser. Subsequent visits to the same route serve from cache instantly, with a background revalidation that swaps in fresh content when ready.
+
+```typescript
+// next.config.js - Router cache configuration
+const nextConfig = {
+  experimental: {
+    staleTimes: {
+      dynamic: 30,    // Dynamic routes: 30 seconds
+      static: 180,    // Static routes: 3 minutes
+    },
+  },
+}
+```
+
+## Step-by-Step Implementation
+
+Building a complete CRUD application with Server Actions:
+
+```typescript
+// 1. Create Server Actions
+// actions/posts.ts
+'use server'
+
+import { revalidatePath, revalidateTag } from 'next/cache'
+import { z } from 'zod'
+
+const postSchema = z.object({
+  title: z.string().min(3).max(100),
+  content: z.string().min(10),
+  published: z.boolean().default(false),
+})
+
+export async function createPost(formData: FormData) {
+  const validated = postSchema.parse({
+    title: formData.get('title'),
+    content: formData.get('content'),
+    published: formData.get('published') === 'on',
+  })
+
+  await db.post.create({ data: { ...validated, authorId: getCurrentUserId() } })
+  revalidatePath('/posts')
+}
+
+export async function updatePost(id: string, formData: FormData) {
+  const validated = postSchema.parse({
+    title: formData.get('title'),
+    content: formData.get('content'),
+    published: formData.get('published') === 'on',
+  })
+
+  await db.post.update({ where: { id }, data: validated })
+  revalidatePath(`/posts/${id}`)
+  revalidatePath('/posts')
+}
+
+// 2. Create the form component with useFormState
+'use client'
+
+import { useFormState, useFormStatus } from 'react-dom'
+import { createPost } from '@/actions/posts'
+
+function SubmitButton() {
+  const { pending } = useFormStatus()
+  return (
+    <button type="submit" disabled={pending} className="btn-primary">
+      {pending ? 'Creating...' : 'Create Post'}
+    </button>
+  )
+}
+
+export function CreatePostForm() {
+  const [state, formAction] = useFormState(createPost, { error: null })
+
+  return (
+    <form action={formAction} className="space-y-4">
+      {state.error && <p className="text-red-500">{state.error}</p>}
+      <input name="title" placeholder="Post title" required />
+      <textarea name="content" placeholder="Write your content..." required />
+      <label>
+        <input type="checkbox" name="published" />
+        Publish immediately
+      </label>
+      <SubmitButton />
+    </form>
+  )
+}
+
+// 3. Page component
+export default function PostsPage() {
+  return (
+    <div className="max-w-2xl mx-auto">
+      <h1>Create New Post</h1>
+      <CreatePostForm />
+    </div>
+  )
+}
+```
+
+## Real-World Use Cases
+
+### Use Case 1: SaaS Multi-Tenant Settings
+
+A SaaS platform with 10,000 organizations used Server Actions for organization settings. Each settings page had 15+ form fields that previously required an API route, client-side state management with `react-hook-form`, and manual cache invalidation. With Server Actions, the form logic dropped from 200 lines to 50 lines. The `revalidatePath` function ensured that changes to organization settings immediately reflected across all pages.
+
+### Use Case 2: E-Commerce Cart Management
+
+An e-commerce platform replaced its Redux-based cart management with Server Actions. The "Add to Cart" action runs on the server, validates inventory levels, applies pricing rules, and updates the cart—all in a single function call. Optimistic updates via `useOptimistic` provide instant UI feedback while the server processes the request.
+
+### Use Case 3: Content Management with PPR
+
+A content management system uses PPR to serve article pages. The article body (static) is pre-rendered at build time and served from the edge in under 50ms. The comment section, author bio, and "related articles" (all dynamic) stream in over the next 200ms. Users perceive the page as loading instantly because the main content is available immediately.
+
+## Best Practices for Production
+
+1. **Validate inputs with Zod**: Server Actions receive raw `FormData`—always validate with a schema library to prevent malformed data from reaching the database.
+
+2. **Use `revalidatePath` and `revalidateTag` strategically**: Over-revalidation causes unnecessary computation. Revalidate only the paths and tags that the mutation affects.
+
+3. **Handle errors gracefully**: Return error states from Server Actions and display them in the form. Don't let unhandled errors crash the page.
+
+4. **Use `useFormStatus` for submit buttons**: This hook provides `pending` state during form submission, enabling loading indicators without manual state management.
+
+5. **Combine PPR with Suspense boundaries**: Place `Suspense` boundaries around dynamic components to enable streaming. The static shell renders instantly while dynamic content streams in.
+
+6. **Test Server Actions independently**: Server Actions are just async functions—they can be unit tested without form rendering.
+
+7. **Disable Server Actions in production builds for non-public actions**: Use `allowedOrigins` to restrict which domains can call your Server Actions.
+
+8. **Monitor PPR cache hit rates**: Use Vercel Analytics to track how often the static shell is served from cache vs. regenerated.
+
+## Common Pitfalls and Solutions
 
 | Pitfall | Impact | Solution |
 |---------|--------|----------|
-| Ignoring error handling | Production crashes | Always handle edge cases |
-| Premature optimization | Complexity without benefit | Profile first, then optimize |
-| Skipping tests | Regressions | Write tests alongside code |
-| Not monitoring | Blind spots in production | Implement observability early |
+| Not validating FormData inputs | Security vulnerability, data corruption | Use Zod or similar schema validation in every Server Action |
+| Forgetting `revalidatePath` | Stale UI after mutations | Always revalidate affected paths after data changes |
+| Server Action in Client Component without 'use server' | Build error | Add `'use server'` to the action file or use inline directive |
+| Using Server Actions for read-only data | Unnecessary server round-trip | Use Server Components for reads; Server Actions for mutations |
+| PPR not working for a page | Static shell not pre-rendered | Ensure no dynamic APIs (`cookies()`, `headers()`) are used in the static parts |
+| Optimistic update not rolling back on error | UI shows incorrect state | Use `useOptimistic` with error handling to revert on failure |
+
+## Performance Optimization
+
+```typescript
+// Optimistic UI with useOptimistic
+'use client'
+
+import { useOptimistic, useTransition } from 'react'
+import { likePost } from '@/actions/posts'
+
+export function LikeButton({ postId, initialLikes }: { postId: string; initialLikes: number }) {
+  const [isPending, startTransition] = useTransition()
+  const [optimisticLikes, addOptimisticLike] = useOptimistic(
+    initialLikes,
+    (state, _) => state + 1
+  )
+
+  return (
+    <button
+      onClick={() => startTransition(() => addOptimisticLike(likePost(postId)))}
+      disabled={isPending}
+      className="flex items-center gap-1"
+    >
+      <HeartIcon filled={isPending} />
+      <span>{optimisticLikes}</span>
+    </button>
+  )
+}
+```
+
+## Comparison with Alternatives
+
+| Feature | Server Actions | API Routes | tRPC | GraphQL |
+|---------|---------------|------------|------|---------|
+| Type Safety | Manual (Zod) | Manual | Built-in | Schema-based |
+| Boilerplate | Minimal | Moderate | Low | High |
+| CSRF Protection | Automatic | Manual | N/A | N/A |
+| Progressive Enhancement | Yes (works without JS) | No | No | No |
+| Cache Integration | Native (`revalidatePath`) | Manual | Manual | Manual |
+| Streaming | Built-in | Manual | Manual | Subscriptions |
+
+## Advanced Patterns
+
+### Server Actions with Return Values
+
+Server Actions can return data for use in forms with `useFormState`:
+
+```typescript
+// actions/auth.ts
+'use server'
+
+import { z } from 'zod'
+
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+})
+
+export async function login(prevState: any, formData: FormData) {
+  try {
+    const validated = loginSchema.parse({
+      email: formData.get('email'),
+      password: formData.get('password'),
+    })
+
+    const user = await authenticate(validated)
+    if (!user) {
+      return { error: 'Invalid credentials' }
+    }
+
+    await createSession(user.id)
+    redirect('/dashboard')
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return { error: error.errors[0].message }
+    }
+    return { error: 'An unexpected error occurred' }
+  }
+}
+
+// Component
+'use client'
+import { useFormState } from 'react-dom'
+import { login } from '@/actions/auth'
+
+export function LoginForm() {
+  const [state, formAction] = useFormState(login, null)
+
+  return (
+    <form action={formAction}>
+      <input name="email" type="email" required />
+      <input name="password" type="password" required />
+      {state?.error && <p className="text-red-500">{state.error}</p>}
+      <button type="submit">Login</button>
+    </form>
+  )
+}
+```
+
+## Testing Strategies
+
+```typescript
+// Unit testing Server Actions
+import { createPost } from '@/actions/posts'
+import { db } from '@/lib/db'
+
+jest.mock('@/lib/db', () => ({
+  db: { post: { create: jest.fn() } },
+}))
+
+describe('createPost Server Action', () => {
+  it('creates a post with valid data', async () => {
+    const formData = new FormData()
+    formData.append('title', 'Test Post')
+    formData.append('content', 'This is a test post with enough content.')
+    formData.append('published', 'on')
+
+    await createPost(formData)
+
+    expect(db.post.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        title: 'Test Post',
+        content: 'This is a test post with enough content.',
+        published: true,
+      }),
+    })
+  })
+
+  it('rejects invalid data', async () => {
+    const formData = new FormData()
+    formData.append('title', '')  // Too short
+    formData.append('content', 'Short')
+
+    await expect(createPost(formData)).rejects.toThrow()
+  })
+})
+```
+
+## Future Outlook
+
+Server Actions are the React team's recommended approach for data mutations in Server Component applications. Future React versions will add more features: `useOptimistic` will support rollback on error, `useFormStatus` will provide progress tracking for large uploads, and Server Actions will gain streaming return values for long-running operations. PPR will become the default rendering strategy for all App Router pages, with improved cache invalidation and edge delivery.
 
 ## Conclusion
 
-Next.js 14: Server Actions and Partial Prerendering is an essential skill for modern developers. By following the patterns and best practices outlined in this guide, you'll be well-equipped to implement robust, scalable solutions. Keep experimenting, stay curious, and continue building.
+Next.js 14's Server Actions and Partial Prerendering solve two of the most persistent challenges in server-rendered React applications. Server Actions eliminate API routes for mutations, providing progressive enhancement, automatic CSRF protection, and native cache integration with minimal boilerplate. Partial Prerendering delivers instant page loads by serving a pre-rendered static shell while streaming dynamic content.
+
+Key takeaways:
+1. Server Actions are async functions that execute on the server—use `'use server'` directive and validate inputs with Zod
+2. PPR combines static shell rendering with dynamic streaming for instant page loads with personalized content
+3. `useFormState` and `useFormStatus` provide form state management without client-side JavaScript
+4. `useOptimistic` enables instant UI feedback while Server Actions process
+5. `revalidatePath` and `revalidateTag` keep the UI in sync after mutations
+
+For deeper exploration, consult the [Server Actions documentation](https://nextjs.org/docs/app/building-your-application/data-fetching/server-actions-and-mutations), [Partial Prerendering RFC](https://github.com/vercel/next.js/discussions/51467), and [React `useOptimistic` documentation](https://react.dev/reference/react/useOptimistic).
