@@ -56,6 +56,18 @@ function generateContent(title, tags) {
 - Build the project locally to confirm all pages generate: `yarn build`
 - Check `generateStaticParams` count matches in build output: `[+495 more paths]`
 
+## Word Counting for MDX Files
+
+**Critical**: The common `sed` approach for counting words after frontmatter is broken when `---` appears inside code blocks. Use `awk` instead:
+
+```bash
+# BROKEN — matches --- inside code blocks
+sed -n '/^---$/,/^---$/d; p' file.mdx | wc -w
+
+# CORRECT — counts --- delimiters, stops after the second one
+awk 'BEGIN{c=0} /^---$/{c++; next} c>=2' file.mdx | wc -w
+```
+
 ## CI/Deployment Notes
 
 - **Yarn 3 + Corepack**: if `package.json` has `"packageManager": "yarn@3.5.0"`, GitHub Actions will fail unless Corepack is enabled. Add `corepack enable` **before** `setup-node` (not after), because `setup-node` with `cache: 'yarn'` runs yarn commands during its own setup phase.
